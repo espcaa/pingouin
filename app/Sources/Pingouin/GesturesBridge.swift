@@ -13,6 +13,7 @@ final class GesturesBridge {
     private let lock = NSLock()
     private var connectTimer: Timer?
     private var started = false
+    private var hinted = false   // main thread: the ⌃⌥Esc hint, once per run
 
     init(socketPath: String, qemuPID: pid_t) {
         self.socketPath = socketPath
@@ -108,7 +109,15 @@ final class GesturesBridge {
         // Ctrl+Option+Esc let go of the VM ("S esc"): back to Pingouin's own
         // window (macOS switches Space). The VM captures again once it's in front.
         if len >= 5, strncmp(line, "S esc", 5) == 0 {
-            DispatchQueue.main.async { GesturesBridge.showPingouin() }
+            DispatchQueue.main.async { EscapeHint.hide(); GesturesBridge.showPingouin() }
+        }
+        // Capture went on: the VM is full screen and in front.
+        if len >= 4, strncmp(line, "S on", 4) == 0 {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.hinted else { return }
+                self.hinted = true
+                EscapeHint.show()
+            }
         }
         lock.lock()
         defer { lock.unlock() }

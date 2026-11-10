@@ -7,7 +7,8 @@ struct PingouinApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup("Pingouin") {
+        // One window (no second copy with ⌘N); ⌘N makes a VM instead.
+        Window("Pingouin", id: "main") {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 640, minHeight: 400)
@@ -19,13 +20,19 @@ struct PingouinApp: App {
                 }
         }
         .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New VM…") { model.creatingVM = true }.keyboardShortcut("n")
+            }
+        }
+
+        Settings { SettingsView() }
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @State private var selection: String?
-    @State private var creating = false
     @State private var deleting: VM?
 
     var body: some View {
@@ -49,7 +56,7 @@ struct ContentView: View {
             }
             .safeAreaInset(edge: .bottom) {
                 Button {
-                    creating = true
+                    model.creatingVM = true
                 } label: {
                     Label("New VM", systemImage: "plus.circle")
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -86,7 +93,7 @@ struct ContentView: View {
         } message: {
             Text("Its disk and settings go to the Trash; empty the Trash to free the space.")
         }
-        .sheet(isPresented: $creating) {
+        .sheet(isPresented: $model.creatingVM) {
             NewVMSheet { vm in selection = vm.config.name }
         }
         .alert("Pingouin", isPresented: .constant(model.error != nil)) {

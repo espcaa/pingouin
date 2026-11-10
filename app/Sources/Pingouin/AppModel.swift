@@ -25,6 +25,7 @@ final class AppModel: ObservableObject {
     /// What each running VM is doing (RunningVM.phase, published for the UI).
     @Published var phases: [String: RunningVM.Phase] = [:]
     @Published var error: String?
+    @Published var creatingVM = false
     @Published var hasAccessibility = GesturesBridge.hasAccessibility
     @Published var hasInputMonitoring = GesturesBridge.hasInputMonitoring
     var hasGesturePermissions: Bool { hasAccessibility && hasInputMonitoring }
