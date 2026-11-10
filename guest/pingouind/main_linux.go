@@ -19,6 +19,11 @@ func main() {
 		fmt.Println("pingouind", version)
 		return
 	}
+	// The display helper runs as the logged-in user (no uinput needed).
+	if len(os.Args) > 1 && os.Args[1] == "displays" {
+		runDisplays()
+		return
+	}
 
 	padDev, err := newDevice(deviceSpec{
 		// Apple vendor id + Magic Trackpad (USB-C) product id: libinput applies

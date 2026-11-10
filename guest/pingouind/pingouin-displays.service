@@ -1,0 +1,14 @@
+[Unit]
+Description=Pingouin: tell the Mac where the desktop's screens are (extra displays)
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExists=/dev/virtio-ports/app.pingouin.display
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/pingouind displays
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

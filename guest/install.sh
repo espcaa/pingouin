@@ -13,7 +13,15 @@ bin=${1:-$here/pingouind/pingouind}
 
 install -m 755 "$bin" /usr/local/bin/pingouind
 install -m 644 "$here/pingouind/pingouind.service" /etc/systemd/system/pingouind.service
-command -v restorecon >/dev/null && restorecon /usr/local/bin/pingouind /etc/systemd/system/pingouind.service
+# The display helper (extra screens): the logged-in user opens its port.
+install -m 644 "$here/pingouind/pingouin-displays.service" /etc/systemd/user/pingouin-displays.service
+cat > /etc/udev/rules.d/70-pingouin.rules <<'RULES'
+SUBSYSTEM=="virtio-ports", ATTR{name}=="app.pingouin.display", TAG+="uaccess"
+RULES
+command -v restorecon >/dev/null && restorecon /usr/local/bin/pingouind /etc/systemd/system/pingouind.service \
+  /etc/systemd/user/pingouin-displays.service /etc/udev/rules.d/70-pingouin.rules
+udevadm control --reload || true
+udevadm trigger --subsystem-match=virtio-ports || true
 
 # GNOME: the Mac sends taps and clicks itself, so the virtual pad must not tap too
 user=${SUDO_USER:-}
@@ -44,5 +52,12 @@ fi
 
 systemctl daemon-reload
 systemctl enable --now pingouind.service
+systemctl --global enable pingouin-displays.service
+# Start it now in the user's running desktop session, if there is one.
+if [[ -n $user ]]; then
+  systemctl --user -M "$user@" daemon-reload 2>/dev/null &&
+    systemctl --user -M "$user@" restart pingouin-displays.service 2>/dev/null ||
+    echo "pingouin-displays starts at your next login"
+fi
 sleep 2
 journalctl -u pingouind -n 5 --no-pager
