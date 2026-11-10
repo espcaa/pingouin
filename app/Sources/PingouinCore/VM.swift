@@ -14,10 +14,14 @@ public struct VMConfig: Codable, Equatable, Sendable {
     public var sharedFolder: String?
     /// Vulkan in the guest (Venus on MoltenVK); OpenGL works either way.
     public var vulkan: Bool
+    /// The Mac draws the guest's pointer (its image, as the Mac's cursor):
+    /// smoother, but only for desktops that use virtio-gpu's cursor plane
+    /// (GNOME, KDE). Off: the guest draws it, which works everywhere.
+    public var macCursor: Bool
 
     public init(name: String, cpus: Int = VMConfig.defaultCPUs, memoryMiB: Int = VMConfig.defaultMemoryMiB,
                 diskGiB: Int = 80, isoKeyboard: Bool = false, fullPanel: Bool = true,
-                sharedFolder: String? = nil, vulkan: Bool = true) {
+                sharedFolder: String? = nil, vulkan: Bool = true, macCursor: Bool = false) {
         self.name = name
         self.cpus = cpus
         self.memoryMiB = memoryMiB
@@ -26,6 +30,7 @@ public struct VMConfig: Codable, Equatable, Sendable {
         self.fullPanel = fullPanel
         self.sharedFolder = sharedFolder
         self.vulkan = vulkan
+        self.macCursor = macCursor
     }
 
     /// Settings added later default when an older config.json lacks them.
@@ -39,6 +44,7 @@ public struct VMConfig: Codable, Equatable, Sendable {
         fullPanel = try c.decodeIfPresent(Bool.self, forKey: .fullPanel) ?? true
         sharedFolder = try c.decodeIfPresent(String.self, forKey: .sharedFolder)
         vulkan = try c.decodeIfPresent(Bool.self, forKey: .vulkan) ?? true
+        macCursor = try c.decodeIfPresent(Bool.self, forKey: .macCursor) ?? false
     }
 
     /// All cores but two: QEMU's GPU work (virgl) runs on the Mac side and needs some.

@@ -161,6 +161,10 @@ struct VMDetail: View {
                 Toggle("ISO keyboard (§ and < keys)", isOn: $vm.config.isoKeyboard)
                 Toggle("Full screen over the notch", isOn: $vm.config.fullPanel)
                 Toggle("Vulkan (needs Fedora's Mesa 26.2.4 or newer)", isOn: $vm.config.vulkan)
+                Toggle(isOn: $vm.config.macCursor) {
+                    Text("Smoother pointer")
+                    Text("macOS draws Linux's pointer. For GNOME and KDE; other desktops may show two pointers.")
+                }
                 LabeledContent("Disk", value: "\(vm.config.diskGiB) GiB (grows as used)")
             }
             .disabled(isRunning)

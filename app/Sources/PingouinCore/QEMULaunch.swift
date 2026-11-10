@@ -6,6 +6,7 @@ public enum RuntimeEnv {
     public static let icon = "PINGOUIN_ICON"
     public static let fullPanel = "PINGOUIN_FULLPANEL"
     public static let keyboard = "PINGOUIN_KEYBOARD"
+    public static let hwCursor = "PINGOUIN_HW_CURSOR"
 }
 
 /// The virtio-serial port pingouind opens in the guest
@@ -49,7 +50,10 @@ public struct QEMULaunch: Equatable, Sendable {
             "-device", "virtio-blk-pci,drive=root,bootindex=1",
             "-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0,romfile=",
             "-device", gpu,
-            "-display", "cocoa,gl=on,show-cursor=on,zoom-to-fit=on,full-grab=on,swap-opt-cmd=off",
+            // show-cursor=off: no Mac arrow over the VM, the guest draws its own
+            // pointer (any desktop). macCursor: the Mac's cursor shows the
+            // guest's pointer image instead (pingouin-cocoa-hw-cursor.patch).
+            "-display", "cocoa,gl=on,show-cursor=\(c.macCursor ? "on" : "off"),zoom-to-fit=on,full-grab=on,swap-opt-cmd=off",
             "-device", "virtio-keyboard-pci,romfile=", "-device", "virtio-tablet-pci,romfile=",
             "-audiodev", "sdl,id=snd", "-device", "intel-hda,romfile=", "-device", "hda-duplex,audiodev=snd",
             "-object", "rng-random,id=rng,filename=/dev/urandom", "-device", "virtio-rng-pci,rng=rng,romfile=",
@@ -78,6 +82,7 @@ public struct QEMULaunch: Equatable, Sendable {
         if let icon { env[RuntimeEnv.icon] = icon.path }
         if c.fullPanel { env[RuntimeEnv.fullPanel] = "1" }
         if c.isoKeyboard { env[RuntimeEnv.keyboard] = "iso" }
+        if c.macCursor { env[RuntimeEnv.hwCursor] = "1" }
 
         executable = runtime.qemu
         arguments = a
