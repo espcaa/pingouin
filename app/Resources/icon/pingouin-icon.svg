@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- macOS icon grid: 824 x 824 rounded square centred in 1024, corner radius 185 -->
+  <defs>
+    <clipPath id="tile"><rect x="100" y="100" width="824" height="824" rx="185" ry="185"/></clipPath>
+  </defs>
+  <g clip-path="url(#tile)">
+    <rect x="100" y="100.00" width="824" height="137.34" fill="#87C463"/>
+    <rect x="100" y="237.33" width="824" height="137.34" fill="#F7C751"/>
+    <rect x="100" y="374.67" width="824" height="137.34" fill="#EE9A40"/>
+    <rect x="100" y="512.00" width="824" height="137.34" fill="#DB5E51"/>
+    <rect x="100" y="649.33" width="824" height="137.34" fill="#9F57A6"/>
+    <rect x="100" y="786.67" width="824" height="137.33" fill="#54ABE1"/>
+    <!-- penguin: same size and spot as in the mockup -->
+    <image x="259" y="218" width="387" height="593" preserveAspectRatio="xMidYMid meet" xlink:href="penguin.png"/>
+  </g>
+</svg>
