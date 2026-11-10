@@ -12,6 +12,11 @@ public enum RuntimeEnv {
 /// The virtio-serial port pingouind opens in the guest
 /// (/dev/virtio-ports/<name>).
 public let gesturesPortName = "org.pingouin.gestures"
+/// The display channel's port: pingouind displays says where the guest put
+/// its screens (pingouin-cocoa-displays.patch).
+public let displayPortName = "app.pingouin.display"
+/// Screens a VM can have: the main window plus one per chosen Mac display.
+public let maxOutputs = 4
 
 /// 9p mount tags: the VM's shared folder, and the guest tools (read-only).
 public let sharedFolderTag = "pingouin"
@@ -32,7 +37,7 @@ public struct QEMULaunch: Equatable, Sendable {
         let venus = c.vulkan ? VenusPlan.forThisMac(memoryMiB: c.memoryMiB) : nil
         var machine = "virt,gic-version=3"
         if let w = venus?.highWindowGB { machine += ",highmem-mmio-size=\(w)G" }
-        var gpu = "virtio-gpu-gl-pci,max_outputs=1,xres=1920,yres=1080,romfile="
+        var gpu = "virtio-gpu-gl-pci,max_outputs=\(maxOutputs),xres=1920,yres=1080,romfile="
         if let venus { gpu += ",blob=true,venus=true,hostmem=\(venus.hostmemMB)M" }
 
         var a: [String] = [
@@ -63,6 +68,8 @@ public struct QEMULaunch: Equatable, Sendable {
             "-device", "virtio-serial-pci,id=vser,romfile=",
             "-chardev", "socket,id=gestures,path=\(file(vm.gesturesSocket)),server=on,wait=off",
             "-device", "virtserialport,bus=vser.0,chardev=gestures,name=\(gesturesPortName)",
+            "-chardev", "socket,id=display,path=\(file(vm.displaySocket)),server=on,wait=off",
+            "-device", "virtserialport,bus=vser.0,chardev=display,name=\(displayPortName)",
             "-serial", "file:\(vm.dir.appendingPathComponent("serial.log").path)",
             "-qmp", "unix:\(file(vm.controlSocket)),server=on,wait=off",
         ]
@@ -78,7 +85,9 @@ public struct QEMULaunch: Equatable, Sendable {
                   "-device", "scsi-cd,bus=scsi.0,drive=iso,bootindex=0"]
         }
 
-        var env = [RuntimeEnv.productName: "Pingouin"]
+        var env = [RuntimeEnv.productName: "Pingouin",
+                   "PINGOUIN_DISPLAY_SOCKET": vm.displaySocket.path,
+                   "PINGOUIN_DISPLAYS_CHOICES": vm.displayChoicesURL.path]
         if let icon { env[RuntimeEnv.icon] = icon.path }
         if c.fullPanel { env[RuntimeEnv.fullPanel] = "1" }
         if c.isoKeyboard { env[RuntimeEnv.keyboard] = "iso" }

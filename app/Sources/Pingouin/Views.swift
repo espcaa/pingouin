@@ -189,6 +189,8 @@ struct VMDetail: View {
                     .font(.footnote).foregroundStyle(.secondary)
             }
 
+            DisplaysSection(vm: vm)
+
             Section("Guest tools") {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(

@@ -94,6 +94,7 @@ final class AppModel: ObservableObject {
                                     guestTools: GuestTools.locate())
             try? FileManager.default.removeItem(at: vm.gesturesSocket)
             try? FileManager.default.removeItem(at: vm.controlSocket)
+            try? FileManager.default.removeItem(at: vm.displaySocket)
             FileManager.default.createFile(atPath: vm.logURL.path, contents: Data((launch.shellLine + "\n\n").utf8))
             let log = try FileHandle(forWritingTo: vm.logURL)
             log.seekToEndOfFile()

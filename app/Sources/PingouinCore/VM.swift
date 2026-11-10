@@ -93,6 +93,11 @@ public struct VM: Sendable {
     public var gesturesSocket: URL { socket("gestures") }
     /// QEMU's control socket (QMP): shut down, restart.
     public var controlSocket: URL { socket("qmp") }
+    /// The display channel (pingouind displays in the guest; QEMU's window connects).
+    public var displaySocket: URL { socket("display") }
+    /// Which Mac displays this VM uses: {"<display UUID>": true|false}, edited
+    /// by the app and by QEMU (⌃⌥D, pingouin-displays-choice.patch).
+    public var displayChoicesURL: URL { dir.appendingPathComponent("displays.json") }
 
     private func socket(_ name: String) -> URL {
         let inDir = dir.appendingPathComponent("\(name).sock")
