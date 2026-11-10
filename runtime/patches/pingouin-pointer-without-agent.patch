@@ -1,0 +1,72 @@
+From: Pingouin
+Subject: [PATCH] ui/cocoa: hide the Mac's cursor once any guest draws its pointer
+
+What: with show-cursor=off, the Mac's cursor over the VM hid only after
+Omarchy's display agent said hello on its channel (pingouin-cocoa-pointer-start:
+until then the guest may draw no pointer, at boot). Without that agent the
+cursor never hid, and the guest's pointer showed under the Mac's arrow.
+Now the guest counts as drawing its pointer once it puts a pointer image on
+virtio-gpu's cursor plane (GNOME, KDE and most Wayland desktops do), or once
+its desktop is up (the boot splash's own test: a lit picture), for guests
+that draw the pointer into the picture. A reset waits again, as before.
+Upstream: Pingouin only (it replaces the agent's hello).
+---
+diff --color -Naur a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m	2026-11-10 09:46:38
++++ b/ui/cocoa.m	2026-11-10 09:46:38
+@@ -6758,6 +6758,24 @@
+     [[NSRunLoop mainRunLoop] addTimer:pingouin_cur_watch forMode:NSRunLoopCommonModes];
+ }
+ 
++/*
++ * Pingouin, main thread: the guest draws its own pointer, so the Mac's cursor
++ * may hide over the VM (show-cursor=off). Upstream waited for Omarchy's display
++ * agent to say so; any guest does once it puts a pointer image on virtio-gpu's
++ * cursor plane (GNOME, KDE...), or once its desktop is up (a pointer drawn
++ * into the picture). A reset waits again (pingouin_pointer_guest_reset).
++ */
++static void pingouin_pointer_guest_draws(const char *why)
++{
++    if (pingouin_ptr.drawing) {
++        return;
++    }
++    info_report("cocoa: the guest draws its own pointer now (%s)", why);
++    pingouin_pointer_guest_hello(&pingouin_ptr);
++    [cocoaView pingouinUpdateMacCursor];
++    [cocoaView pingouinTakePointer:nil why:"guest pointer up"];
++}
++
+ static void cocoa_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
+ {
+     unsigned seq = pingouin_hwc.on ? qatomic_fetch_inc(&pingouin_hwc_seq) + 1 : 0;
+@@ -6765,6 +6783,7 @@
+     dispatch_async(dispatch_get_main_queue(), ^{
+         BQL_LOCK_GUARD();
+         [cocoaView setCursor:qemu_console_get_cursor(dcl->con)];
++        pingouin_pointer_guest_draws("its pointer image on the cursor plane");
+         if (seq && qatomic_read(&pingouin_hwc_seq) == seq) {
+             pingouin_hwc_take(0, qemu_console_get_cursor(dcl->con), cocoaView,
+                             qemu_console_get_width(dcl->con, 0));
+@@ -7349,6 +7368,9 @@
+             pingouin_watching = false;
+             pingouin_desktop_up = true;
+             gl_dirty = true;
++            dispatch_async(dispatch_get_main_queue(), ^{
++                pingouin_pointer_guest_draws("its desktop is up");
++            });
+             info_report("cocoa: the desktop came after the boot logo's time limit "
+                         "(%.1f s of running time after the start)", ran / 1000.0);
+         } else {
+@@ -7384,8 +7406,12 @@
+     gl_dirty = true;
+     info_report("cocoa: boot logo gives way, %s (%.1f s of running time after the start)",
+                 why, ran / 1000.0);
++    bool desktop = pingouin_desktop_up;
+     dispatch_async(dispatch_get_main_queue(), ^{
+         pingouin_intro_reveal(error);
++        if (desktop) {
++            pingouin_pointer_guest_draws("its desktop is up");
++        }
+     });
+ }
+ 
