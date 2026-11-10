@@ -11,6 +11,8 @@
 # What it sets up (nothing to download, no package manager):
 #   - pingouind, a system service: Mac trackpad gestures and ⌘ shortcuts
 #     (a virtual touchpad and keyboard through /dev/uinput);
+#   - pingouind clipboard, in the desktop session: the clipboard, shared with
+#     the Mac as text (Wayland data-control, or X11 for GNOME);
 #   - pingouind displays, in the desktop session: extra screens (where the
 #     desktop put its screens; it copies the Mac's arrangement);
 #   - the VM's shared folder (Pingouin > Shared folder) on ~/Mac.
@@ -34,8 +36,9 @@ uninstall() {
   case $init in
     systemd)
       systemctl disable --now pingouind.service 2>/dev/null || true
-      systemctl --global disable pingouin-displays.service 2>/dev/null || true
-      rm -f /etc/systemd/system/pingouind.service /etc/systemd/user/pingouin-displays.service
+      systemctl --global disable pingouin-displays.service pingouin-clipboard.service 2>/dev/null || true
+      rm -f /etc/systemd/system/pingouind.service /etc/systemd/user/pingouin-displays.service \
+        /etc/systemd/user/pingouin-clipboard.service
       systemctl daemon-reload ;;
     openrc)
       rc-service pingouind stop 2>/dev/null || true
@@ -45,7 +48,8 @@ uninstall() {
       rm -f /var/service/pingouind /etc/runit/runsvdir/default/pingouind
       rm -rf /etc/sv/pingouind ;;
   esac
-  rm -f /etc/xdg/autostart/pingouin-displays.desktop /etc/udev/rules.d/70-pingouin.rules \
+  rm -f /etc/xdg/autostart/pingouin-displays.desktop /etc/xdg/autostart/pingouin-clipboard.desktop \
+    /etc/udev/rules.d/70-pingouin.rules \
     /etc/modules-load.d/pingouin.conf /usr/local/bin/pingouind
   if grep -q "$mark" /etc/fstab 2>/dev/null; then
     awk -v m="$mark" 'index($0, m) == 0' /etc/fstab > /etc/fstab.pingouin && cat /etc/fstab.pingouin > /etc/fstab
@@ -96,16 +100,19 @@ echo uinput > /etc/modules-load.d/pingouin.conf
 install -m 755 "$bin" /usr/local/bin/pingouind
 cat > /etc/udev/rules.d/70-pingouin.rules <<'RULES'
 SUBSYSTEM=="virtio-ports", ATTR{name}=="app.pingouin.display", TAG+="uaccess"
+SUBSYSTEM=="virtio-ports", ATTR{name}=="app.pingouin.clipboard", TAG+="uaccess"
 RULES
 # The display helper also starts from the desktop's autostart, for sessions
 # without systemd's graphical-session.target (one runs; the other stands by).
 mkdir -p /etc/xdg/autostart
 install -m 644 "$here/pingouind/pingouin-displays.desktop" /etc/xdg/autostart/pingouin-displays.desktop
+install -m 644 "$here/pingouind/pingouin-clipboard.desktop" /etc/xdg/autostart/pingouin-clipboard.desktop
 case $init in
   systemd)
     install -m 644 "$here/pingouind/pingouind.service" /etc/systemd/system/pingouind.service
     mkdir -p /etc/systemd/user
-    install -m 644 "$here/pingouind/pingouin-displays.service" /etc/systemd/user/pingouin-displays.service ;;
+    install -m 644 "$here/pingouind/pingouin-displays.service" /etc/systemd/user/pingouin-displays.service
+    install -m 644 "$here/pingouind/pingouin-clipboard.service" /etc/systemd/user/pingouin-clipboard.service ;;
   openrc)
     install -m 755 "$here/pingouind/pingouind.openrc" /etc/init.d/pingouind ;;
   runit)
@@ -113,7 +120,8 @@ case $init in
     install -m 755 "$here/pingouind/pingouind.runit" /etc/sv/pingouind/run ;;
 esac
 command -v restorecon >/dev/null && restorecon -R /usr/local/bin/pingouind /etc/udev/rules.d/70-pingouin.rules \
-  /etc/xdg/autostart/pingouin-displays.desktop /etc/systemd 2>/dev/null || true
+  /etc/xdg/autostart/pingouin-displays.desktop /etc/xdg/autostart/pingouin-clipboard.desktop \
+  /etc/systemd 2>/dev/null || true
 if command -v udevadm >/dev/null; then
   udevadm control --reload || true
   udevadm trigger --subsystem-match=virtio-ports || true
@@ -172,11 +180,11 @@ case $init in
     systemctl daemon-reload
     systemctl enable pingouind.service >/dev/null
     systemctl restart pingouind.service
-    systemctl --global enable pingouin-displays.service 2>/dev/null || true
+    systemctl --global enable pingouin-displays.service pingouin-clipboard.service 2>/dev/null || true
     if [[ -n $user ]]; then
       systemctl --user -M "$user@" daemon-reload 2>/dev/null &&
-        systemctl --user -M "$user@" restart pingouin-displays.service 2>/dev/null ||
-        say "the display helper starts at your next login"
+        systemctl --user -M "$user@" restart pingouin-displays.service pingouin-clipboard.service 2>/dev/null ||
+        say "the display and clipboard helpers start at your next login"
     fi ;;
   openrc)
     rc-update add pingouind default >/dev/null

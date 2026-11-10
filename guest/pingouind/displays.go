@@ -20,15 +20,12 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 const displayPort = "/dev/virtio-ports/app.pingouin.display"
@@ -179,24 +176,7 @@ func runDisplays() {
 // One helper per session: it can be started both by its systemd user unit and
 // by the desktop's XDG autostart (install.sh adds both, for desktops that only
 // run one). The second waits here as a standby, taking over if the first ends.
-func waitForDisplaysLock() {
-	dir := os.Getenv("XDG_RUNTIME_DIR")
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	f, err := os.OpenFile(filepath.Join(dir, "pingouin-displays.lock"), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		log.Printf("displays: no lock file (%v): running anyway", err)
-		return
-	}
-	if unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) != nil {
-		log.Printf("displays: another helper runs in this session: standing by")
-		if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
-			log.Printf("displays: lock: %v: running anyway", err)
-		}
-	}
-	// f stays open (and locked) for the life of the process.
-}
+func waitForDisplaysLock() { waitForLock("pingouin-displays.lock", "displays") }
 
 var errHostGone = errors.New("Pingouin's window isn't connected")
 

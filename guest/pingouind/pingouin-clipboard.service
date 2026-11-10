@@ -1,0 +1,14 @@
+[Unit]
+Description=Pingouin: the Mac's clipboard and this desktop's, as text
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExists=/dev/virtio-ports/app.pingouin.clipboard
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/pingouind clipboard
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

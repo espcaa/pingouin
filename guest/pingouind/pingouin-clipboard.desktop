@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Pingouin clipboard
+Comment=Shares the clipboard with the Mac (text)
+Exec=/usr/local/bin/pingouind clipboard
+NoDisplay=true
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-phase=1

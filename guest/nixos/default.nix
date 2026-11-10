@@ -12,7 +12,7 @@ let
 in
 {
   options.services.pingouin = {
-    enable = lib.mkEnableOption "Pingouin's guest tools (gestures, displays, shared folder)" // { default = true; };
+    enable = lib.mkEnableOption "Pingouin's guest tools (gestures, displays, clipboard, shared folder)" // { default = true; };
     user = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -39,9 +39,10 @@ in
         wantedBy = [ "multi-user.target" ];
         serviceConfig = { ExecStart = "${pingouind}"; Restart = "always"; RestartSec = 2; };
       };
-      # extra displays: the logged-in user opens the display channel
+      # extra displays and the clipboard: the logged-in user opens their channels
       services.udev.extraRules = ''
         SUBSYSTEM=="virtio-ports", ATTR{name}=="app.pingouin.display", TAG+="uaccess"
+        SUBSYSTEM=="virtio-ports", ATTR{name}=="app.pingouin.clipboard", TAG+="uaccess"
       '';
       systemd.user.services.pingouin-displays = {
         description = "Pingouin: tell the Mac where the desktop's screens are";
@@ -50,6 +51,14 @@ in
         wantedBy = [ "graphical-session.target" ];
         unitConfig = { ConditionPathExists = "/dev/virtio-ports/app.pingouin.display"; StartLimitIntervalSec = 0; };
         serviceConfig = { ExecStart = "${pingouind} displays"; Restart = "on-failure"; RestartSec = 2; };
+      };
+      systemd.user.services.pingouin-clipboard = {
+        description = "Pingouin: the Mac's clipboard and this desktop's, as text";
+        partOf = [ "graphical-session.target" ];
+        after = [ "graphical-session.target" ];
+        wantedBy = [ "graphical-session.target" ];
+        unitConfig = { ConditionPathExists = "/dev/virtio-ports/app.pingouin.clipboard"; StartLimitIntervalSec = 0; };
+        serviceConfig = { ExecStart = "${pingouind} clipboard"; Restart = "on-failure"; RestartSec = 2; };
       };
     }
     (lib.mkIf (cfg.user != null) {

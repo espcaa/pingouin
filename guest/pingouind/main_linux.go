@@ -24,6 +24,11 @@ func main() {
 		runDisplays()
 		return
 	}
+	// The clipboard helper too (the desktop session's clipboard).
+	if len(os.Args) > 1 && os.Args[1] == "clipboard" {
+		runClipboard()
+		return
+	}
 
 	padDev, err := newDevice(deviceSpec{
 		// Apple vendor id + Magic Trackpad (USB-C) product id: libinput applies
