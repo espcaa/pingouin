@@ -1,0 +1,13 @@
+#!/bin/bash
+# Builds pingouind for the VM (linux/arm64, static) into dist/guest/.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=$root/dist/guest
+mkdir -p "$out/pingouind"
+cd "$root/guest/pingouind"
+go test ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+  -ldflags "-s -w -X main.version=${VERSION:-dev}" -o "$out/pingouind/pingouind" .
+cp pingouind.service "$out/pingouind/"
+cp "$root/guest/install.sh" "$out/"
+echo "$out"

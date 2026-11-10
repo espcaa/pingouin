@@ -1,0 +1,10 @@
+[Unit]
+Description=pingouind: Mac trackpad gestures on a virtual touchpad
+
+[Service]
+ExecStart=/usr/local/bin/pingouind
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
