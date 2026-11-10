@@ -1,0 +1,337 @@
+From: Pingouin
+Subject: [PATCH] ui/cocoa: Paste as Typing (⌃⌥V, Edit menu)
+
+What: the Mac's clipboard text typed into the VM as key presses, so text
+gets where no clipboard does (a text console, an installer, a disk password
+prompt at boot, a guest without Pingouin's tools). Each character becomes the
+keys the Mac's current layout needs: Shift and Option combinations, and a
+dead key then a key (ê is ^ then e on a French layout); Return and Tab for
+new lines and tabs. Characters the layout can't type are skipped (a notice
+says how many). The keys held for ⌃⌥V are let go first. Keys go out from a
+timer, two events every 4 ms (~150 characters a second); Esc stops. At most
+50000 characters. The guest's keyboard layout must be the Mac's, as for
+typing by hand. Edit > Paste as Typing does the same (a new Edit menu).
+Upstream: Pingouin only.
+---
+diff --color -Naur a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m	2026-11-10 20:33:43
++++ b/ui/cocoa.m	2026-11-10 20:33:43
+@@ -1115,6 +1115,10 @@
+ static void pingouin_displays_update(void);
+ /* Pingouin: ⌃⌥D, which displays the VM uses (the code is with pingouin_displays_apply). */
+ static void pingouin_choice_toggle(void);
++/* Pingouin: Paste as Typing (⌃⌥V, Edit menu); Esc stops it (code with the notices). */
++static void pingouin_paste_as_typing(void);
++static bool pingouin_typing_stop(void);
++static id pingouin_paste_target(void);
+ static void pingouin_pointer_init(void);
+ 
+ /*
+@@ -2531,6 +2535,18 @@
+                 }
+                 return true;
+             }
++            /* Pingouin: Esc while pasting as typing stops it; ⌃⌥V pastes as typing. */
++            if ([event keyCode] == kVK_Escape && pingouin_typing_stop()) {
++                return true;
++            }
++            if ([event keyCode] == kVK_ANSI_V && (modifiers & NSEventModifierFlagControl) &&
++                (modifiers & NSEventModifierFlagOption) &&
++                !(modifiers & (NSEventModifierFlagCommand | NSEventModifierFlagShift))) {
++                if (![event isARepeat]) {
++                    dispatch_async(dispatch_get_main_queue(), ^{ pingouin_paste_as_typing(); });
++                }
++                return true;
++            }
+             /* Pingouin: ⌃⌥D in full screen adds or removes a display (pingouin_choice_toggle). */
+             if ([event keyCode] == kVK_ANSI_D && (modifiers & NSEventModifierFlagControl) &&
+                 (modifiers & NSEventModifierFlagOption) &&
+@@ -6239,6 +6255,18 @@
+     [menuItem setSubmenu:menu];
+     [[NSApp mainMenu] addItem:menuItem];
+ 
++    // Pingouin: Edit menu, Paste as Typing (the Mac's clipboard typed into the VM)
++    menu = [[NSMenu alloc] initWithTitle:@"Edit"];
++    menuItem = [[[NSMenuItem alloc] initWithTitle:@"Paste as Typing"
++                                           action:@selector(pasteAsTyping:)
++                                    keyEquivalent:@"v"] autorelease];
++    [menuItem setKeyEquivalentModifierMask:NSEventModifierFlagControl | NSEventModifierFlagOption];
++    [menuItem setTarget:pingouin_paste_target()];
++    [menu addItem:menuItem];
++    menuItem = [[[NSMenuItem alloc] initWithTitle:@"Edit" action:nil keyEquivalent:@""] autorelease];
++    [menuItem setSubmenu:menu];
++    [[NSApp mainMenu] addItem:menuItem];
++
+     // View menu
+     menu = [[NSMenu alloc] initWithTitle:@"View"];
+     fullScreenMenuItem = [[[NSMenuItem alloc] initWithTitle:@"Enter Full Screen" action:@selector(doToggleFullScreen:) keyEquivalent:@"f"] autorelease];
+@@ -10909,6 +10937,269 @@
+         return;
+     }
+     pingouin_notice(nil, @"No other display to add.", 5);
++}
++
++/*
++ * Pingouin: Paste as Typing. The Mac's clipboard text typed into the VM as
++ * key presses, the keys the Mac's own layout would need (Shift, Option and
++ * dead keys too: ê is ^ then e on a French layout), so it works where no
++ * clipboard does: a text console, an installer, a disk password at boot.
++ * The guest's layout must be the Mac's (as for typing by hand). Characters
++ * the layout can't type are skipped and counted. Keys go out from a timer
++ * (two events every 4 ms); Esc stops it. ⌃⌥V or Edit > Paste as Typing.
++ */
++typedef struct PingouinTypeStep {
++    unsigned int key;   /* linux keycode */
++    bool down;
++} PingouinTypeStep;
++
++static PingouinTypeStep *pingouin_type_steps;   /* with the BQL */
++static size_t pingouin_type_n, pingouin_type_at;
++static QEMUTimer *pingouin_type_timer;
++
++#define PINGOUIN_TYPE_MAX_CHARS 50000
++#define PINGOUIN_TYPE_TICK_MS 4
++
++enum { PINGOUIN_T_SHIFT = 1, PINGOUIN_T_OPTION = 2 };
++
++typedef struct PingouinChord {
++    UInt16 key;
++    uint8_t mods;
++} PingouinChord;
++
++static UInt32 pingouin_type_carbon_mods(uint8_t m)
++{
++    return ((m & PINGOUIN_T_SHIFT ? shiftKey : 0) | (m & PINGOUIN_T_OPTION ? optionKey : 0)) >> 8;
++}
++
++static bool pingouin_type_key_ok(UInt16 key)
++{
++    /* the main block only: keypad keys depend on the guest's Num Lock */
++    return key <= kVK_ANSI_Grave || key == kVK_JIS_Yen || key == kVK_JIS_Underscore;
++}
++
++/*
++ * char -> one or two chords on this layout: direct keys first, then a dead
++ * key and a key. Values: NSData of 1 or 2 PingouinChord.
++ */
++static NSDictionary *pingouin_type_map(const UCKeyboardLayout *layout)
++{
++    NSMutableDictionary *map = [NSMutableDictionary dictionary];
++    static const uint8_t mods[4] = { 0, PINGOUIN_T_SHIFT, PINGOUIN_T_OPTION,
++                                     PINGOUIN_T_SHIFT | PINGOUIN_T_OPTION };
++
++    for (int mi = 0; mi < 4; mi++) {
++        for (UInt16 key = 0; key < 0x80; key++) {
++            if (!pingouin_type_key_ok(key)) {
++                continue;
++            }
++            UniChar c = cocoa_layout_character(layout, key, pingouin_type_carbon_mods(mods[mi]), true);
++            if (c && !map[@(c)]) {
++                PingouinChord ch = { key, mods[mi] };
++                map[@(c)] = [NSData dataWithBytes:&ch length:sizeof(ch)];
++            }
++        }
++    }
++    for (int mi = 0; mi < 4; mi++) {
++        for (UInt16 k1 = 0; k1 < 0x80; k1++) {
++            UInt32 dead = 0;
++            UniChar out[4];
++            UniCharCount n = 0;
++            if (!pingouin_type_key_ok(k1) ||
++                UCKeyTranslate(layout, k1, kUCKeyActionDown, pingouin_type_carbon_mods(mods[mi]),
++                               LMGetKbdType(), 0, &dead, 4, &n, out) != noErr || !dead) {
++                continue;
++            }
++            for (int mj = 0; mj < 4; mj++) {
++                for (UInt16 k2 = 0; k2 < 0x80; k2++) {
++                    UInt32 d = dead;
++                    if (!pingouin_type_key_ok(k2) ||
++                        UCKeyTranslate(layout, k2, kUCKeyActionDown, pingouin_type_carbon_mods(mods[mj]),
++                                       LMGetKbdType(), 0, &d, 4, &n, out) != noErr ||
++                        n != 1 || d || map[@(out[0])]) {
++                        continue;
++                    }
++                    PingouinChord ch[2] = { { k1, mods[mi] }, { k2, mods[mj] } };
++                    map[@(out[0])] = [NSData dataWithBytes:ch length:sizeof(ch)];
++                }
++            }
++        }
++    }
++    return map;
++}
++
++static void pingouin_type_push(NSMutableData *steps, unsigned int key, bool down)
++{
++    PingouinTypeStep st = { key, down };
++    [steps appendBytes:&st length:sizeof(st)];
++}
++
++static void pingouin_type_chord(NSMutableData *steps, PingouinChord c)
++{
++    if (c.mods & PINGOUIN_T_SHIFT) {
++        pingouin_type_push(steps, KEY_LEFTSHIFT, true);
++    }
++    if (c.mods & PINGOUIN_T_OPTION) {
++        pingouin_type_push(steps, KEY_LEFTALT, true);   /* as the left Option key */
++    }
++    pingouin_type_push(steps, cocoa_keycode_to_linux(c.key), true);
++    pingouin_type_push(steps, cocoa_keycode_to_linux(c.key), false);
++    if (c.mods & PINGOUIN_T_OPTION) {
++        pingouin_type_push(steps, KEY_LEFTALT, false);
++    }
++    if (c.mods & PINGOUIN_T_SHIFT) {
++        pingouin_type_push(steps, KEY_LEFTSHIFT, false);
++    }
++}
++
++/* QEMU's thread, BQL: the next keys. */
++static void pingouin_type_tick(void *opaque)
++{
++    for (int i = 0; i < 2 && pingouin_type_at < pingouin_type_n; i++) {
++        PingouinTypeStep st = pingouin_type_steps[pingouin_type_at++];
++        if (!kbd || cocoa_display_closed) {
++            pingouin_type_at = pingouin_type_n;
++            break;
++        }
++        qkbd_state_key_event(kbd, st.key, st.down);
++    }
++    if (pingouin_type_at < pingouin_type_n) {
++        timer_mod(pingouin_type_timer,
++                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + PINGOUIN_TYPE_TICK_MS);
++    } else {
++        g_free(pingouin_type_steps);
++        pingouin_type_steps = NULL;
++        pingouin_type_n = pingouin_type_at = 0;
++    }
++}
++
++/* BQL (the key handler): Esc while typing stops it; false: not typing. */
++static bool pingouin_typing_stop(void)
++{
++    if (!pingouin_type_steps) {
++        return false;
++    }
++    timer_del(pingouin_type_timer);
++    g_free(pingouin_type_steps);
++    pingouin_type_steps = NULL;
++    pingouin_type_n = pingouin_type_at = 0;
++    if (kbd) {
++        qkbd_state_lift_all_keys(kbd);
++    }
++    dispatch_async(dispatch_get_main_queue(), ^{
++        pingouin_notice(nil, @"Stopped typing.", 3);
++    });
++    return true;
++}
++
++/* Main thread. */
++static void pingouin_paste_as_typing(void)
++{
++    NSString *text = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
++    TISInputSourceRef source = TISCopyCurrentKeyboardLayoutInputSource();
++    CFDataRef data = source ? TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) : NULL;
++    const UCKeyboardLayout *layout = data ? (const UCKeyboardLayout *)CFDataGetBytePtr(data) : NULL;
++    NSMutableData *steps = [NSMutableData data];
++    NSUInteger skipped = 0, typed = 0;
++
++    if (![text length]) {
++        if (source) {
++            CFRelease(source);
++        }
++        pingouin_notice(nil, @"Nothing to paste: the clipboard has no text.", 4);
++        return;
++    }
++    if (!layout) {
++        if (source) {
++            CFRelease(source);
++        }
++        pingouin_notice(nil, @"Can't read the Mac's keyboard layout.", 4);
++        return;
++    }
++    if ([text length] > PINGOUIN_TYPE_MAX_CHARS) {
++        if (source) {
++            CFRelease(source);
++        }
++        pingouin_notice(nil, [NSString stringWithFormat:@"Too long to type (%lu characters, %d at most).",
++                              (unsigned long)[text length], PINGOUIN_TYPE_MAX_CHARS], 5);
++        return;
++    }
++    NSDictionary *map = pingouin_type_map(layout);
++    for (NSUInteger i = 0; i < [text length]; i++) {
++        UniChar c = [text characterAtIndex:i];
++        if (c == '\r') {
++            if (i + 1 < [text length] && [text characterAtIndex:i + 1] == '\n') {
++                continue;
++            }
++            c = '\n';
++        }
++        if (c == '\n' || c == '\t') {
++            unsigned int k = c == '\n' ? KEY_ENTER : KEY_TAB;
++            pingouin_type_push(steps, k, true);
++            pingouin_type_push(steps, k, false);
++            typed++;
++            continue;
++        }
++        NSData *chords = map[@(c)];
++        if (!chords) {
++            skipped++;
++            continue;
++        }
++        const PingouinChord *ch = [chords bytes];
++        for (NSUInteger j = 0; j < [chords length] / sizeof(PingouinChord); j++) {
++            pingouin_type_chord(steps, ch[j]);
++        }
++        typed++;
++    }
++    CFRelease(source);
++
++    size_t n = [steps length] / sizeof(PingouinTypeStep);
++    PingouinTypeStep *copy = g_memdup2([steps bytes], [steps length]);
++    with_bql(^{
++        if (pingouin_type_steps) {
++            timer_del(pingouin_type_timer);
++            g_free(pingouin_type_steps);
++        }
++        if (!pingouin_type_timer) {
++            pingouin_type_timer = timer_new_ms(QEMU_CLOCK_REALTIME, pingouin_type_tick, NULL);
++        }
++        if (kbd) {
++            /* the keys held for ⌃⌥V must not modify the text */
++            qkbd_state_lift_all_keys(kbd);
++        }
++        pingouin_type_steps = copy;
++        pingouin_type_n = n;
++        pingouin_type_at = 0;
++        timer_mod(pingouin_type_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 30);
++    });
++    info_report("cocoa: paste as typing: %lu characters, %lu skipped",
++                (unsigned long)typed, (unsigned long)skipped);
++    if (skipped) {
++        pingouin_notice(nil, [NSString stringWithFormat:
++                              @"Typing %lu characters. %lu can't be typed on this keyboard layout and are skipped. Esc stops.",
++                              (unsigned long)typed, (unsigned long)skipped], 6);
++    } else if (typed > 200) {
++        pingouin_notice(nil, [NSString stringWithFormat:@"Typing %lu characters… Esc stops.",
++                              (unsigned long)typed], 4);
++    }
++}
++
++@interface PingouinPasteTarget : NSObject
++@end
++@implementation PingouinPasteTarget
++- (void)pasteAsTyping:(id)sender
++{
++    pingouin_paste_as_typing();
++}
++@end
++
++static id pingouin_paste_target(void)
++{
++    static PingouinPasteTarget *t;
++    if (!t) {
++        t = [[PingouinPasteTarget alloc] init];
++    }
++    return t;
+ }
+ 
+ /*
