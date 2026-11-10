@@ -6,8 +6,11 @@ import PingouinCore
 /// A running VM: QEMU as a child process (so macOS counts it under
 /// Pingouin.app's Accessibility grant) plus its gestures bridge.
 final class RunningVM {
+    enum Phase { case running, shuttingDown, restarting, forceStopping }
+
     let process: Process
     var gestures: GesturesBridge?
+    var phase = Phase.running
 
     init(process: Process, gestures: GesturesBridge?) {
         self.process = process
@@ -19,6 +22,8 @@ final class RunningVM {
 final class AppModel: ObservableObject {
     @Published var vms: [VM] = []
     @Published var running: [String: RunningVM] = [:]
+    /// What each running VM is doing (RunningVM.phase, published for the UI).
+    @Published var phases: [String: RunningVM.Phase] = [:]
     @Published var error: String?
     @Published var hasAccessibility = GesturesBridge.hasAccessibility
     @Published var hasInputMonitoring = GesturesBridge.hasInputMonitoring
@@ -87,6 +92,7 @@ final class AppModel: ObservableObject {
                                     iso: iso, icon: Bundle.main.url(forResource: "Pingouin", withExtension: "icns"),
                                     guestTools: GuestTools.locate())
             try? FileManager.default.removeItem(at: vm.gesturesSocket)
+            try? FileManager.default.removeItem(at: vm.controlSocket)
             FileManager.default.createFile(atPath: vm.logURL.path, contents: Data((launch.shellLine + "\n\n").utf8))
             let log = try FileHandle(forWritingTo: vm.logURL)
             log.seekToEndOfFile()
@@ -109,20 +115,58 @@ final class AppModel: ObservableObject {
                 gestures?.start()
             }
             running[name] = RunningVM(process: p, gestures: gestures)
+            phases[name] = .running
         } catch {
             self.error = "\(error)"
         }
     }
 
-    /// Asks the guest to shut down (ACPI power button), like closing QEMU's window.
-    func stop(_ vm: VM) {
-        running[vm.config.name]?.process.interrupt()
+    /// Presses the VM's power button: Linux shuts down cleanly, then QEMU quits.
+    func shutDown(_ vm: VM) { powerButton(vm, then: .shuttingDown) }
+
+    /// Shuts down cleanly, then starts again (from the disk: an installer ISO
+    /// is only for the run it was booted with).
+    func restart(_ vm: VM) { powerButton(vm, then: .restarting) }
+
+    /// Quits QEMU at once, like pulling the plug (for a VM that won't shut down).
+    func forceStop(_ vm: VM) {
+        guard let r = running[vm.config.name] else { return }
+        set(r, vm.config.name, .forceStopping)
+        r.process.terminate()
+    }
+
+    /// Resets the VM at once, like a reset button (no clean shutdown).
+    func forceRestart(_ vm: VM) { qmp(vm, "system_reset") }
+
+    private func powerButton(_ vm: VM, then phase: RunningVM.Phase) {
+        guard let r = running[vm.config.name] else { return }
+        set(r, vm.config.name, phase)
+        qmp(vm, "system_powerdown")
+    }
+
+    private func set(_ r: RunningVM, _ name: String, _ phase: RunningVM.Phase) {
+        r.phase = phase
+        phases[name] = phase
+    }
+
+    private func qmp(_ vm: VM, _ command: String) {
+        let socket = vm.controlSocket
+        Task.detached {
+            do { try QMP.run(command, socket: socket) } catch {
+                await MainActor.run { self.error = "\(vm.config.name): \(error)" }
+            }
+        }
     }
 
     private func stopped(_ name: String, status: Int32) {
+        let phase = running[name]?.phase
         running[name]?.gestures?.stop()
         running[name] = nil
-        if status != 0, let vm = vms.first(where: { $0.config.name == name }) {
+        phases[name] = nil
+        guard let vm = vms.first(where: { $0.config.name == name }) else { return }
+        if phase == .restarting {
+            start(vm)
+        } else if status != 0 && phase != .forceStopping {
             error = "\(name) stopped with status \(status). See \(vm.logURL.path)"
         }
     }

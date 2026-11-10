@@ -60,6 +60,7 @@ public struct QEMULaunch: Equatable, Sendable {
             "-chardev", "socket,id=gestures,path=\(file(vm.gesturesSocket)),server=on,wait=off",
             "-device", "virtserialport,bus=vser.0,chardev=gestures,name=\(gesturesPortName)",
             "-serial", "file:\(vm.dir.appendingPathComponent("serial.log").path)",
+            "-qmp", "unix:\(file(vm.controlSocket)),server=on,wait=off",
         ]
         // Files the guest writes are made by QEMU, so they're the Mac user's.
         if let folder = c.sharedFolder {

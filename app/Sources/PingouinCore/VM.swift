@@ -84,10 +84,14 @@ public struct VM: Sendable {
 
     /// The gestures channel's socket. Unix socket paths max out at 104 bytes,
     /// so a long home folder falls back to a short path in /tmp.
-    public var gesturesSocket: URL {
-        let inDir = dir.appendingPathComponent("gestures.sock")
+    public var gesturesSocket: URL { socket("gestures") }
+    /// QEMU's control socket (QMP): shut down, restart.
+    public var controlSocket: URL { socket("qmp") }
+
+    private func socket(_ name: String) -> URL {
+        let inDir = dir.appendingPathComponent("\(name).sock")
         if inDir.path.utf8.count < 100 { return inDir }
-        return URL(fileURLWithPath: "/tmp/pingouin-\(getuid())-\(config.name).sock")
+        return URL(fileURLWithPath: "/tmp/pingouin-\(getuid())-\(config.name)-\(name).sock")
     }
 
     public func save() throws {

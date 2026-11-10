@@ -181,7 +181,22 @@ struct VMDetail: View {
             Section {
                 HStack {
                     if isRunning {
-                        Button("Shut Down") { model.stop(vm) }
+                        switch model.phases[vm.config.name] {
+                        case .shuttingDown?:
+                            ProgressView().controlSize(.small)
+                            Text("Shutting down…").foregroundStyle(.secondary)
+                        case .restarting?:
+                            ProgressView().controlSize(.small)
+                            Text("Restarting…").foregroundStyle(.secondary)
+                        default:
+                            Button("Shut Down") { model.shutDown(vm) }
+                            Button("Restart") { model.restart(vm) }
+                        }
+                        Menu("Force") {
+                            Button("Force Restart") { model.forceRestart(vm) }
+                            Button("Force Stop", role: .destructive) { model.forceStop(vm) }
+                        }
+                        .fixedSize()
                     } else {
                         Button("Start") { model.start(vm) }.keyboardShortcut(.defaultAction)
                         Button("Boot Installer ISO…") { pickingISO = true }

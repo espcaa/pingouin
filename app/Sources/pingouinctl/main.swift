@@ -33,7 +33,7 @@ func intOption(_ name: String) -> Int? {
 
 let store = VMStore.default
 guard let command = args.first else {
-    fail("usage: pingouinctl list | create <name> | args <name> [--iso FILE] | run <name> [--iso FILE]")
+    fail("usage: pingouinctl list | create <name> | args <name> [--iso FILE] | run <name> [--iso FILE] | shutdown <name> | reset <name>")
 }
 args.removeFirst()
 
@@ -55,6 +55,11 @@ do {
         if flag("--no-fullpanel") { c.fullPanel = false }
         let vm = try store.create(c)
         print("created \(vm.dir.path)")
+
+    case "shutdown", "reset":
+        guard let name = args.first else { fail("\(command): which VM?") }
+        let vm = try store.load(name)
+        try QMP.run(command == "shutdown" ? "system_powerdown" : "system_reset", socket: vm.controlSocket)
 
     case "args", "run":
         let iso = option("--iso").map { URL(fileURLWithPath: $0) }
