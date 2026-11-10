@@ -10,15 +10,19 @@ public struct VMConfig: Codable, Equatable, Sendable {
     public var isoKeyboard: Bool
     /// Full screen over the notch strip too (the whole panel).
     public var fullPanel: Bool
+    /// A Mac folder the guest sees as ~/Mac (virtio-9p, mount tag "pingouin").
+    public var sharedFolder: String?
 
     public init(name: String, cpus: Int = VMConfig.defaultCPUs, memoryMiB: Int = VMConfig.defaultMemoryMiB,
-                diskGiB: Int = 80, isoKeyboard: Bool = false, fullPanel: Bool = true) {
+                diskGiB: Int = 80, isoKeyboard: Bool = false, fullPanel: Bool = true,
+                sharedFolder: String? = nil) {
         self.name = name
         self.cpus = cpus
         self.memoryMiB = memoryMiB
         self.diskGiB = diskGiB
         self.isoKeyboard = isoKeyboard
         self.fullPanel = fullPanel
+        self.sharedFolder = sharedFolder
     }
 
     /// All cores but two: QEMU's GPU work (virgl) runs on the Mac side and needs some.
@@ -38,6 +42,7 @@ public enum VMError: Error, CustomStringConvertible {
     case invalidName(String)
     case exists(String)
     case notFound(String)
+    case running(String)
     case runtimeMissing([String])
 
     public var description: String {
@@ -45,6 +50,7 @@ public enum VMError: Error, CustomStringConvertible {
         case .invalidName(let n): return "invalid VM name \"\(n)\" (letters, digits, - and _ only)"
         case .exists(let n): return "a VM named \"\(n)\" already exists"
         case .notFound(let n): return "no VM named \"\(n)\""
+        case .running(let n): return "\"\(n)\" is running; shut it down first"
         case .runtimeMissing(let tried): return "QEMU runtime not found; looked in:\n  " + tried.joined(separator: "\n  ")
         }
     }
@@ -115,6 +121,11 @@ public struct VMStore: Sendable {
         try sparseFile(vm.varsURL, bytes: 64 << 20) // the size QEMU's virt pflash expects
         try vm.save()
         return vm
+    }
+
+    /// Moves the VM's folder to the Trash (a symlinked VM: only the link).
+    public func delete(_ vm: VM) throws {
+        try FileManager.default.trashItem(at: vm.dir, resultingItemURL: nil)
     }
 
     private func sparseFile(_ url: URL, bytes: UInt64) throws {

@@ -28,6 +28,10 @@ else
   exit 1
 fi
 
+# The guest tools (pingouind, install.sh), shown to every VM read-only
+"$root/guest/build.sh" >/dev/null
+ditto "$root/dist/guest" "$out/Contents/Resources/guest"
+
 # The hardened runtime turns on library validation: QEMU may then only load
 # dylibs signed by the same team. Ad-hoc and self-signed (development)
 # signatures have no team, so only a Developer ID gets the hardened runtime

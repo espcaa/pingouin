@@ -23,6 +23,7 @@ struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @State private var selection: String?
     @State private var creating = false
+    @State private var deleting: VM?
 
     var body: some View {
         NavigationSplitView {
@@ -33,6 +34,12 @@ struct ContentView: View {
                     if model.running[vm.config.name] != nil {
                         Circle().fill(.green).frame(width: 8, height: 8)
                     }
+                }
+                .contextMenu {
+                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([vm.dir]) }
+                    Divider()
+                    Button("Move to Trash…", role: .destructive) { deleting = vm }
+                        .disabled(model.running[vm.config.name] != nil)
                 }
             }
             .safeAreaInset(edge: .bottom) {
@@ -49,12 +56,24 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 if !model.hasGesturePermissions { PermissionBanner() }
                 if let name = selection, let vm = model.vms.first(where: { $0.config.name == name }) {
-                    VMDetail(vm: vm).id(name)
+                    VMDetail(vm: vm, deleting: $deleting).id(name)
                 } else {
                     ContentUnavailableView("No VM selected", systemImage: "macwindow",
                                            description: Text("Make one with New VM, then boot a Linux installer ISO."))
                 }
             }
+        }
+        .confirmationDialog("Move \"\(deleting?.config.name ?? "")\" to the Trash?",
+                            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
+            Button("Move to Trash", role: .destructive) {
+                if let vm = deleting {
+                    model.delete(vm)
+                    if selection == vm.config.name { selection = model.vms.first?.config.name }
+                }
+                deleting = nil
+            }
+        } message: {
+            Text("Its disk and settings go to the Trash; empty the Trash to free the space.")
         }
         .sheet(isPresented: $creating) {
             NewVMSheet { vm in selection = vm.config.name }
@@ -104,6 +123,7 @@ struct PermissionBanner: View {
 struct VMDetail: View {
     @EnvironmentObject var model: AppModel
     @State var vm: VM
+    @Binding var deleting: VM?
     @State private var pickingISO = false
 
     var isRunning: Bool { model.running[vm.config.name] != nil }
@@ -123,6 +143,41 @@ struct VMDetail: View {
             .onChange(of: vm.config) { model.save(vm) }
 
             Section {
+                LabeledContent("Shared folder") {
+                    HStack {
+                        if let f = vm.config.sharedFolder {
+                            Text((f as NSString).abbreviatingWithTildeInPath)
+                                .lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
+                            Button("Remove") { vm.config.sharedFolder = nil }
+                        } else {
+                            Text("None").foregroundStyle(.secondary)
+                        }
+                        Button("Choose…", action: chooseFolder)
+                    }
+                }
+                .disabled(isRunning)
+            } footer: {
+                Text("Shows up as ~/Mac inside Linux (after installing the guest tools below).")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+
+            Section("Guest tools") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Trackpad gestures, ⌘ shortcuts and the shared folder need Pingouin's tools in Linux. Once, in a terminal inside the VM:")
+                        .font(.callout)
+                    HStack {
+                        Text(guestInstallCommand)
+                            .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                        Spacer()
+                        Button("Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(guestInstallCommand, forType: .string)
+                        }
+                    }
+                }
+            }
+
+            Section {
                 HStack {
                     if isRunning {
                         Button("Shut Down") { model.stop(vm) }
@@ -132,6 +187,7 @@ struct VMDetail: View {
                     }
                     Spacer()
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([vm.dir]) }
+                    Button("Move to Trash…", role: .destructive) { deleting = vm }.disabled(isRunning)
                 }
             } footer: {
                 Text("After installing, shut the VM down (don't reboot) and press Start: the ISO is only attached for the run you boot it with.")
@@ -143,6 +199,20 @@ struct VMDetail: View {
         .fileImporter(isPresented: $pickingISO, allowedContentTypes: [UTType(filenameExtension: "iso") ?? .data]) { result in
             if case .success(let url) = result { model.start(vm, iso: url) }
         }
+    }
+}
+
+let guestInstallCommand = "sudo mount -t 9p -o trans=virtio,ro pingouin-tools /mnt && sudo bash /mnt/install.sh; sudo umount /mnt"
+
+extension VMDetail {
+    func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Share"
+        panel.message = "The folder \(vm.config.name) sees as ~/Mac"
+        if panel.runModal() == .OK, let url = panel.url { vm.config.sharedFolder = url.path }
     }
 }
 

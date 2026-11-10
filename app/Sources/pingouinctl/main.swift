@@ -61,7 +61,7 @@ do {
         if let iso, !FileManager.default.fileExists(atPath: iso.path) { fail("no such file: \(iso.path)") }
         guard let name = args.first else { fail("\(command): which VM?") }
         let vm = try store.load(name)
-        let launch = QEMULaunch(vm: vm, runtime: try Runtime.locate(), iso: iso)
+        let launch = QEMULaunch(vm: vm, runtime: try Runtime.locate(), iso: iso, guestTools: GuestTools.locate())
         if command == "args" {
             print(launch.shellLine)
             break

@@ -45,3 +45,14 @@ public struct Runtime: Sendable {
         return nil
     }
 }
+
+/// pingouind and install.sh, for the guest: the app's Resources/guest, or this
+/// repo's dist/guest (guest/build.sh) during development.
+public enum GuestTools {
+    public static func locate(bundle: Bundle = .main) -> URL? {
+        var dirs: [URL] = []
+        if let res = bundle.resourceURL { dirs.append(res.appendingPathComponent("guest")) }
+        if let repo = Runtime.guessRepoRoot() { dirs.append(repo.appendingPathComponent("dist/guest")) }
+        return dirs.first { FileManager.default.fileExists(atPath: $0.appendingPathComponent("install.sh").path) }
+    }
+}

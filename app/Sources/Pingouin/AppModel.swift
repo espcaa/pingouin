@@ -74,11 +74,18 @@ final class AppModel: ObservableObject {
         do { try vm.save(); reload() } catch { self.error = "\(error)" }
     }
 
+    /// Moves a stopped VM to the Trash.
+    func delete(_ vm: VM) {
+        guard running[vm.config.name] == nil else { error = "\(VMError.running(vm.config.name))"; return }
+        do { try store.delete(vm); reload() } catch { self.error = "\(error)" }
+    }
+
     func start(_ vm: VM, iso: URL? = nil) {
         guard running[vm.config.name] == nil else { return }
         do {
             let launch = QEMULaunch(vm: vm, runtime: try Runtime.locate(),
-                                    iso: iso, icon: Bundle.main.url(forResource: "Pingouin", withExtension: "icns"))
+                                    iso: iso, icon: Bundle.main.url(forResource: "Pingouin", withExtension: "icns"),
+                                    guestTools: GuestTools.locate())
             try? FileManager.default.removeItem(at: vm.gesturesSocket)
             FileManager.default.createFile(atPath: vm.logURL.path, contents: Data((launch.shellLine + "\n\n").utf8))
             let log = try FileHandle(forWritingTo: vm.logURL)

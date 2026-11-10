@@ -12,6 +12,10 @@ public enum RuntimeEnv {
 /// (/dev/virtio-ports/<name>).
 public let gesturesPortName = "org.pingouin.gestures"
 
+/// 9p mount tags: the VM's shared folder, and the guest tools (read-only).
+public let sharedFolderTag = "pingouin"
+public let guestToolsTag = "pingouin-tools"
+
 public struct QEMULaunch: Equatable, Sendable {
     public var executable: URL
     public var arguments: [String]
@@ -19,7 +23,9 @@ public struct QEMULaunch: Equatable, Sendable {
 
     /// QEMU's command line for a VM. `iso` is attached as a CD for this run only
     /// and boots first (installing); without it the VM boots from its disk.
-    public init(vm: VM, runtime: Runtime, iso: URL? = nil, icon: URL? = nil) {
+    /// `guestTools`: the folder with pingouind and install.sh (the app's
+    /// Resources/guest), shown to every VM read-only.
+    public init(vm: VM, runtime: Runtime, iso: URL? = nil, icon: URL? = nil, guestTools: URL? = nil) {
         let c = vm.config
         func file(_ u: URL) -> String { u.path.replacingOccurrences(of: ",", with: ",,") }
 
@@ -50,6 +56,13 @@ public struct QEMULaunch: Equatable, Sendable {
             "-device", "virtserialport,bus=vser.0,chardev=gestures,name=\(gesturesPortName)",
             "-serial", "file:\(vm.dir.appendingPathComponent("serial.log").path)",
         ]
+        // Files the guest writes are made by QEMU, so they're the Mac user's.
+        if let folder = c.sharedFolder {
+            a += ["-virtfs", "local,id=share,path=\(file(URL(fileURLWithPath: folder))),mount_tag=\(sharedFolderTag),security_model=none"]
+        }
+        if let guestTools {
+            a += ["-virtfs", "local,id=tools,path=\(file(guestTools)),mount_tag=\(guestToolsTag),security_model=none,readonly=on"]
+        }
         if let iso {
             a += ["-drive", "if=none,id=iso,format=raw,readonly=on,media=cdrom,file=\(file(iso))",
                   "-device", "scsi-cd,bus=scsi.0,drive=iso,bootindex=0"]
