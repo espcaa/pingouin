@@ -28,11 +28,16 @@ public struct QEMULaunch: Equatable, Sendable {
     public init(vm: VM, runtime: Runtime, iso: URL? = nil, icon: URL? = nil, guestTools: URL? = nil) {
         let c = vm.config
         func file(_ u: URL) -> String { u.path.replacingOccurrences(of: ",", with: ",,") }
+        let venus = c.vulkan ? VenusPlan.forThisMac(memoryMiB: c.memoryMiB) : nil
+        var machine = "virt,gic-version=3"
+        if let w = venus?.highWindowGB { machine += ",highmem-mmio-size=\(w)G" }
+        var gpu = "virtio-gpu-gl-pci,max_outputs=1,xres=1920,yres=1080,romfile="
+        if let venus { gpu += ",blob=true,venus=true,hostmem=\(venus.hostmemMB)M" }
 
         var a: [String] = [
             // (no process=: QEMU exits on macOS, which can't rename processes)
             "-name", "guest=\(c.name)",
-            "-machine", "virt,gic-version=3", "-accel", "hvf",
+            "-machine", machine, "-accel", "hvf",
             "-cpu", "host,pmu=off", "-smp", "\(c.cpus)", "-m", "\(c.memoryMiB)M",
             "-nodefaults",
             "-drive", "if=pflash,format=raw,readonly=on,file=\(file(runtime.firmware))",
@@ -43,7 +48,7 @@ public struct QEMULaunch: Equatable, Sendable {
             "-drive", "if=none,id=root,format=raw,cache=writeback,file=\(file(vm.diskURL))",
             "-device", "virtio-blk-pci,drive=root,bootindex=1",
             "-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0,romfile=",
-            "-device", "virtio-gpu-gl-pci,max_outputs=1,xres=1920,yres=1080,romfile=",
+            "-device", gpu,
             "-display", "cocoa,gl=on,show-cursor=on,zoom-to-fit=on,full-grab=on,swap-opt-cmd=off",
             "-device", "virtio-keyboard-pci,romfile=", "-device", "virtio-tablet-pci,romfile=",
             "-audiodev", "sdl,id=snd", "-device", "intel-hda,romfile=", "-device", "hda-duplex,audiodev=snd",

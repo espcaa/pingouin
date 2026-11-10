@@ -1,0 +1,321 @@
+From: OmacVM
+Subject: [PATCH] socket: non-blocking datagram sockets, drop what the host
+ cannot take at once
+
+What: UDP, ICMP and ICMPv6 sockets (and the listening TCP socket of a host
+forward) are non-blocking from creation. A sendto() that the host cannot
+take at once (EAGAIN/EWOULDBLOCK, or ENOBUFS from a full interface queue)
+drops the datagram like a busy link would, instead of answering the guest
+with ICMP "network unreachable": it is counted, and logged at most once a
+minute with its destination ("dropped a datagram to A port P ..."). The
+count is the last line of slirp_connection_info() (QEMU: "info usernet").
+Receives that find nothing after all (EAGAIN) keep the socket.
+
+Why (incident 2026-10-05 14:21, OmacVM 2.9.0 RC12 on a Mac mini, macOS 27):
+the whole VM froze. sample(1) showed QEMU's main loop thread, holding the
+BQL, in virtio_net_tx_bh -> net_slirp_receive -> udp_input -> sosendto ->
+__sendto for the full sample; every vCPU thread waited for the BQL. libslirp
+4.9.4 creates its UDP sockets blocking and sends with flags 0, so when macOS
+cannot queue a datagram at once (send buffer space held back, e.g. by a
+network extension content filter, which XNU's sosend counts against the
+socket's send space) sendto() waits in sbwait() - with QEMU's main loop and
+the BQL. Earlier stalls at 13:59 and ~14:05 the same day fit the same cause
+(guest event links dropped and came back). TCP sockets were already
+non-blocking (tcp_fconnect, tcp_connect); the listening socket of a host
+forward was not, and accept() on it could wait the same way when a client
+resets between poll and accept().
+
+Checked, not changed: TCP sends (slirp_send) are on non-blocking sockets;
+the DNS forwarder sends through sosendto (covered here); its host server
+lookup (res_ninit) is local and cached for 1 s; guestfwd/exec paths
+(fork_exec, open_unix) are not used by QEMU's -netdev user in OmacVM.
+
+Upstream: not sent yet. Written against libslirp 4.9.4 after
+libslirp-darwin-icmp-matching.patch, libslirp-ipv4-udp-translation.patch and
+pingouin-libslirp-host-ports.patch; nothing in it depends on them.
+
+Test: app/runtime/Tests/net/test-slirp-udp-stall.sh (run by the runtime
+build): a real QEMU with -netdev user and a guest-side socket; a sendto()
+stall injected with XNU's semantics (blocking socket: waits; non-blocking:
+EAGAIN). Old runtime: QMP stops answering (hang). This one: QMP and slirp's
+ping keep answering, the drops are counted and logged.
+
+diff --git a/src/ip6_icmp.c b/src/ip6_icmp.c
+index abb1a99..ccda58b 100644
+--- a/src/ip6_icmp.c
++++ b/src/ip6_icmp.c
+@@ -101,7 +101,9 @@ static int icmp6_send(struct socket *so, struct mbuf *m, int hlen)
+                (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+         DEBUG_MISC("icmp6_input icmp sendto tx errno = %d-%s", errno,
+                    g_strerror(errno));
+-        icmp6_send_error(m, ICMP6_UNREACH, ICMP6_UNREACH_NO_ROUTE);
++        if (!sodrop_busy(slirp, errno, (struct sockaddr *)&addr)) {
++            icmp6_send_error(m, ICMP6_UNREACH, ICMP6_UNREACH_NO_ROUTE);
++        }
+         icmp_detach(so);
+     }
+ 
+@@ -252,6 +254,11 @@ void icmp6_receive(struct socket *so)
+     id = icp->icmp6_id;
+     seq = icp->icmp6_seq;
+     len = recv(so->s, icp, M_ROOM(m), 0);
++    if (len == -1 && so_would_block(errno)) {
++        m->m_data -= hlen;
++        m->m_len += hlen;
++        return;
++    }
+ 
+     icp->icmp6_id = id;
+     icp->icmp6_seq = seq;
+@@ -622,7 +629,9 @@ void icmp6_input(struct mbuf *m)
+                        (struct sockaddr *)&addr, sockaddr_size(&addr)) == -1) {
+                 DEBUG_MISC("icmp6_input udp sendto tx errno = %d-%s", errno,
+                            g_strerror(errno));
+-                icmp6_send_error(m, ICMP6_UNREACH, ICMP6_UNREACH_NO_ROUTE);
++                if (!sodrop_busy(slirp, errno, (struct sockaddr *)&addr)) {
++                    icmp6_send_error(m, ICMP6_UNREACH, ICMP6_UNREACH_NO_ROUTE);
++                }
+                 udp_detach(so);
+             }
+         } /* if (in6_equal_host(&ip->ip_dst)) */
+diff --git a/src/ip_icmp.c b/src/ip_icmp.c
+index e1bbf07..1035104 100644
+--- a/src/ip_icmp.c
++++ b/src/ip_icmp.c
+@@ -150,7 +150,10 @@ static int icmp_send(struct socket *so, struct mbuf *m, int hlen)
+                (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+         DEBUG_MISC("icmp_input icmp sendto tx errno = %d-%s", errno,
+                    g_strerror(errno));
+-        icmp_send_error(m, ICMP_UNREACH, ICMP_UNREACH_NET, 0, g_strerror(errno));
++        if (!sodrop_busy(slirp, errno, (struct sockaddr *)&addr)) {
++            icmp_send_error(m, ICMP_UNREACH, ICMP_UNREACH_NET, 0,
++                            g_strerror(errno));
++        }
+         icmp_detach(so);
+     }
+ 
+@@ -265,8 +268,10 @@ void icmp_input(struct mbuf *m, int hlen)
+                        (struct sockaddr *)&addr, sockaddr_size(&addr)) == -1) {
+                 DEBUG_MISC("icmp_input udp sendto tx errno = %d-%s", errno,
+                            g_strerror(errno));
+-                icmp_send_error(m, ICMP_UNREACH, ICMP_UNREACH_NET, 0,
+-                                g_strerror(errno));
++                if (!sodrop_busy(slirp, errno, (struct sockaddr *)&addr)) {
++                    icmp_send_error(m, ICMP_UNREACH, ICMP_UNREACH_NET, 0,
++                                    g_strerror(errno));
++                }
+                 udp_detach(so);
+             }
+         } /* if ip->ip_dst.s_addr == alias_addr.s_addr */
+@@ -555,6 +560,11 @@ void icmp_receive(struct socket *so)
+ 
+     id = icp->icmp_id;
+     len = recv(so->s, icp, M_ROOM(m), 0);
++    if (len == -1 && so_would_block(errno)) {
++        m->m_data -= hlen;
++        m->m_len += hlen;
++        return;
++    }
+ 
+     if (so->so_type == IPPROTO_IP) {
+         if (len >= sizeof(struct ip)) {
+diff --git a/src/misc.c b/src/misc.c
+index e5e2164..2fc7ef8 100644
+--- a/src/misc.c
++++ b/src/misc.c
+@@ -393,6 +393,9 @@ char *slirp_connection_info(Slirp *slirp)
+                                so->so_rcv.sb_cc, so->so_snd.sb_cc);
+     }
+ 
++    g_string_append_printf(str, "  Datagrams dropped (host busy): %" PRIu64 "\n",
++                           slirp->busy_drops);
++
+     return g_string_free(str, FALSE);
+ }
+ 
+diff --git a/src/slirp.h b/src/slirp.h
+index 6333031..fdf70aa 100644
+--- a/src/slirp.h
++++ b/src/slirp.h
+@@ -218,6 +218,10 @@ struct Slirp {
+     struct sockaddr_in *outbound_addr;
+     struct sockaddr_in6 *outbound_addr6;
+     bool disable_dns; /* slirp will not redirect/serve any DNS packet */
++
++    /* Datagrams dropped because the host could not take them at once */
++    uint64_t busy_drops;
++    int64_t busy_drop_said_ns; /* when the last drop was logged */
+ };
+ 
+ /*
+diff --git a/src/socket.c b/src/socket.c
+index c3870f0..c84a938 100644
+--- a/src/socket.c
++++ b/src/socket.c
+@@ -576,6 +576,9 @@ void sorecvfrom(struct socket *so)
+ 
+         len = recvfrom(so->s, buff, 256, 0, (struct sockaddr *)&addr, &addrlen);
+         /* XXX Check if reply is "correct"? */
++        if (len == -1 && so_would_block(errno)) {
++            return;
++        }
+ 
+         if (len == -1 || len == 0) {
+             uint8_t code = ICMP_UNREACH_PORT;
+@@ -598,6 +601,9 @@ void sorecvfrom(struct socket *so)
+ 
+         len = recvfrom(so->s, buff, 256, 0, (struct sockaddr *)&addr, &addrlen);
+         /* XXX Check if reply is "correct"? */
++        if (len == -1 && so_would_block(errno)) {
++            return;
++        }
+ 
+         if (len == -1 || len == 0) {
+             uint8_t code = ICMP6_UNREACH_PORT;
+@@ -664,7 +670,10 @@ void sorecvfrom(struct socket *so)
+         DEBUG_MISC(" did recvfrom %d, errno = %d-%s", m->m_len, errno,
+                    g_strerror(errno));
+         if (m->m_len < 0) {    	
+-            if (errno == ENOTCONN) {
++            if (so_would_block(errno)) {
++                /* Nothing to read after all: keep the socket */
++                m_free(m);
++            } else if (errno == ENOTCONN) {
+                 /*
+                  * UDP socket got burnt, e.g. by suspend on iOS. Tear it down
+                  * and let it get re-created if the guest still needs it
+@@ -764,6 +773,51 @@ void sorecvfrom(struct socket *so)
+     } /* if ping packet */
+ }
+ 
++/* The socket is non-blocking and has nothing (or no room) right now. */
++bool so_would_block(int err)
++{
++    return err == EAGAIN || err == EWOULDBLOCK || err == EINTR;
++}
++
++/*
++ * A datagram the host could not take at once: its send buffer is full, the
++ * interface queue is full (ENOBUFS), or a network filter still holds earlier
++ * data. Drop it, as a busy link would; the guest's protocols retry. Waiting
++ * instead would stop the caller's main loop and with it the whole VM.
++ * Returns true when err is such a case (counted, logged at most once a
++ * minute with the destination); false for a real error.
++ */
++bool sodrop_busy(Slirp *slirp, int err, const struct sockaddr *dst)
++{
++    char addr[INET6_ADDRSTRLEN] = "?";
++    unsigned port = 0;
++    int64_t now;
++
++    if (err != EAGAIN && err != EWOULDBLOCK && err != ENOBUFS) {
++        return false;
++    }
++    slirp->busy_drops++;
++    now = slirp->cb->clock_get_ns(slirp->opaque);
++    if (slirp->busy_drops > 1 &&
++        now - slirp->busy_drop_said_ns < 60 * 1000000000LL) {
++        return true;
++    }
++    slirp->busy_drop_said_ns = now;
++    if (dst && dst->sa_family == AF_INET) {
++        const struct sockaddr_in *sin = (const struct sockaddr_in *)dst;
++        inet_ntop(AF_INET, &sin->sin_addr, addr, sizeof(addr));
++        port = ntohs(sin->sin_port);
++    } else if (dst && dst->sa_family == AF_INET6) {
++        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)dst;
++        inet_ntop(AF_INET6, &sin6->sin6_addr, addr, sizeof(addr));
++        port = ntohs(sin6->sin6_port);
++    }
++    g_warning("dropped a datagram to %s port %u: the host could not take it "
++              "at once (%s); %" PRIu64 " dropped so far (logged at most "
++              "once a minute)", addr, port, g_strerror(err), slirp->busy_drops);
++    return true;
++}
++
+ /*
+  * sendto() a socket
+  */
+@@ -785,7 +839,7 @@ int sosendto(struct socket *so, struct mbuf *m)
+     /* Don't care what port we get */
+     ret = sendto(so->s, m->m_data, m->m_len, 0, (struct sockaddr *)&addr,
+                  sockaddr_size(&addr));
+-    if (ret < 0)
++    if (ret < 0 && !sodrop_busy(so->slirp, errno, (struct sockaddr *)&addr))
+         return -1;
+ 
+     /*
+@@ -889,6 +943,8 @@ struct socket *tcpx_listen(Slirp *slirp,
+     }
+     setsockopt(s, SOL_SOCKET, SO_OOBINLINE, &opt, sizeof(int));
+     slirp_socket_set_nodelay(s);
++    /* A connection reset between poll and accept() must not block accept() */
++    slirp_set_nonblock(s);
+ 
+     addrlen = sizeof(so->fhost);
+     getsockname(s, &so->fhost.sa, &addrlen);
+diff --git a/src/socket.h b/src/socket.h
+index c7c6834..8a182b4 100644
+--- a/src/socket.h
++++ b/src/socket.h
+@@ -198,6 +198,8 @@ int sowrite(struct socket *);
+ void sorecvfrom(struct socket *);
+ /* Send data to the Internet UDP socket */
+ int sosendto(struct socket *, struct mbuf *);
++bool sodrop_busy(Slirp *slirp, int err, const struct sockaddr *dst);
++bool so_would_block(int err);
+ /* Listen for incoming TCPv4 connections on this haddr+hport */
+ struct socket *tcp_listen(Slirp *, uint32_t haddr, unsigned hport, uint32_t laddr, unsigned lport, int flags);
+ /*
+diff --git a/src/tcp_subr.c b/src/tcp_subr.c
+index 1542f18..6f08d0f 100644
+--- a/src/tcp_subr.c
++++ b/src/tcp_subr.c
+@@ -523,7 +523,10 @@ void tcp_connect(struct socket *inso)
+     addrlen = sizeof(addr);
+     s = accept(inso->s, (struct sockaddr *)&addr, &addrlen);
+     if (not_valid_socket(s)) {
+-        tcp_close(sototcpcb(so)); /* This will sofree() as well */
++        /* Gone before accept() (reset): keep listening on an accept-once socket */
++        if (so != inso || !so_would_block(errno)) {
++            tcp_close(sototcpcb(so)); /* This will sofree() as well */
++        }
+         return;
+     }
+     so->s = s;
+diff --git a/src/util.c b/src/util.c
+index 95d3219..b749a08 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -151,6 +151,12 @@ static void slirp_set_cloexec(slirp_os_socket fd)
+ /*
+  * Opens a socket with FD_CLOEXEC set
+  * On failure errno contains the reason.
++ *
++ * Datagram and raw sockets are non-blocking: slirp sends on them from the
++ * caller's packet path (QEMU's main loop), and a blocking sendto() there
++ * stops the whole VM when the host cannot take the datagram at once
++ * (a full send buffer, a network filter holding earlier data). A datagram
++ * that cannot go now is dropped instead (see sodrop_busy()).
+  */
+ slirp_os_socket slirp_socket(int domain, int type, int protocol)
+ {
+@@ -159,12 +165,18 @@ slirp_os_socket slirp_socket(int domain, int type, int protocol)
+ #ifdef SOCK_CLOEXEC
+     ret = socket(domain, type | SOCK_CLOEXEC, protocol);
+     if (ret != -1 || errno != EINVAL) {
++        if (have_valid_socket(ret) && type != SOCK_STREAM) {
++            slirp_set_nonblock(ret);
++        }
+         return ret;
+     }
+ #endif
+     ret = socket(domain, type, protocol);
+     if (have_valid_socket(ret)) {
+         slirp_set_cloexec(ret);
++        if (type != SOCK_STREAM) {
++            slirp_set_nonblock(ret);
++        }
+     }
+ 
+     return ret;

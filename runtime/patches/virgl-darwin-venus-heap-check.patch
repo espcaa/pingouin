@@ -1,0 +1,25 @@
+From: OmacVM
+Subject: [PATCH] venus: fail a Metal export without a heap
+
+MoltenVK returns VK_SUCCESS and a NULL MTLHeap for memory it did not put
+in a heap; the render server then crashed QEMU in CFRetain(NULL).
+
+Upstream: not applicable (tap's Metal export).
+Test: none automatic; the crash was seen with MoltenVK before the fix.
+
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 504b655..382eaf1 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -658,8 +658,9 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+          .handleType = handle_type,
+       };
+       VkResult ret = vk->GetMemoryMetalHandleEXT(mem->device->base.handle.device, &metal_info, &metal_heap);
+-      if (ret != VK_SUCCESS) {
+-         vkr_log("metal export failed (vk ret %d)", ret);
++      if (ret != VK_SUCCESS || !metal_heap) {
++         /* MoltenVK has a heap only with MVK_CONFIG_USE_MTLHEAP=1 */
++         vkr_log("metal export failed (vk ret %d, heap %p)", ret, (void *)metal_heap);
+          return false;
+       }
+    } else {

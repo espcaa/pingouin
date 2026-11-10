@@ -1,0 +1,49 @@
+virglrenderer: report the host's sampler limit
+
+What: caps.v2.max_texture_samplers was always PIPE_MAX_SAMPLERS (32). It is now
+the smallest texture unit limit of the shader stages the host has (fragment,
+vertex, geometry, tessellation, compute), at most 32; a failed query is skipped.
+Why: current guest Mesa takes this cap as every stage's sampler limit
+(GL_MAX_TEXTURE_IMAGE_UNITS). The Mac has 16 per stage, so a guest program
+that used the reported 32 (dEQP-GLES3 sampler tests do) failed to link on the
+Mac ("Implementation limit of 16 active fragment shader samplers exceeded") and
+stopped the guest context. GLES 3.0 needs 16, so the guest loses nothing it
+could use. One number for all stages: a host with more units in one stage than
+another gives the guest the smaller number everywhere.
+Upstreamable; not sent (upstream's comment says the value is no longer used,
+but Mesa 26's virgl driver does use it).
+Tests: Tests/virgl/test-sampler-limit.c (fills the caps on the Mac's OpenGL and
+compares with every stage's limit; fails without this patch).
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -13550,8 +13550,30 @@
+     *
+     * Now we send the "correct" value, to ensure good behavior from old guest
+     * drivers, but it is not "useful" for any other purpose.
++    *
++    * Current guest Mesa takes it as every stage's sampler limit, so it must
++    * not exceed the host's for any stage the host has: macOS has 16, and a
++    * program with more samplers fails to link on the host. A query that
++    * fails (0) leaves the limit as it is.
+     */
+    caps->v2.max_texture_samplers = PIPE_MAX_SAMPLERS;
++   {
++      GLenum stage_limits[] = {
++         GL_MAX_TEXTURE_IMAGE_UNITS, GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS,
++         has_feature(feat_geometry_shader) ? GL_MAX_GEOMETRY_TEXTURE_IMAGE_UNITS : GL_NONE,
++         has_feature(feat_tessellation) ? GL_MAX_TESS_CONTROL_TEXTURE_IMAGE_UNITS : GL_NONE,
++         has_feature(feat_tessellation) ? GL_MAX_TESS_EVALUATION_TEXTURE_IMAGE_UNITS : GL_NONE,
++         has_feature(feat_compute_shader) ? GL_MAX_COMPUTE_TEXTURE_IMAGE_UNITS : GL_NONE,
++      };
++      for (unsigned i = 0; i < ARRAY_SIZE(stage_limits); i++) {
++         GLint units = 0;
++         if (stage_limits[i] == GL_NONE)
++            continue;
++         glGetIntegerv(stage_limits[i], &units);
++         if (units > 0 && (uint32_t)units < caps->v2.max_texture_samplers)
++            caps->v2.max_texture_samplers = units;
++      }
++   }
+ 
+    if (has_feature(feat_ubo)) {
+       glGetIntegerv(GL_MAX_UNIFORM_BLOCK_SIZE, &max);

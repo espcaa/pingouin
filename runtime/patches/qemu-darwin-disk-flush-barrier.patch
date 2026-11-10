@@ -1,0 +1,114 @@
+From: OmacVM
+Subject: [PATCH] file-posix: a guest flush is a write barrier on macOS
+
+What: on macOS a guest disk flush (NVMe Flush, FUA) becomes
+fcntl(F_BARRIERFSYNC) instead of fdatasync(). PINGOUIN_DISK_FLUSH=full uses
+F_FULLFSYNC, =fsync QEMU's own fdatasync(). A drive that refuses the fcntl
+falls back to the next weaker call and QEMU's log says so once. The log
+says which mode the VM got ("OmacVM: disk flush: ...").
+
+Why: macOS's fsync()/fdatasync() stop at the drive's cache, with no order.
+After a power cut (the Mac mini has no battery; a held power button) the
+guest can lose writes it was told were safe and keep later ones, which can
+leave its btrfs unmountable (a superblock that points at trees that never
+reached the flash). F_BARRIERFSYNC orders every flush at the drive, so the
+file system stays whole; it costs ~0.4 ms per flush on an M4 (fdatasync
+~0.02 ms, F_FULLFSYNC ~3 ms). Numbers: work/tracks/disk.md.
+
+Upstream: not sent (QEMU uses plain fdatasync on every host).
+Test: Tests/disk/test-flush.sh (the helper with a stand-in fcntl: each
+mode, the fallbacks, errors kept); the runtime build checks the call is in.
+
+--- a/block/file-posix.c
++++ b/block/file-posix.c
+@@ -1702,7 +1702,78 @@
+     return 0;
+ }
+ #endif /* linux */
++
++#ifdef CONFIG_DARWIN
++/*
++ * Pingouin: on macOS fsync() and fdatasync() hand the data to the drive but
++ * leave it in the drive's cache, in any order. A power cut can then lose
++ * writes the guest was told are safe, and keep later ones (a file system's
++ * superblock without the trees it points to). F_BARRIERFSYNC (the default)
++ * makes every guest flush a write barrier on the drive: what came before it
++ * reaches the drive's flash before anything after it, so the guest's file
++ * system stays whole. F_FULLFSYNC also waits until the drive has written
++ * it, at several times the cost. PINGOUIN_DISK_FLUSH=full|barrier|fsync picks
++ * one; fsync is QEMU's own behaviour. A drive that refuses the call (some
++ * network and external file systems) gets the next weaker one, said once.
++ */
++enum { PINGOUIN_FLUSH_FSYNC, PINGOUIN_FLUSH_BARRIER, PINGOUIN_FLUSH_FULL };
++static int pingouin_flush_mode = PINGOUIN_FLUSH_BARRIER;
++static pthread_once_t pingouin_flush_once = PTHREAD_ONCE_INIT;
++
++static void pingouin_flush_init(void)
++{
++    const char *v = getenv("PINGOUIN_DISK_FLUSH");
+ 
++    if (v && strcmp(v, "full") == 0) {
++        pingouin_flush_mode = PINGOUIN_FLUSH_FULL;
++    } else if (v && strcmp(v, "fsync") == 0) {
++        pingouin_flush_mode = PINGOUIN_FLUSH_FSYNC;
++    }
++    fprintf(stderr, "Pingouin: disk flush: %s\n",
++            pingouin_flush_mode == PINGOUIN_FLUSH_FULL ? "full (F_FULLFSYNC)" :
++            pingouin_flush_mode == PINGOUIN_FLUSH_FSYNC ? "fsync (no barrier)" :
++            "barrier (F_BARRIERFSYNC)");
++}
++
++static bool pingouin_flush_unsupported(int err)
++{
++    /* ENOTSUP (45) and EOPNOTSUPP (102) are different numbers on macOS */
++    return err == ENOTSUP || err == EOPNOTSUPP || err == ENOTTY ||
++           err == EINVAL;
++}
++
++static int pingouin_darwin_flush(int fd)
++{
++    static bool said, said_full;
++    int ret;
++
++    pthread_once(&pingouin_flush_once, pingouin_flush_init);
++    if (pingouin_flush_mode == PINGOUIN_FLUSH_FULL) {
++        ret = RETRY_ON_EINTR(fcntl(fd, F_FULLFSYNC));
++        if (ret != -1 || !pingouin_flush_unsupported(errno)) {
++            return ret;
++        }
++        if (!qatomic_xchg(&said_full, true)) {
++            fprintf(stderr, "Pingouin: disk flush: the drive refused F_FULLFSYNC "
++                    "(%s): barrier\n", strerror(errno));
++        }
++    }
++    if (pingouin_flush_mode != PINGOUIN_FLUSH_FSYNC) {
++        ret = RETRY_ON_EINTR(fcntl(fd, F_BARRIERFSYNC));
++        if (ret != -1 || !pingouin_flush_unsupported(errno)) {
++            return ret;
++        }
++        if (!qatomic_xchg(&said, true)) {
++            fprintf(stderr, "Pingouin: disk flush: the drive refused %s (%s): "
++                    "fsync only\n", pingouin_flush_mode == PINGOUIN_FLUSH_FULL ?
++                    "F_FULLFSYNC and F_BARRIERFSYNC" : "F_BARRIERFSYNC",
++                    strerror(errno));
++        }
++    }
++    return qemu_fdatasync(fd);
++}
++#endif
++
+ static int handle_aiocb_flush(void *opaque)
+ {
+     RawPosixAIOData *aiocb = opaque;
+@@ -1713,7 +1784,11 @@
+         return -s->page_cache_inconsistent;
+     }
+ 
++#ifdef CONFIG_DARWIN
++    ret = pingouin_darwin_flush(aiocb->aio_fildes);
++#else
+     ret = qemu_fdatasync(aiocb->aio_fildes);
++#endif
+     if (ret == -1) {
+         trace_file_flush_fdatasync_failed(errno);
+ 

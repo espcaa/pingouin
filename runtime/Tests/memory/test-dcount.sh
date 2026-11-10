@@ -1,0 +1,114 @@
+#!/bin/bash
+# Test for qemu-hvf-own-view-sweep.patch (no VM): after a sweep, Activity
+# Monitor counts guest RAM once, QEMU and the guest still see the same
+# memory, and a remap that does not do what ADR 0066 expects turns the sweep
+# off or maps back instead of stopping QEMU (test-dcount.c says how).
+#   test-dcount.sh [QEMU_SOURCE_DIR [WORK_DIR]]
+# With a source dir (the runtime build): the sweep and the free page reclaim
+# from the patched accel/hvf/hvf-all.c, and they must be wired in. Without
+# (CI): both from their patches. Runs the patch's sweep (must pass) and
+# main's, which has none (must fail: the footprint stays about twice what
+# the Mac holds), each with a second mapping standing in for the
+# hypervisor's and, where this Mac lets a process make a VM, a real one
+# (--hv). Then --predicate (which RAM blocks a free page report may replace
+# and the sweep may remap: never the Venus host memory window's blobs, pflash
+# or ROM) and the sweep's own test hook: the trial's remap diverges or takes
+# too long (the sweep is off, guest RAM never remapped), a chunk's remap
+# diverges in the first or a later pass, leaves a hole, reads private once,
+# or its spare differs (mapped back or stopped, QEMU runs on), and mapping
+# back fails too (QEMU must stop: the only abort left).
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+src=${1:-} work=${2:-}
+(( $# <= 2 )) || { echo "usage: test-dcount.sh [QEMU_SOURCE_DIR [WORK_DIR]]" >&2; exit 2; }
+work=${work:-$(mktemp -d "${TMPDIR:-/tmp}/pingouin-test-dcount.XXXXXX")}
+mkdir -p "$work"
+# block NAME FILE [patch]: the lines between "/* pingouin-NAME: begin" and "/* pingouin-NAME: end */".
+block() {
+  local b="/* pingouin-$1: begin" e="/* pingouin-$1: end */"
+  if [[ ${3:-} == patch ]]; then
+    B=$b E=$e awk '{ l = $0; if (substr(l, 1, 1) != "+") { if (on) exit; next }; l = substr(l, 2) }
+      index(l, ENVIRON["B"]) == 1 { on = 1 } on { print l } on && l == ENVIRON["E"] { exit }' "$2"
+  else
+    B=$b E=$e awk 'index($0, ENVIRON["B"]) == 1 { on = 1 } on { print } on && $0 == ENVIRON["E"] { exit }' "$2"
+  fi
+}
+if [[ -n $src ]]; then
+  f=$src/accel/hvf/hvf-all.c
+  block reclaim "$f" > "$work/reclaim.inc"
+  block sweep "$f" > "$work/sweep.inc"
+  # Wired in: a free page report goes by the sweep's rule for QEMU's private
+  # RAM; the sweep starts with the machine, from its own timer under the BQL,
+  # over the machine's main RAM only, and checks the rule at every step.
+  body=$(awk '/^void hvf_report_free_pages\(/ { on = 1 } on { print } on && /^}$/ { exit }' "$f")
+  [[ $body == *"if (!pingouin_ram_private(mr) ||"* && $body != *"rb->flags"* ]] || \
+    { echo "FAIL: hvf_report_free_pages() does not go by pingouin_ram_private()"; exit 1; }
+  init=$(awk '/^static int hvf_accel_init\(/ { on = 1 } on { print } on && /^}$/ { exit }' "$f")
+  [[ $init == *"qemu_add_machine_init_done_notifier(&pingouin_sweep_init);"* ]] || \
+    { echo "FAIL: hvf_accel_init() does not start the sweep with the machine"; exit 1; }
+  tick=$(awk '/^static void pingouin_sweep_tick\(/ { on = 1 } on { print } on && /^}$/ { exit }' "$f")
+  [[ $tick == *"assert(bql_locked());"* &&
+     $tick == *"MemoryRegion *mr = current_machine->ram;"* &&
+     $tick == *"pingouin_sweep_step(&pingouin_sweep, get_clock(), pingouin_ram_private(mr));"* ]] || \
+    { echo "FAIL: the sweep's timer does not step under the BQL over the machine's RAM with the rule"; exit 1; }
+  start=$(awk '/^static void pingouin_sweep_start\(/ { on = 1 } on { print } on && /^}$/ { exit }' "$f")
+  [[ $start == *"MemoryRegion *mr = current_machine ? current_machine->ram : NULL;"* &&
+     $start == *"!pingouin_ram_private(mr)"* &&
+     $start == *'getenv("PINGOUIN_DCOUNT_SWEEP")'* &&
+     $start == *"timer_new_ns(QEMU_CLOCK_REALTIME, pingouin_sweep_tick, NULL);"* &&
+     $start == *'"Pingouin: own-view sweep: on: '* ]] || \
+    { echo "FAIL: the sweep does not start over the machine's main RAM, with its switch and start line"; exit 1; }
+  # The trial before the machine starts, at a free IPA below the VM's IPA size, its time limit, and off with why;
+  # mem-lock turns it off; the test hook only in test mode.
+  [[ $start == *"if (!pingouin_sweep_canary(&pingouin_sweep, pingouin_sweep_free_ipa(PINGOUIN_SWEEP_TRIAL),"* &&
+     $start == *"PINGOUIN_SWEEP_TRIAL_MS, why, sizeof(why))) {"* &&
+     $start == *'"Pingouin: own-view sweep: off (%s): Activity Monitor counts the VM'* &&
+     $start == *"if (should_mlock(mlock_state)) {"* &&
+     $start == *'getenv("PINGOUIN_TEST_SWEEP_DIVERGE")'* && $start == *"if (test && test_mode && *test_mode) {"* ]] || \
+    { echo "FAIL: the sweep does not run its trial first (with its time limit, off with why, mem-lock, test hook)"; exit 1; }
+  [[ $init == *"pingouin_sweep_ipa_bits = pa_range;"* ]] || \
+    { echo "FAIL: hvf_accel_init() does not give the sweep the VM's IPA size"; exit 1; }
+else
+  block reclaim "$here/../../patches/qemu-hvf-free-page-reclaim-reusable.patch" patch > "$work/reclaim.inc"
+  block sweep "$here/../../patches/qemu-hvf-own-view-sweep.patch" patch > "$work/sweep.inc"
+fi
+grep -q 'pingouin-reclaim: end' "$work/reclaim.inc" || \
+  { echo "FAIL: no free page reclaim (pingouin-reclaim: begin ... end) in ${src:-its patch}"; exit 1; }
+grep -q 'pingouin-sweep: end' "$work/sweep.inc" || \
+  { echo "FAIL: no sweep (pingouin-sweep: begin ... end) in ${src:-its patch}"; exit 1; }
+cat > "$work/hv.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
+EOF
+for v in patch main; do
+  def=(); [[ $v == main ]] && def=(-DSWEEP_MAIN)
+  cc -O1 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function ${def[@]+"${def[@]}"} -I"$work" \
+    "$here/test-dcount.c" -framework Hypervisor -o "$work/test-$v"
+  codesign -s - -f --entitlements "$work/hv.plist" "$work/test-$v" 2>/dev/null
+done
+fail=0
+run() {   # WANT(pass|fail|abort:MESSAGE) BINARY [ARGS...]
+  local want=$1 bin=$2 rc out; shift 2
+  rc=0; out=$(TEST_DCOUNT_DIR=$work "$work/$bin" "$@" 2>&1) || rc=$?
+  local what="$bin${*:+ $*}"
+  if (( rc == 2 )) && [[ $out == *"SKIP"* ]]; then
+    echo "  $what: skipped, $(grep -m1 -o 'SKIP.*' <<< "$out")"
+  elif [[ $want == pass && $rc == 0 ]] || [[ $want == fail && $rc == 1 && $out == *"COUNTED TWICE"* ]] ||
+       [[ $want == abort:* && $rc -ge 128 && $out == *"${want#abort:}"* ]]; then
+    echo "  $what: ${want%%:*}ed as it should ($(grep -c '^  ok' <<< "$out") ok rows${out:+; $(grep -m1 -o -e 'after pass 2: [^:]*' -e 'mapped back after [0-9]* us' -e 'off ([^:]*' <<< "$out" || true)})"
+  else
+    echo "FAIL $what (exit $rc, want $want):"; grep -v '^  ok' <<< "$out" | sed 's/^/    /' | tail -25; fail=1
+  fi
+}
+for hv in "" --hv; do
+  run pass test-patch ${hv:+"$hv"}
+  run fail test-main ${hv:+"$hv"}
+  for c in --canary --diverge --chunk --spare --hole --dip --hang; do
+    run pass test-patch ${hv:+"$hv"} "$c"
+  done
+  run "abort:could not be mapped back" test-patch ${hv:+"$hv"} --unmapped
+done
+run pass test-patch --predicate
+rm -f "$work/io-in" "$work/io-out"
+(( fail == 0 )) && echo "test-dcount: all ok" || { echo "test-dcount: FAILED"; exit 1; }

@@ -1,0 +1,706 @@
+From: OmacVM
+Subject: [PATCH] cocoa: the VM's windows follow the displays once they settle (#428)
+
+What: every display change (the main window changing screen, entering or
+leaving full screen, the screen parameters, the guest's word) asks for an
+update of the displays' windows, and it runs from one timer once the
+displays settle (ui/pingouin-display-settle.h): never inside the notification
+that asked, never inside another update, never while the screen is locked,
+the displays sleep or another user has the console (then 1 s after unlock or
+wake; all three are also read at start, where no notice comes). Displays
+that are inactive, asleep or smaller than 100 x 100 points count as absent;
+one that comes back gets its window once it has counted for 2 s. Full-screen
+tries are counted per display, also when its window is made again: 4 tries,
+a pause doubling from 1 s between them, a full screen that held 10 s starts
+the count over. A display window that goes while macOS moves it into or out
+of full screen is closed once macOS is done (or after 4 s). A display window
+whose Space macOS moved to another display is made again on its own.
+resizeWindow never runs inside itself, the main window's size check after a
+resize runs a moment later, a size macOS keeps refusing is tried 3 times,
+and nothing is sized for a display that does not count.
+PINGOUIN_TEST_LOCK_HOOK=1: the distributed notifications app.pingouin.test.lock
+and app.pingouin.test.unlock stand for the lock (tests; the test Mac is never
+locked).
+
+Why: #428 (@ylorn): the VM in full screen on a MacBook's display and an
+external one, the Mac locked, the external display unplugged (or waking
+inactive at 1 x 1 for 3 s): macOS moved the main window's full-screen
+Space, its setFrame: posted a resize whose check sized the window again
+(29 deep), the window changed screen inside that, the screen change ran the
+display update at once, the second display's window was made again, each
+new one went into full screen in a new Space (the 5-try cap was per window)
+and was closed in the middle of it, so AppKit kept it and its Space: 33 to
+89 black full-screen Spaces in half a minute, until QEMU quit.
+
+Upstream: not sent (the extra displays' windows are OmacVM's).
+Test: app/runtime/Tests/display/test-display-settle.sh (the rules, and the
+wiring in the patched ui/cocoa.m at build time); src/tests/e2e/display-unplug.sh
+(windows and Spaces counted while a display goes, flaps and comes back).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -53,6 +53,7 @@
+ #include "ui/pingouin-fullpanel.h"
+ #include "ui/pingouin-close.h"
+ #include "ui/pingouin-modifiers.h"
++#include "ui/pingouin-display-settle.h"
+ #include "hw/core/boards.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+@@ -1053,6 +1054,25 @@ static bool pingouin_map_pointer(int output, double u, double v,
+ static void pingouin_displays_update(void);
+ static void pingouin_pointer_init(void);
+ 
++/*
++ * Pingouin (#428): a Mac display the VM can use now. macOS lists a display
++ * that is unplugged or wakes from sleep for a few seconds as inactive at
++ * 1 x 1: windows sized for it, or put in full screen on it, made a loop.
++ */
++static bool pingouin_screen_counts(NSScreen *s)
++{
++    CGDirectDisplayID id;
++    NSSize size;
++
++    if (!s) {
++        return false;
++    }
++    id = [[[s deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
++    size = [s frame].size;
++    return pingouin_ds_counts(CGDisplayIsActive(id), CGDisplayIsAsleep(id),
++                            size.width, size.height);
++}
++
+ /* VM state callbacks hold the BQL; this method only touches input state. */
+ static void cocoa_pinch_vm_change(void *opaque, bool running, RunState state)
+ {
+@@ -1700,13 +1720,68 @@ - (void) pingouinCheckGuestTop
+         !([[self window] styleMask] & NSWindowStyleMaskFullScreen)) {
+         return;
+     }
++    /* Pingouin (#428): not on a display that does not count (inactive, 1 x 1). */
++    if (![self pingouinScreenCounts]) {
++        return;
++    }
+     area = [self fullScreenSize];
+     fits = [self pingouinGuestFitsTop:area];
+     if (fits != qatomic_read(&pingouin_guest_top) ||
+         (fits && (fabs(now.width - area.width) > 0.5 ||
+                   fabs(now.height - area.height) > 0.5))) {
++        /*
++         * Pingouin (#428): a size macOS keeps refusing (the window's Space
++         * moving between displays) is tried three times, not on every
++         * resize it causes.
++         */
++        static NSSize tried;
++        static int refused;
++
++        if (fabs(tried.width - area.width) > 0.5 ||
++            fabs(tried.height - area.height) > 0.5) {
++            tried = area;
++            refused = 0;
++        }
++        if (refused >= 3) {
++            return;
++        }
+         [self resizeWindow];
++        now = [self frame].size;
++        if (fits && (fabs(now.width - area.width) > 0.5 ||
++                     fabs(now.height - area.height) > 0.5)) {
++            if (++refused == 3) {
++                fprintf(stderr, "pingouin: full screen: the window stays %.0fx%.0f "
++                        "(macOS keeps it from %.0fx%.0f)\n",
++                        now.width, now.height, area.width, area.height);
++            }
++        } else {
++            refused = 0;
++        }
++    }
++}
++
++/* Pingouin (#428): the window's display counts (not inactive, asleep or 1 x 1). */
++- (bool) pingouinScreenCounts
++{
++    return pingouin_screen_counts([[self window] screen]);
++}
++
++/*
++ * Pingouin (#428): the check after a resize, a moment later: never a new size
++ * from inside the resize notification.
++ */
++- (void) pingouinCheckGuestTopSoon
++{
++    static bool queued;
++
++    if (queued) {
++        return;
+     }
++    queued = true;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        queued = false;
++        [self pingouinCheckGuestTop];
++    });
+ }
+ 
+ /*
+@@ -1732,7 +1807,25 @@ - (void) placeFullScreen
+     [w setFrameOrigin:frame.origin];
+ }
+ 
++/*
++ * Pingouin (#428): never from inside itself. Its setContentSize: posts the
++ * window's resize notification, whose check sized the window again: 29 deep
++ * in the report while macOS moved the full-screen Space, until the window
++ * changed screen in the middle of it.
++ */
+ - (void) resizeWindow
++{
++    static bool busy;
++
++    if (busy) {
++        return;
++    }
++    busy = true;
++    [self pingouinResizeWindow];
++    busy = false;
++}
++
++- (void) pingouinResizeWindow
+ {
+     /*
+      * Pingouin: the window keeps its size when the guest changes mode
+@@ -1744,6 +1837,10 @@ - (void) resizeWindow
+         return;
+     }
+ 
++    /* Pingouin (#428): not to a display that does not count (inactive, 1 x 1). */
++    if (![self pingouinScreenCounts]) {
++        return;
++    }
+     [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
+ 
+     /*
+@@ -1909,6 +2006,13 @@ - (void) updateUIInfo
+          */
+         return;
+     }
++    /*
++     * Pingouin (#428): no size from a display that does not count (inactive,
++     * 1 x 1); its next change, once it settles, tells the guest.
++     */
++    if ([self window] && [[self window] screen] && ![self pingouinScreenCounts]) {
++        return;
++    }
+ 
+     with_bql(^{
+         [self updateUIInfoLocked];
+@@ -4507,7 +4611,7 @@ - (void)windowDidResize:(NSNotification *)notification
+ {
+     [cocoaView updateScale];
+     [cocoaView updateUIInfo];
+-    [cocoaView pingouinCheckGuestTop];
++    [cocoaView pingouinCheckGuestTopSoon];
+ }
+ 
+ /*
+@@ -8028,10 +8132,31 @@ static bool cocoa_gl_is_compatible_dcl(DisplayGLCtx *dgc,
+     NSView *view;
+     bool want_full;                 /* waiting for macOS full screen */
+     bool full;                      /* in macOS full screen */
+-    int full_tries;
++    uint32_t key;                   /* the display's key (pingouin_ds_key) */
+ } PingouinHead;
+ 
+ static PingouinHead pingouin_heads[PINGOUIN_MAX_OUTPUTS];   /* [0] = the main window */
++
++/*
++ * Pingouin (#428): display changes settle before the windows follow them, and
++ * full-screen tries are counted per display (ui/pingouin-display-settle.h).
++ * Main thread only.
++ */
++static PingouinDsTimer pingouin_ds_timer;
++static PingouinDsDisplays pingouin_ds_known;
++/* Display windows that went while macOS moved them: closed when it is done. */
++static NSMutableArray *pingouin_heads_leaving;
++
++static double pingouin_ds_clock(void)
++{
++    return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9;
++}
++
++static uint32_t pingouin_display_key(CGDirectDisplayID id)
++{
++    return pingouin_ds_key(CGDisplayVendorNumber(id), CGDisplayModelNumber(id),
++                         CGDisplaySerialNumber(id), id);
++}
+ static int pingouin_outputs = 1;                         /* graphic consoles */
+ static bool pingouin_external_enabled = true;
+ 
+@@ -9113,11 +9238,16 @@ static void pingouin_heads_moved(void)
+ @interface PingouinHeadDelegate : NSObject <NSWindowDelegate>
+ @end
+ 
++static void pingouin_head_left(NSWindow *w);
++
+ @implementation PingouinHeadDelegate
+ - (void)windowDidEnterFullScreen:(NSNotification *)note
+ {
+     PingouinHead *hd = pingouin_head_for_window([note object]);
++    pingouin_head_left([note object]);
+     if (hd) {
++        pingouin_ds_full(pingouin_ds_display(&pingouin_ds_known, hd->key, pingouin_ds_clock()),
++                       true, pingouin_ds_clock());
+         hd->full = true;
+         hd->want_full = false;
+         [[note object] setAlphaValue:1.0];
+@@ -9139,6 +9269,7 @@ - (void)windowDidResize:(NSNotification *)note
+ 
+ - (void)windowDidFailToEnterFullScreen:(NSWindow *)window
+ {
++    pingouin_head_left(window);
+     pingouin_full_busy = false;
+     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2),
+                    dispatch_get_main_queue(), ^{ pingouin_full_next(); });
+@@ -9147,7 +9278,10 @@ - (void)windowDidFailToEnterFullScreen:(NSWindow *)window
+ - (void)windowDidExitFullScreen:(NSNotification *)note
+ {
+     PingouinHead *hd = pingouin_head_for_window([note object]);
++    pingouin_head_left([note object]);
+     if (hd) {
++        pingouin_ds_full(pingouin_ds_display(&pingouin_ds_known, hd->key, pingouin_ds_clock()),
++                       false, pingouin_ds_clock());
+         hd->full = false;
+         pingouin_heads_moved();
+     }
+@@ -9254,6 +9388,7 @@ static void pingouin_head_on(PingouinHead *hd, NSScreen *s)
+                        pingouin_product_name(), hd->output + 1];
+ 
+     hd->display = pingouin_screen_id(s);
++    hd->key = pingouin_display_key(hd->display);
+     if (!hd->window) {
+         NSRect content = NSMakeRect(0, 0, 640, 400);
+         hd->view = [[PingouinHeadView alloc] initWithFrame:content output:hd->output];
+@@ -9291,24 +9426,64 @@ static void pingouin_head_on(PingouinHead *hd, NSScreen *s)
+         [hd->window setFrame:NSInsetRect([s visibleFrame], 60, 60) display:NO];
+         [hd->window orderFront:nil];
+         hd->want_full = true;
+-        hd->full_tries = 0;
+     }
+     [[hd->view layer] setContentsScale:[s backingScaleFactor]];
+     hd->dirty = true;
+ }
+ 
++/* A display's window goes for good. */
++static void pingouin_head_close(NSWindow *w)
++{
++    [w orderOut:nil];
++    [w setDelegate:nil];
++    [w close];
++}
++
++/*
++ * Pingouin (#428): a display window that went while macOS moved it into or out
++ * of full screen is closed once macOS is done (its delegate's calls), or
++ * after 4 s. Closed in the middle, AppKit kept it and its full-screen Space
++ * until QEMU quit.
++ */
++static void pingouin_head_leave(NSWindow *w)
++{
++    if (!pingouin_heads_leaving) {
++        pingouin_heads_leaving = [[NSMutableArray alloc] init];
++    }
++    [w setAlphaValue:0.0];
++    [pingouin_heads_leaving addObject:w];
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC),
++                   dispatch_get_main_queue(), ^{ pingouin_head_left(w); });
++}
++
++static void pingouin_head_left(NSWindow *w)
++{
++    if (w && [pingouin_heads_leaving containsObject:w]) {
++        pingouin_head_close(w);
++        [pingouin_heads_leaving removeObject:w];
++    }
++}
++
+ static void pingouin_head_off(PingouinHead *hd)
+ {
+-    if (pingouin_full_busy && pingouin_full_busy_output == hd->output) {
++    bool moving = pingouin_full_busy && pingouin_full_busy_output == hd->output;
++
++    if (moving) {
+         pingouin_full_busy = false;   /* its window goes: do not wait for it */
+     }
++    if (hd->display) {
++        pingouin_ds_full(pingouin_ds_display(&pingouin_ds_known, hd->key, pingouin_ds_clock()),
++                       false, pingouin_ds_clock());
++    }
+     hd->display = 0;
+     hd->want_full = false;
+     hd->full = false;
+     if (hd->window) {
+-        [hd->window orderOut:nil];
+-        [hd->window setDelegate:nil];
+-        [hd->window close];
++        if (moving) {
++            pingouin_head_leave(hd->window);
++        } else {
++            pingouin_head_close(hd->window);
++        }
+         [hd->window release];
+         hd->window = nil;
+         [hd->view release];
+@@ -9316,10 +9491,29 @@ static void pingouin_head_off(PingouinHead *hd)
+     }
+ }
+ 
++/* Pingouin (#428): full screen for a display's window again in wait seconds. */
++static void pingouin_full_next_later(double wait)
++{
++    static bool armed;
++
++    if (armed) {
++        return;
++    }
++    armed = true;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++        armed = false;
++        pingouin_full_next();
++    });
++}
++
+ /* macOS full screen, one window at a time: it ignores a second while one is moving. */
+ static void pingouin_full_next(void)
+ {
+-    if (pingouin_full_busy) {
++    double now = pingouin_ds_clock(), soonest = 0;
++
++    /* Locked or asleep: the update after unlock or wake comes here again. */
++    if (pingouin_full_busy || pingouin_ds_timer.locked) {
+         return;
+     }
+     for (int i = 1; i < pingouin_outputs; i++) {
+@@ -9333,12 +9527,24 @@ static void pingouin_full_next(void)
+             [hd->window setAlphaValue:1.0];
+             continue;
+         }
+-        if (++hd->full_tries > 5) {
+-            /* macOS would not: the display shows the window as it is. */
+-            hd->want_full = false;
+-            [hd->window setAlphaValue:1.0];
++        /* Tries per display, also when its window is made again (#428). */
++        PingouinDsDisplay *d = pingouin_ds_display(&pingouin_ds_known, hd->key, now);
++        double wait;
++        if (!pingouin_ds_may_try(d, now, &wait)) {
++            if (wait < 0) {
++                /* macOS would not, or the display keeps going: the window as it is. */
++                hd->want_full = false;
++                [hd->window setAlphaValue:1.0];
++                fprintf(stderr, "pingouin: display %u: no full screen after %d tries "
++                        "(its window stays as it is)\n", hd->display, PINGOUIN_DS_TRIES);
++            } else if (!soonest || wait < soonest) {
++                soonest = wait;
++            }
+             continue;
+         }
++        pingouin_ds_tried(d, now);
++        fprintf(stderr, "pingouin: display %u: full screen for its window (try %d of %d)\n",
++                hd->display, d->tries, PINGOUIN_DS_TRIES);
+         pingouin_full_busy = true;
+         pingouin_full_busy_output = i;
+         [hd->window toggleFullScreen:nil];
+@@ -9353,14 +9559,21 @@ static void pingouin_full_next(void)
+         });
+         return;
+     }
++    if (soonest > 0) {
++        pingouin_full_next_later(soonest);
++    }
+ }
+ 
+ /*
+  * Which Mac displays get a window: in full screen, with the guest's consent,
+  * every display but the main window's. Outputs keep their display while it
+  * stays; new displays take the lowest free output, left to right.
++ * Pingouin (#428): only displays that count (not inactive, asleep or 1 x 1),
++ * a display that comes (back) once it has counted for a moment. Returns the
++ * seconds until it wants to look again (0: not needed). Only from the
++ * update timer (pingouin_displays_update).
+  */
+-static void pingouin_displays_update(void)
++static double pingouin_displays_apply(void)
+ {
+     NSWindow *mw = [cocoaView window];
+     NSScreen *ms = [mw screen];
+@@ -9368,11 +9581,33 @@ static void pingouin_displays_update(void)
+     bool want = pingouin_outputs > 1 && pingouin_guest_ready &&
+                 pingouin_external_enabled && pingouin_main_full_screen() && ms;
+     NSMutableArray *screens = [NSMutableArray array];
++    double now = pingouin_ds_clock(), retry = 0;
+ 
++    if (want && !pingouin_screen_counts(ms)) {
++        /* The main window's display does not count yet: nothing moves. */
++        return PINGOUIN_DS_STABLE_S;
++    }
+     if (want) {
++        uint32_t listed[PINGOUIN_DS_MAX];
++        int n = 0;
++        for (NSScreen *s in [NSScreen screens]) {
++            if (n < PINGOUIN_DS_MAX) {
++                listed[n++] = pingouin_display_key(pingouin_screen_id(s));
++            }
++        }
++        pingouin_ds_listed(&pingouin_ds_known, listed, n);
+         for (NSScreen *s in [NSScreen screens]) {
+             CGDirectDisplayID id = pingouin_screen_id(s);
+-            if (id != main_id && pingouin_test_allows(id)) {
++            if (id == main_id || !pingouin_test_allows(id)) {
++                continue;
++            }
++            double left = pingouin_ds_look(pingouin_ds_display(&pingouin_ds_known,
++                                                            pingouin_display_key(id), now),
++                                         pingouin_screen_counts(s), now);
++            if (left > 0) {
++                /* Not settled yet: no window for it until then. */
++                retry = retry > 0 ? MIN(retry, left) : left;
++            } else if (left == 0) {
+                 [screens addObject:s];
+             }
+         }
+@@ -9393,6 +9628,16 @@ static void pingouin_displays_update(void)
+         for (NSScreen *s in screens) {
+             keep |= hd->display && pingouin_screen_id(s) == hd->display;
+         }
++        /*
++         * macOS moved its full-screen Space to another display while its own
++         * was away: it is made again on its display (once: tries per display).
++         */
++        NSScreen *ws = keep && hd->full && !pingouin_full_busy ? [hd->window screen] : nil;
++        if (ws && pingouin_screen_id(ws) != hd->display) {
++            fprintf(stderr, "pingouin: display %u: its window is on display %u now: made again\n",
++                    hd->display, pingouin_screen_id(ws));
++            keep = false;
++        }
+         if (hd->display && !keep) {
+             pingouin_head_off(hd);
+             changed = true;
+@@ -9422,6 +9667,198 @@ static void pingouin_displays_update(void)
+     pingouin_update_mac_layout();
+     pingouin_send_layout();
+     pingouin_full_next();
++    return retry;
++}
++
++/*
++ * Pingouin (#428): every display change asks for an update here, and it runs
++ * from a timer once the displays settle: never inside the window or screen
++ * notification that asked, never inside another update, never while the
++ * screen is locked or the displays sleep (ui/pingouin-display-settle.h).
++ */
++static bool pingouin_ds_screen_locked, pingouin_ds_asleep, pingouin_ds_away, pingouin_ds_test_locked;
++static double pingouin_ds_locked_at;
++
++static void pingouin_ds_fired(void);
++
++static void pingouin_ds_arm(double at)
++{
++    double wait = MAX(0.0, at - pingouin_ds_clock());
++
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{ pingouin_ds_fired(); });
++}
++
++static void pingouin_ds_fired(void)
++{
++    double at, retry;
++
++    switch (pingouin_ds_fire(&pingouin_ds_timer, pingouin_ds_clock(), &at)) {
++    case PINGOUIN_DS_REARM:
++        pingouin_ds_arm(at);
++        return;
++    case PINGOUIN_DS_SKIP:
++        return;
++    case PINGOUIN_DS_RUN:
++        break;
++    }
++    retry = pingouin_displays_apply();
++    if (pingouin_ds_done(&pingouin_ds_timer, pingouin_ds_clock(), retry, &at)) {
++        pingouin_ds_arm(at);
++    }
++}
++
++static void pingouin_ds_lock_changed(const char *why)
++{
++    bool locked = pingouin_ds_screen_locked || pingouin_ds_asleep || pingouin_ds_away ||
++                  pingouin_ds_test_locked;
++    double at;
++
++    if (locked != pingouin_ds_timer.locked) {
++        pingouin_ds_locked_at = pingouin_ds_clock();
++        fprintf(stderr, "pingouin: displays: %s (%s)\n", locked ?
++                "no window changes while locked or asleep" :
++                "windows follow the displays again once they settle", why);
++    }
++    if (pingouin_ds_lock(&pingouin_ds_timer, locked, pingouin_ds_clock(), &at)) {
++        pingouin_ds_arm(at);
++    }
++}
++
++/* The session's own word: locked, or another user on the console. */
++static void pingouin_ds_session(bool *locked, bool *away)
++{
++    CFDictionaryRef d = CGSessionCopyCurrentDictionary();
++    CFTypeRef v;
++    int n = 0;
++
++    *locked = *away = false;
++    if (!d) {
++        return;
++    }
++    v = CFDictionaryGetValue(d, CFSTR("CGSSessionScreenIsLocked"));
++    if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
++        *locked = CFBooleanGetValue(v);
++    } else if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
++        *locked = CFNumberGetValue(v, kCFNumberIntType, &n) && n;
++    }
++    v = CFDictionaryGetValue(d, kCGSessionOnConsoleKey);
++    if (v && CFGetTypeID(v) == CFBooleanGetTypeID()) {
++        *away = !CFBooleanGetValue(v);
++    }
++    CFRelease(d);
++}
++
++static void pingouin_displays_update(void)
++{
++    double at;
++
++    /* A change while locked for a while: a missed unlock or wake must not stop them for good. */
++    if (pingouin_ds_timer.locked && pingouin_ds_clock() - pingouin_ds_locked_at > 5) {
++        bool locked, away;
++        pingouin_ds_session(&locked, &away);
++        if ((pingouin_ds_screen_locked && !locked) || (pingouin_ds_away && !away) ||
++            (pingouin_ds_asleep && !CGDisplayIsAsleep(CGMainDisplayID()))) {
++            pingouin_ds_screen_locked = locked;
++            pingouin_ds_away = away;
++            pingouin_ds_asleep = CGDisplayIsAsleep(CGMainDisplayID());
++            pingouin_ds_lock_changed("the session says so");
++        }
++    }
++    if (pingouin_ds_ask(&pingouin_ds_timer, pingouin_ds_clock(), PINGOUIN_DS_SETTLE_S, &at)) {
++        pingouin_ds_arm(at);
++    }
++}
++
++/*
++ * The lock and sleep notifications (delivered also while the app is in the
++ * background). PINGOUIN_TEST_LOCK_HOOK=1: app.pingouin.test.lock and
++ * app.pingouin.test.unlock (distributed) stand for them, so the locked path is
++ * tested without locking the test Mac.
++ */
++@interface PingouinLockWatch : NSObject
++@end
++
++@implementation PingouinLockWatch
++- (void)locked:(NSNotification *)n
++{
++    pingouin_ds_screen_locked = true;
++    pingouin_ds_lock_changed("screen locked");
++}
++- (void)unlocked:(NSNotification *)n
++{
++    pingouin_ds_screen_locked = false;
++    pingouin_ds_lock_changed("screen unlocked");
++}
++- (void)asleep:(NSNotification *)n
++{
++    pingouin_ds_asleep = true;
++    pingouin_ds_lock_changed("displays asleep");
++}
++- (void)awake:(NSNotification *)n
++{
++    pingouin_ds_asleep = false;
++    pingouin_ds_lock_changed("displays awake");
++}
++- (void)away:(NSNotification *)n
++{
++    pingouin_ds_away = true;
++    pingouin_ds_lock_changed("another user");
++}
++- (void)back:(NSNotification *)n
++{
++    pingouin_ds_away = false;
++    pingouin_ds_lock_changed("back on the console");
++}
++- (void)testLocked:(NSNotification *)n
++{
++    pingouin_ds_test_locked = true;
++    pingouin_ds_lock_changed("test: locked");
++}
++- (void)testUnlocked:(NSNotification *)n
++{
++    pingouin_ds_test_locked = false;
++    pingouin_ds_lock_changed("test: unlocked");
++}
++@end
++
++static void pingouin_ds_watch_lock(void)
++{
++    static PingouinLockWatch *watch;
++    NSDistributedNotificationCenter *dc = [NSDistributedNotificationCenter defaultCenter];
++    NSNotificationCenter *wc = [[NSWorkspace sharedWorkspace] notificationCenter];
++    const char *hook = getenv("PINGOUIN_TEST_LOCK_HOOK");
++
++    watch = [[PingouinLockWatch alloc] init];
++    [dc addObserver:watch selector:@selector(locked:) name:@"com.apple.screenIsLocked"
++             object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
++    [dc addObserver:watch selector:@selector(unlocked:) name:@"com.apple.screenIsUnlocked"
++             object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
++    if (hook && !strcmp(hook, "1")) {
++        [dc addObserver:watch selector:@selector(testLocked:) name:@"app.pingouin.test.lock"
++                 object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
++        [dc addObserver:watch selector:@selector(testUnlocked:) name:@"app.pingouin.test.unlock"
++                 object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
++        fprintf(stderr, "pingouin: displays: test lock hook on (app.pingouin.test.lock/unlock)\n");
++    }
++    [wc addObserver:watch selector:@selector(asleep:)
++               name:NSWorkspaceScreensDidSleepNotification object:nil];
++    [wc addObserver:watch selector:@selector(awake:)
++               name:NSWorkspaceScreensDidWakeNotification object:nil];
++    [wc addObserver:watch selector:@selector(away:)
++               name:NSWorkspaceSessionDidResignActiveNotification object:nil];
++    [wc addObserver:watch selector:@selector(back:)
++               name:NSWorkspaceSessionDidBecomeActiveNotification object:nil];
++    /*
++     * At start: no notice comes for what began before QEMU did (a VM started
++     * on a locked Mac, with its displays asleep, or for another user).
++     */
++    pingouin_ds_session(&pingouin_ds_screen_locked, &pingouin_ds_away);
++    pingouin_ds_asleep = CGDisplayIsAsleep(CGMainDisplayID());
++    if (pingouin_ds_screen_locked || pingouin_ds_away || pingouin_ds_asleep) {
++        pingouin_ds_lock_changed(pingouin_ds_screen_locked ? "at start: screen locked" :
++                               pingouin_ds_away ? "at start: another user" : "at start: displays asleep");
++    }
+ }
+ 
+ /* The guest channel: app.pingouin.display (JSON lines). */
+@@ -10745,6 +11182,7 @@ static void pingouin_displays_init(void)
+     }
+ #endif
+     pingouin_head_delegate = [[PingouinHeadDelegate alloc] init];
++    pingouin_ds_watch_lock();
+     /* Another Space: the detached cursor must move there (see pingouin_guard_corners). */
+     [[[NSWorkspace sharedWorkspace] notificationCenter]
+         addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification
+@@ -10758,9 +11196,8 @@ static void pingouin_displays_init(void)
+                     object:nil
+                      queue:[NSOperationQueue mainQueue]
+                 usingBlock:^(NSNotification *note) {
+-        /* Displays settle for a moment after a plug or unplug. */
+-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2),
+-                       dispatch_get_main_queue(), ^{ pingouin_displays_update(); });
++        /* Displays settle for a moment after a plug or unplug: the update waits. */
++        pingouin_displays_update();
+     }];
+     /*
+      * Another app came to the front: let go of the pointer and keyboard even

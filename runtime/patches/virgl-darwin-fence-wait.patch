@@ -1,0 +1,152 @@
+From: OmacVM
+Subject: [PATCH] vrend: wait for fences without spinning a core on macOS
+
+Apple's glClientWaitSync spins on the CPU until the fence signals, so the
+sync thread kept a core busy while the guest rendered. Test the fence
+instead: busy for up to 100 us (most fences are done by then), then nap
+50 us at a time with mach_wait_until. A fence that takes longer than
+1 ms doubles the nap up to 1 ms, so a long or stuck guest GPU job wakes
+the thread about 1000 times a second instead of 20000.
+
+The sync thread becomes a time-constraint thread, so macOS wakes it when
+asked; plain nanosleep was stretched by timer coalescing and cut WebGL
+Aquarium to 7-15 fps. Its budget per wake (computation, 200 us) covers
+the spin: the 100 us count from the thread's last sleep, not from each
+fence, so fences that finish back to back cannot chain spins past the
+budget. The thread's port right from mach_thread_self() is released.
+
+Measured in an OmacVM.app VM (bench lock held): QEMU's CPU during glmark2
+195% -> 165%, during Aquarium 194% -> 176%; glmark2 3351/3417 -> 3361/3310,
+Aquarium 19.2-20.1 -> 19.6-20.4 fps. The longer naps after 1 ms change
+neither glmark2 (3746/3663 vs 3748/3696) nor Aquarium (22.6/23.6/22.2 vs
+22.9/22.6/22.8 fps).
+A guest job of 65-100 ms GPU draws (glFinish after each), bench lock, one
+run each: QEMU woke 19,900 times a second with 50 us naps throughout, 2,100
+with the longer naps (idle: 240); its CPU energy fell from 2.8 J to 1.5 J
+in 20 s; the GPU work per draw was the same.
+
+Upstream: macOS-specific; could go upstream with the thread-sync support.
+
+Test: glmark2 and Aquarium A/B with the bench lock (numbers above); the
+long-job wake count (above); tests/graphics dEQP and WebGL runs on the
+runtime with this patch.
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 394fb9b..3f136c1 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -95,6 +95,28 @@ static const uint32_t fake_occlusion_query_samples_passed_default = 1024;
+ 
+ const struct vrend_if_cbs *vrend_clicbs;
+ 
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <mach/mach_time.h>
++#include <mach/thread_policy.h>
++
++/* The sync thread's fence wait on macOS (do_wait): busy for at most SPIN
++ * after the thread last slept, then naps of NAP between tests; once a
++ * fence has taken LONG, each nap doubles up to NAP_MAX, so a long or stuck
++ * GPU job wakes the thread about 1000 times a second, not 20000. The spin
++ * counts from the last sleep, not per fence, so fences that finish back to
++ * back cannot chain spins: the thread's time-constraint budget per wake
++ * (BUDGET, thread_sync) covers the spin and the work around it. */
++#define FENCE_SPIN_NS 100000ull
++#define FENCE_NAP_NS 50000ull
++#define FENCE_LONG_NS 1000000ull
++#define FENCE_NAP_MAX_NS 1000000ull
++#define FENCE_BUDGET_NS 200000ull
++
++/* When the sync thread last woke from a sleep (only it reads or writes). */
++static uint64_t fence_awake_since;
++#endif
++
+ struct vrend_fence {
+    /* When the sync thread is waiting on the fence and the main thread
+     * destroys the context, ctx is set to NULL.  Otherwise, ctx is always
+@@ -7384,6 +7406,37 @@ static bool do_wait(struct vrend_fence *fence, bool can_block)
+ 
+    bool done = false;
+    int timeout = can_block ? 1000000000 : 0;
++#ifdef __APPLE__
++   /* Apple's glClientWaitSync spins on the CPU until the fence signals.
++    * Test instead: busy for up to 100 us (most fences are done by then)
++    * while the thread has been awake less than that, then nap between
++    * tests with mach_wait_until (the sync thread is a time-constraint
++    * thread, so macOS wakes it on time). */
++   if (can_block) {
++      static mach_timebase_info_data_t tb;
++      if (!tb.denom)
++         mach_timebase_info(&tb);
++      const uint64_t t0 = mach_absolute_time();
++      const uint64_t spin = FENCE_SPIN_NS * tb.denom / tb.numer;
++      const uint64_t lng = FENCE_LONG_NS * tb.denom / tb.numer;
++      const uint64_t nap_max = FENCE_NAP_MAX_NS * tb.denom / tb.numer;
++      uint64_t nap = FENCE_NAP_NS * tb.denom / tb.numer;
++      for (;;) {
++         GLenum glret = glClientWaitSync(fence->glsyncobj, 0, 0);
++         if (glret == GL_WAIT_FAILED)
++            virgl_warn("Wait sync failed: illegal fence object %p\n", (void*) fence->glsyncobj);
++         if (glret != GL_TIMEOUT_EXPIRED)
++            return true;
++         const uint64_t now = mach_absolute_time();
++         if (now - t0 <= spin && now - fence_awake_since <= spin)
++            continue;
++         mach_wait_until(now + nap);
++         fence_awake_since = mach_absolute_time();
++         if (now - t0 > lng && nap < nap_max)
++            nap = MIN2(nap * 2, nap_max);
++      }
++   }
++#endif
+    do {
+       GLenum glret = glClientWaitSync(fence->glsyncobj, 0, timeout);
+       if (glret == GL_WAIT_FAILED) {
+@@ -7479,15 +7532,43 @@ static int thread_sync(UNUSED void *arg)
+    virgl_gl_context gl_context = vrend_state.sync_context;
+ 
+    u_thread_setname("vrend-sync");
++#ifdef __APPLE__
++   {
++      /* Short, punctual waits (see do_wait): a time-constraint thread is
++       * woken when asked, not when timer coalescing gets round to it. Its
++       * budget per wake (200 us) covers the at most 100 us of spinning
++       * since the last sleep, with room for the work around it. */
++      mach_timebase_info_data_t tb;
++      mach_timebase_info(&tb);
++      thread_time_constraint_policy_data_t pol = {
++         .period = 0,
++         .computation = (uint32_t)(FENCE_BUDGET_NS * tb.denom / tb.numer),
++         .constraint = (uint32_t)(1000000ull * tb.denom / tb.numer),
++         .preemptible = 1,
++      };
++      mach_port_t self = mach_thread_self();
++      kern_return_t kr = thread_policy_set(self, THREAD_TIME_CONSTRAINT_POLICY,
++                                           (thread_policy_t)&pol,
++                                           THREAD_TIME_CONSTRAINT_POLICY_COUNT);
++      mach_port_deallocate(mach_task_self(), self);
++      if (kr != KERN_SUCCESS)
++         virgl_warn("sync thread: no time-constraint policy, fence waits may be late\n");
++      fence_awake_since = mach_absolute_time();
++   }
++#endif
+ 
+    mtx_lock(&vrend_state.fence_mutex);
+    vrend_clicbs->make_current_surfaceless(gl_context);
+ 
+    while (!vrend_state.stop_sync_thread) {
+-      if (list_is_empty(&vrend_state.fence_wait_list) &&
+-          cnd_wait(&vrend_state.fence_cond, &vrend_state.fence_mutex) != 0) {
+-         virgl_warn("Error while waiting on condition\n");
+-         break;
++      if (list_is_empty(&vrend_state.fence_wait_list)) {
++         if (cnd_wait(&vrend_state.fence_cond, &vrend_state.fence_mutex) != 0) {
++            virgl_warn("Error while waiting on condition\n");
++            break;
++         }
++#ifdef __APPLE__
++         fence_awake_since = mach_absolute_time();
++#endif
+       }
+ 
+       list_for_each_entry_safe(struct vrend_fence, fence, &vrend_state.fence_wait_list, fences) {

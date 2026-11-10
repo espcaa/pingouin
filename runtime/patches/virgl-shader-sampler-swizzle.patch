@@ -1,0 +1,46 @@
+virglrenderer: no swizzle on a sampler in the GLSL
+
+What: a TGSI sampler source with a swizzle (TEX ..., SAMP[0].wwww) was written
+into GLSL as "fssamp0.wwww". The swizzle is now left out, as gallium's own
+translators (tgsi_to_nir) ignore it: a sampler is not a vector.
+Why: Mesa's VA-API video compositor (vl_compositor_gfx.c,
+create_frag_shader_yuv) reads the alpha that way. The Mac refused the shader
+("Swizzle of non-vector primitive sampler2DArray"), so its draws were skipped
+and every frame VA-API converted to RGB stayed black: Google Chrome's
+hardware decoder converts each frame to ARGB (its "1-copy" path on GL), so
+YouTube in hardware showed nothing.
+Upstreamable; not sent.
+Tests: Tests/virgl/test-core-glsl-shaders.c "swizzle on a sampler (Mesa's
+video compositor)" (fails without: the GLSL has "fssamp0." and the Mac's
+OpenGL refuses it).
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -5237,20 +5237,22 @@
+          break;
+       }
+       case TGSI_FILE_SAMPLER: {
++         /* A sampler is not a vector: its swizzle (Mesa's video compositor writes
++          * SAMP[0].wwww) means nothing, as in gallium's own translators. In GLSL
++          * it is an error ("Swizzle of non-vector primitive"). */
+          const char *cname = tgsi_proc_to_prefix(ctx->prog_type);
+          if (ctx->info.indirect_files & (1 << TGSI_FILE_SAMPLER)) {
+             int basearrayidx = lookup_sampler_array(ctx, src->Register.Index);
+             if (src->Register.Indirect) {
+                char index[64];
+-               strbuf_fmt(src_buf, "%ssamp%d[%s]%s", cname, basearrayidx,
+-                          clamped_index(index, src->Indirect.Index, src->Register.Index - basearrayidx,
+-                                        sampler_array_size(ctx, basearrayidx)),
+-                          swizzle);
++               strbuf_fmt(src_buf, "%ssamp%d[%s]", cname, basearrayidx,
++                          clamped_index(index, src->Indirect.Index, src->Register.Index - basearrayidx,
++                                        sampler_array_size(ctx, basearrayidx)));
+             } else {
+-               strbuf_fmt(src_buf, "%ssamp%d[%d]%s", cname, basearrayidx, src->Register.Index - basearrayidx, swizzle);
++               strbuf_fmt(src_buf, "%ssamp%d[%d]", cname, basearrayidx, src->Register.Index - basearrayidx);
+             }
+          } else {
+-            strbuf_fmt(src_buf, "%ssamp%d%s", cname, src->Register.Index, swizzle);
++            strbuf_fmt(src_buf, "%ssamp%d", cname, src->Register.Index);
+          }
+          sinfo->sreg_index = src->Register.Index;
+       } break;

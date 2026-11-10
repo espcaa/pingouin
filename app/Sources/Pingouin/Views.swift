@@ -137,6 +137,7 @@ struct VMDetail: View {
                         in: 2048...Int(ProcessInfo.processInfo.physicalMemory >> 20), step: 1024)
                 Toggle("ISO keyboard (§ and < keys)", isOn: $vm.config.isoKeyboard)
                 Toggle("Full screen over the notch", isOn: $vm.config.fullPanel)
+                Toggle("Vulkan (needs Fedora's Mesa 26.2.4 or newer)", isOn: $vm.config.vulkan)
                 LabeledContent("Disk", value: "\(vm.config.diskGiB) GiB (grows as used)")
             }
             .disabled(isRunning)

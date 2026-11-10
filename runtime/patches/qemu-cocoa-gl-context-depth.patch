@@ -1,0 +1,52 @@
+From: OmacVM
+Subject: [PATCH] cocoa: GL contexts for virgl without reading the 2D surface
+
+What: the window code's GL context callback (cocoa_gl_create_context)
+takes the pixel depth from gl_ctx_bpp, an int set with the 2D surface in
+cocoa_switch, instead of reading the surface pointer.
+
+Why: virglrenderer makes GL contexts from guest commands (a context, or a
+sub-context inside SUBMIT_3D), and with qemu-virtio-gpu-virgl-unlocked.patch
+those run without the BQL. The surface pointer is replaced by the console
+code with the BQL held, also from the AppKit thread (a console switch from
+the View menu), so reading it there could use a freed surface. The depth is
+the only thing the callback needed from it.
+
+Upstream: OmacVM only.
+Test: src/tests/gpu-unlocked.sh (no surface read in the callback).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 105ac97..e6cd7a0 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -132,6 +132,13 @@ static void cocoa_switch(DisplayChangeListener *dcl,
+ };
+ static DisplayChangeListener dcl;
+ static DisplaySurface *surface;
++/*
++ * Pingouin: the pixel depth of the 2D surface, for the GL contexts virglrenderer
++ * asks for. virgl makes contexts from any command (a guest sub-context), also
++ * while it runs without the BQL, so it must not read the surface pointer,
++ * which the console code replaces with the BQL held. Set with the surface.
++ */
++static int gl_ctx_bpp = 32;
+ static QKbdState *kbd;
+ static int64_t injectedTextSource;
+ static int cursor_hide = 1;
+@@ -5566,6 +5573,7 @@ static void cocoa_switch(DisplayChangeListener *dcl,
+     COCOA_DEBUG("qemu_cocoa: cocoa_switch\n");
+ 
+     surface = new_surface;
++    qatomic_set(&gl_ctx_bpp, PIXMAN_FORMAT_BPP(surface_format(new_surface)));
+ 
+     dispatch_async(dispatch_get_main_queue(), ^{
+         BQL_LOCK_GUARD();
+@@ -5819,7 +5827,7 @@ static QEMUGLContext cocoa_gl_create_context(DisplayGLCtx *dgc,
+     }
+ #endif
+ 
+-    bpp = PIXMAN_FORMAT_BPP(surface_format(surface));
++    bpp = qatomic_read(&gl_ctx_bpp);
+     format = cocoa_gl_create_cgl_pixel_format(bpp);
+     CGLCreateContext(format, gl_view_ctx, &ctx);
+     CGLDestroyPixelFormat(format);

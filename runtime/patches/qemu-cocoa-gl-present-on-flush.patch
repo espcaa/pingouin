@@ -1,0 +1,55 @@
+From: OmacVM
+Subject: [PATCH] cocoa: show each guest frame when it is flushed
+
+The GL scanout flush only marked the view dirty; the window redrew on
+QEMU's 30 ms GUI refresh tick, so by the code it could show at most 33
+frames a second while Omarchy rendered at 120. Ask Core Animation for a
+redraw as soon as the guest flushes (one request in flight at a time).
+
+PINGOUIN_GL_PRESENT_ON_TICK=1 restores the old behaviour (GPU safe mode
+sets it). Applies after the texture-borrowing and GPU-resolution patches.
+
+Upstream: not sent; small enough to offer.
+Test: a frame counter (dev build only) showed 60 frames/s on a 60 Hz
+display, and up to 90 during workspace animations at 120 Hz; GPU safe
+mode A/B in the app.
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index abc53b5..2be99eb 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -138,6 +138,7 @@ @interface QemuCGLLayer : CAOpenGLLayer
+ @end
+ 
+ static bool gl_dirty;
++static bool gl_present_pending;
+ static uint32_t gl_scanout_id;
+ static DisplayGLTextureBorrower gl_scanout_borrow;
+ static QEMUGLContext gl_view_ctx;
+@@ -2898,6 +2899,26 @@ static void cocoa_gl_scanout_flush(DisplayChangeListener *dcl,
+ {
+     gl_dirty = true;
+ 
++    /*
++     * Show the guest's frame now, not on the next 30 ms refresh tick:
++     * the window would otherwise update at 33 frames a second at most.
++     * One request at a time; Core Animation draws it with the next frame.
++     */
++    static int on_tick = -1;
++    if (on_tick < 0) {
++        /* PINGOUIN_GL_PRESENT_ON_TICK=1: the old way, for comparison. */
++        on_tick = getenv("PINGOUIN_GL_PRESENT_ON_TICK") != NULL;
++    }
++#ifdef CONFIG_EGL
++    if (!egl_surface)
++#endif
++    if (!on_tick && !qatomic_xchg(&gl_present_pending, true)) {
++        dispatch_async(dispatch_get_main_queue(), ^{
++            qatomic_set(&gl_present_pending, false);
++            [[cocoaView layer] setNeedsDisplay];
++        });
++    }
++
+     cocoa_gl_log("scanout flush region=%ux%u+%u+%u", w, h, x, y);
+ }
+ 

@@ -1,0 +1,1028 @@
+From: OmacVM
+Subject: [PATCH] ui/cocoa: the Mac's input methods type into the VM (mac-ime, experimental)
+
+What: with PINGOUIN_IME_SOCKET set (OmacVM.app sets it only for a VM with the
+feature mac-ime on, together with the virtio port app.pingouin.ime), QEMU's
+view becomes an NSTextInputClient. The VM's Fcitx5 module (src/ime/guest)
+says over the port which kind of field has the focus and where its caret
+is. While a text field has it, the Mac's input source is an input method
+and the VM has the keyboard, keys without Cmd or Control go to the view's
+NSTextInputContext (also keys from the full-grab tap): marked text goes to
+the guest as preedit (code points, clauses), chosen text as commit; keys the
+input method does not want (Return, arrows, Backspace with nothing marked,
+its Latin mode's own letters) go to the VM as keys, QEMU's way; the release
+of a key it used is not sent. The candidate window is placed at the guest's
+caret, mapped through the display layout the display port already keeps
+(output, black rows, the window of that output); with only the window known
+(Chromium, foot) at the last click after the focus, else the window's
+bottom left. In a text field, macOS's input source shortcuts (hot keys 60
+and 61, while macOS's own shortcuts are off for the VM) and a globe key set
+to "Change Input Source" switch the Mac's input source instead of going to
+the VM. Leaving the field, the window or the input method drops what was
+marked. The Mac never reads the guest's text.
+When only the guest's field goes (the VM keeps the keyboard), the input
+method's context goes off 0.2 s later unless a field comes back: a
+terminal takes its focus again right after Enter, and some input methods
+(WeChat Input) go back to their first mode at each off and on (#357).
+
+Why: #273 (requested and scoped by @Vocllum): Chinese, Japanese and Korean
+with the Mac's own input methods and candidate window in Omarchy
+(docs/adr/0043-mac-ime.md).
+
+Off: without PINGOUIN_IME_SOCKET pingouin_ime_on stays false; handleEvent:
+checks it before anything else and the globe key's tap only after its own
+test, so every key takes QEMU's path byte for byte as before, and the view
+has no input context (as NSView without the protocol).
+
+Security: the guest is untrusted. Lines over 4 KiB are dropped, numbers
+checked (ui/pingouin-ime.h), types checked before use (NSJSONSerialization
+values); the guest can only move the candidate window or keep keys going
+to the VM. Nothing new is allowed: no entitlement, no permission.
+
+Upstream: not applicable (OmacVM's guest side).
+Test: app/runtime/Tests/keys/test-ime.sh (the rules, and this patch's hooks
+in the patched ui/cocoa.m); typing on a test VM (docs/adr/0043-mac-ime.md).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -48,6 +48,7 @@
+ #include "ui/pingouin-desktop-restart.h"
+ #include "ui/pingouin-clean-size.h"
+ #include "ui/pingouin-notch-park.h"
++#include "ui/pingouin-ime.h"
+ #include "hw/core/boards.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+@@ -843,6 +844,14 @@
+     }
+     return changed;
+ }
++
++/*
++ * Pingouin mac-ime (further down): on only for a VM with the feature on
++ * (PINGOUIN_IME_SOCKET); set once at the start, main thread.
++ */
++static bool pingouin_ime_on;
++static bool pingouin_ime_key(NSEvent *event);
++static bool pingouin_ime_globe(void);
+ 
+ /*
+  * Main thread, every key and click event before QEMU's own handling (the
+@@ -897,7 +906,9 @@
+         }
+     }
+     int what = pingouin_globe_tap_step(&pingouin_globe_tap, ev, pingouin_now_ms());
+-    if (what == PINGOUIN_GLOBE_DO_TAP && qemu_console_is_graphic(dcl.con)) {
++    /* mac-ime: in a text field, a globe key set to "Change Input Source" switches the Mac's. */
++    if (what == PINGOUIN_GLOBE_DO_TAP && qemu_console_is_graphic(dcl.con) &&
++        !(pingouin_ime_on && pingouin_ime_globe())) {
+         qkbd_state_key_event(kbd, PINGOUIN_GLOBE_LINUX_KEY, true);
+         qkbd_state_key_event(kbd, PINGOUIN_GLOBE_LINUX_KEY, false);
+     }
+@@ -2033,6 +2044,10 @@
+ {
+     if (pingouin_key_for_macos(event)) {
+         return false;
++    }
++    /* Pingouin mac-ime: keys for the Mac's input method (off: not even looked at). */
++    if (pingouin_ime_on && pingouin_ime_key(event)) {
++        return true;
+     }
+     return bool_with_bql(^{
+         return [self handleEventLocked:event];
+@@ -8465,8 +8480,926 @@
+     dispatch_source_set_event_handler(pingouin_chan_src, ^{ pingouin_chan_read(); });
+     dispatch_source_set_cancel_handler(pingouin_chan_src, ^{ close(fd); });
+     dispatch_resume(pingouin_chan_src);
++}
++
++/*
++ * Pingouin mac-ime (docs/adr/0043-mac-ime.md): the Mac's input methods type
++ * into the VM. Pingouin.app sets PINGOUIN_IME_SOCKET only for a VM with the
++ * feature on; without it nothing here runs and every key takes QEMU's path
++ * as before. The VM's Fcitx5 module (src/ime/guest) says over the virtio
++ * port app.pingouin.ime which kind of field has the focus and where its caret
++ * is. While a text field has it, the Mac's input source is an input method
++ * and the VM has the keyboard, keys without Cmd or Control go to an
++ * NSTextInputContext of QEMU's view: the input method's marked text goes to
++ * the guest as preedit, its chosen text as commit. Keys it does not want
++ * (Return, arrows, Backspace with nothing marked, the letters of its Latin
++ * mode) go to the VM as keys, as always. The candidate window sits at the
++ * guest's caret. The Mac never reads the guest's text; the guest's numbers
++ * are checked (ui/pingouin-ime.h). Main thread only; keys to the VM take the
++ * BQL as QEMU's own path does.
++ */
++@interface QemuCocoaView (PingouinIme) <NSTextInputClient>
++@end
++
++static int pingouin_ime_fd = -1;
++static dispatch_source_t pingouin_ime_src;
++static PingouinImeLines pingouin_ime_lines;
++static PingouinImeState pingouin_ime;
++static PingouinImeKeys pingouin_ime_keys;
++static NSTextInputContext *pingouin_ime_ctx;
++static NSEvent *pingouin_ime_event;       /* the key the input method has now */
++static bool pingouin_ime_event_sent;      /* ... which went to the VM as a key */
++static NSString *pingouin_ime_marked;     /* the marked text (nil: none) */
++static double pingouin_ime_focus_at;      /* CACurrentMediaTime() of the last focus */
++static double pingouin_ime_click_at;      /* ... of the last click in the VM */
++static NSPoint pingouin_ime_click;        /* where (screen points) */
++static NSString *pingouin_ime_source;     /* the Mac's input source now ... */
++static NSString *pingouin_ime_source_before;   /* ... and the one before */
++static PingouinImeOffState pingouin_ime_off;   /* when the input method's context goes off */
++static int pingouin_ime_said;
++/* PINGOUIN_IME_DEBUG=1: every line both ways in qemu.log (with what is typed: tests only). */
++static bool pingouin_ime_debug;
++
++static void pingouin_ime_connect(void);
++
++static void pingouin_ime_send(NSDictionary *msg)
++{
++    NSData *json;
++    NSMutableData *d;
++
++    if (pingouin_ime_fd < 0) {
++        return;
++    }
++    json = [NSJSONSerialization dataWithJSONObject:msg options:0 error:nil];
++    if (!json) {
++        return;
++    }
++    if (pingouin_ime_debug) {
++        fprintf(stderr, "pingouin-ime: mac: %.*s\n", (int)[json length], (const char *)[json bytes]);
++    }
++    d = [NSMutableData dataWithData:json];
++    [d appendBytes:"\n" length:1];
++    const char *p = [d bytes];
++    size_t left = [d length];
++    while (left) {
++        ssize_t n = write(pingouin_ime_fd, p, left);
++        if (n > 0) {
++            p += n;
++            left -= n;
++        } else if (n < 0 && errno == EINTR) {
++            continue;
++        } else {
++            /* The guest is not reading: it says hello again when it is back. */
++            break;
++        }
++    }
+ }
+ 
++/* To the guest's module, once it said hello. */
++static void pingouin_ime_write(NSDictionary *msg)
++{
++    if (pingouin_ime.hello) {
++        pingouin_ime_send(msg);
++    }
++}
++
++static void pingouin_ime_set_marked(NSString *s)
++{
++    [pingouin_ime_marked release];
++    pingouin_ime_marked = [s length] ? [s copy] : nil;
++}
++
++/* Chosen text, in pieces of at most PINGOUIN_IME_MAX_TEXT bytes (whole characters). */
++static void pingouin_ime_commit(NSString *text)
++{
++    NSUInteger i = 0, len = [text length];
++
++    while (i < len) {
++        NSUInteger end = i;
++        size_t bytes = 0;
++        while (end < len) {
++            NSRange r = [text rangeOfComposedCharacterSequenceAtIndex:end];
++            size_t b = [[text substringWithRange:r] lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
++            if (end > i && bytes + b > PINGOUIN_IME_MAX_TEXT) {
++                break;
++            }
++            bytes += b;
++            end = NSMaxRange(r);
++        }
++        pingouin_ime_write(@{ @"t": @"commit", @"text": [text substringWithRange:NSMakeRange(i, end - i)] });
++        i = end;
++    }
++}
++
++/* Code points before UTF-16 index i of s. */
++static NSUInteger pingouin_ime_cp(NSString *s, NSUInteger i)
++{
++    NSUInteger len = [s length];
++    unichar *u = malloc(MAX(len, 1) * sizeof(unichar));
++    size_t n;
++
++    [s getCharacters:u range:NSMakeRange(0, len)];
++    n = pingouin_ime_code_points(u, len, i);
++    free(u);
++    return n;
++}
++
++/*
++ * The marked text as the guest's preedit: the cursor, and its clauses
++ * (NSMarkedClauseSegment runs; the one being converted is the selected range
++ * or has the thick underline) as highlight or underline.
++ */
++static void pingouin_ime_preedit(NSString *s, NSRange sel, NSAttributedString *attr)
++{
++    NSUInteger len;
++    NSMutableArray *segs = [NSMutableArray array];
++
++    /* At most PINGOUIN_IME_MAX_TEXT bytes: the rest of a very long one is not shown. */
++    while ([s lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > PINGOUIN_IME_MAX_TEXT && [s length]) {
++        NSRange last = [s rangeOfComposedCharacterSequenceAtIndex:[s length] - 1];
++        s = [s substringToIndex:last.location];
++    }
++    len = [s length];
++    if (!len) {
++        pingouin_ime_write(@{ @"t": @"cancel" });
++        return;
++    }
++    if (sel.location == NSNotFound || sel.location > len) {
++        sel = NSMakeRange(len, 0);
++    }
++    sel.length = MIN(sel.length, len - sel.location);
++    if (attr && [attr length] >= len) {
++        __block NSUInteger at = 0;
++        [attr enumerateAttribute:NSMarkedClauseSegmentAttributeName
++                         inRange:NSMakeRange(0, len)
++                         options:0
++                      usingBlock:^(id value, NSRange r, BOOL *stop) {
++            if (!value || [segs count] >= 64) {
++                return;
++            }
++            id ul = [attr attribute:NSUnderlineStyleAttributeName atIndex:r.location effectiveRange:NULL];
++            bool thick = [ul isKindOfClass:[NSNumber class]] && ([ul integerValue] & NSUnderlineStyleThick);
++            bool active = (sel.length && NSIntersectionRange(r, sel).length) || thick;
++            NSUInteger a = pingouin_ime_cp(s, r.location), b = pingouin_ime_cp(s, NSMaxRange(r));
++            if (a >= at && b > a) {
++                [segs addObject:@[ @(a), @(b), @(active ? 1 : 0) ]];
++                at = b;
++            }
++        }];
++    }
++    if (![segs count] && sel.length) {
++        NSUInteger a = pingouin_ime_cp(s, sel.location), b = pingouin_ime_cp(s, NSMaxRange(sel));
++        NSUInteger n = pingouin_ime_cp(s, len);
++        if (a > 0) {
++            [segs addObject:@[ @0, @(a), @0 ]];
++        }
++        [segs addObject:@[ @(a), @(b), @1 ]];
++        if (b < n) {
++            [segs addObject:@[ @(b), @(n), @0 ]];
++        }
++    }
++    pingouin_ime_write(@{ @"t": @"preedit", @"text": s, @"cursor": @(pingouin_ime_cp(s, NSMaxRange(sel))),
++                        @"segs": segs });
++}
++
++/* The guest's field that marked and chosen text goes to: there, not a password field. */
++static bool pingouin_ime_field(void)
++{
++    return pingouin_ime.hello && pingouin_ime.focus && !pingouin_ime.password;
++}
++
++/*
++ * A window of the VM has the keyboard. macOS 26 draws the input method's
++ * candidate list as a window of this process, and that window can become
++ * the key window while it shows: the VM's main window still counts then.
++ */
++static bool pingouin_ime_window_key(void)
++{
++    return [NSApp isActive] && !pingouin_touchid_up &&
++           (pingouin_is_our_window([NSApp keyWindow]) || pingouin_is_our_window([NSApp mainWindow]));
++}
++
++/*
++ * After any change: the window's keyboard, the guest's focus, the Mac's
++ * input source. The guest's field gone (another field, a password field,
++ * the module gone): what was marked goes, in the guest too. Only the keys
++ * gone (another input source, another window or app in front): the input
++ * method's context is deactivated, and the input method keeps or commits
++ * what it marked, as in a Mac app.
++ */
++static void pingouin_ime_update(void)
++{
++    pingouin_ime.window_key = pingouin_ime_window_key();
++    bool active = pingouin_ime_active(&pingouin_ime);
++    if (pingouin_ime_marked && !pingouin_ime_field()) {
++        pingouin_ime_set_marked(nil);
++        [pingouin_ime_ctx discardMarkedText];
++        pingouin_ime_write(@{ @"t": @"cancel" });
++    }
++    bool changed = active != pingouin_ime_off.was_active;
++    switch (pingouin_ime_off_step(&pingouin_ime_off, &pingouin_ime)) {
++    case PINGOUIN_IME_OFF_NOW:
++        [pingouin_ime_ctx deactivate];
++        break;
++    case PINGOUIN_IME_OFF_LATER: {
++        /* Only the guest's field went, and it often comes back at once. */
++        unsigned gen = pingouin_ime_off.gen;
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PINGOUIN_IME_OFF_DELAY * NSEC_PER_SEC)),
++                       dispatch_get_main_queue(), ^{
++            if (pingouin_ime_off_due(&pingouin_ime_off, gen)) {
++                [pingouin_ime_ctx deactivate];
++                if (pingouin_ime_debug) {
++                    fprintf(stderr, "pingouin-ime: input method off (no field came back)\n");
++                }
++            }
++        });
++        break;
++    }
++    case PINGOUIN_IME_OFF_KEPT:
++        if (pingouin_ime_debug) {
++            fprintf(stderr, "pingouin-ime: input method kept on (a field came back)\n");
++        }
++        break;
++    case PINGOUIN_IME_OFF_NONE:
++        break;
++    }
++    if (changed) {
++        if (pingouin_ime_debug) {
++            NSWindow *k = [NSApp keyWindow];
++            fprintf(stderr, "pingouin-ime: %s (active app %d, key window %s level %ld, main ours %d, source im %d, focus %d)\n",
++                    active ? "active" : "inactive", [NSApp isActive], k ? [NSStringFromClass([k class]) UTF8String] : "none",
++                    (long)[k level], pingouin_is_our_window([NSApp mainWindow]), pingouin_ime.source_im, pingouin_ime.focus);
++        }
++        if (pingouin_ime_said < 4) {
++            pingouin_ime_said++;
++            info_report("cocoa: mac-ime: keys %s", active ?
++                        "go to the Mac's input method (a text field in the VM has the focus)" :
++                        "go to the VM as keys");
++        }
++    }
++}
++
++static void pingouin_ime_source_changed(void)
++{
++    TISInputSourceRef src = TISCopyCurrentKeyboardInputSource();
++    bool im = false;
++    NSString *sid = nil;
++
++    if (src) {
++        CFStringRef type = TISGetInputSourceProperty(src, kTISPropertyInputSourceType);
++        CFStringRef idr = TISGetInputSourceProperty(src, kTISPropertyInputSourceID);
++        /* An input method's mode (Kotoeri's Hiragana), one without modes, or the
++         * method itself (what some report while they convert). */
++        im = type && (CFEqual(type, kTISTypeKeyboardInputMode) ||
++                      CFEqual(type, kTISTypeKeyboardInputMethodWithoutModes) ||
++                      CFEqual(type, kTISTypeKeyboardInputMethodModeEnabled));
++        sid = idr ? [[(NSString *)idr copy] autorelease] : nil;
++        CFRelease(src);
++    }
++    if (pingouin_ime_debug) {
++        NSWindow *k = [NSApp keyWindow];
++        fprintf(stderr, "pingouin-ime: input source %s (input method %d; key window %s, ours %d; marked %d)\n",
++                sid ? [sid UTF8String] : "?", im, k ? [NSStringFromClass([k class]) UTF8String] : "none",
++                pingouin_is_our_window(k), pingouin_ime_marked != nil);
++    }
++    if (sid && ![sid isEqualToString:pingouin_ime_source]) {
++        [pingouin_ime_source_before release];
++        pingouin_ime_source_before = pingouin_ime_source;
++        pingouin_ime_source = [sid retain];
++    }
++    pingouin_ime.source_im = im;
++    pingouin_ime_update();
++}
++
++/*
++ * macOS's "Select the previous input source" (the one used before) or "next
++ * source in Input menu", for the shortcuts and the globe key: QEMU's
++ * full-grab tap takes them before macOS while the VM has the keyboard.
++ */
++static void pingouin_ime_switch(bool previous)
++{
++    NSDictionary *props = @{
++        (NSString *)kTISPropertyInputSourceCategory: (NSString *)kTISCategoryKeyboardInputSource,
++        (NSString *)kTISPropertyInputSourceIsSelectCapable: @YES,
++    };
++    CFArrayRef list = TISCreateInputSourceList((CFDictionaryRef)props, false);
++    CFIndex n, cur = -1, target = -1;
++
++    if (!list) {
++        return;
++    }
++    n = CFArrayGetCount(list);
++    for (CFIndex i = 0; i < n; i++) {
++        TISInputSourceRef s = (TISInputSourceRef)CFArrayGetValueAtIndex(list, i);
++        NSString *sid = (NSString *)TISGetInputSourceProperty(s, kTISPropertyInputSourceID);
++        if ([sid isEqualToString:pingouin_ime_source]) {
++            cur = i;
++        }
++        if (previous && [sid isEqualToString:pingouin_ime_source_before]) {
++            target = i;
++        }
++    }
++    if (target < 0 && n > 0) {
++        target = cur < 0 ? 0 : (cur + 1) % n;
++    }
++    if (target >= 0 && target != cur) {
++        TISSelectInputSource((TISInputSourceRef)CFArrayGetValueAtIndex(list, target));
++    }
++    CFRelease(list);
++    /* Now, not when macOS's notice comes: the next key is for the new one. */
++    pingouin_ime_source_changed();
++}
++
++static void pingouin_ime_hotkey(NSDictionary *all, NSString *key, PingouinImeHotKey *h,
++                              int keycode, uint32_t mods)
++{
++    NSDictionary *e = [all isKindOfClass:[NSDictionary class]] ? all[key] : nil;
++    NSDictionary *v;
++    NSArray *p;
++
++    /* macOS's defaults: on, Control-Space and Control-Option-Space. */
++    h->enabled = true;
++    h->keycode = keycode;
++    h->mods = mods;
++    if (![e isKindOfClass:[NSDictionary class]]) {
++        return;
++    }
++    if ([e[@"enabled"] isKindOfClass:[NSNumber class]]) {
++        h->enabled = [e[@"enabled"] boolValue];
++    }
++    v = e[@"value"];
++    p = [v isKindOfClass:[NSDictionary class]] ? v[@"parameters"] : nil;
++    if ([p isKindOfClass:[NSArray class]] && [p count] >= 3 &&
++        [p[1] isKindOfClass:[NSNumber class]] && [p[2] isKindOfClass:[NSNumber class]]) {
++        h->keycode = [p[1] intValue];
++        h->mods = [p[2] unsignedIntValue];
++    }
++}
++
++static void pingouin_ime_hotkeys_load(void)
++{
++    CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("AppleSymbolicHotKeys"),
++                                                    CFSTR("com.apple.symbolichotkeys"));
++    NSDictionary *all = v && CFGetTypeID(v) == CFDictionaryGetTypeID() ? (NSDictionary *)v : nil;
++
++    pingouin_ime_hotkey(all, @"60", &pingouin_ime_keys.prev, kVK_Space, PINGOUIN_IME_CONTROL);
++    pingouin_ime_hotkey(all, @"61", &pingouin_ime_keys.next, kVK_Space, PINGOUIN_IME_CONTROL | PINGOUIN_IME_OPTION);
++    if (v) {
++        CFRelease(v);
++    }
++}
++
++/* The globe key on its own, set to "Change Input Source", in a text field. */
++static bool pingouin_ime_globe(void)
++{
++    CFPropertyListRef v;
++    int use = -1;
++
++    pingouin_ime.window_key = pingouin_ime_window_key();
++    if (!pingouin_ime_on || !pingouin_ime_text_focus(&pingouin_ime)) {
++        return false;
++    }
++    v = CFPreferencesCopyAppValue(CFSTR("AppleFnUsageType"), CFSTR("com.apple.HIToolbox"));
++    if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
++        CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &use);
++    }
++    if (v) {
++        CFRelease(v);
++    }
++    if (use != 1) {
++        return false;
++    }
++    pingouin_ime_switch(false);
++    return true;
++}
++
++/* A box in the guest's logical pixels on the Mac's screen (points), or false. */
++static bool pingouin_ime_to_screen(double x, double y, double w, double h, NSRect *out)
++{
++    PingouinImeBox outs[PINGOUIN_MAX_OUTPUTS];
++    double u0, v0, u1, v1;
++    int i;
++
++    if (!pingouin_guest_known) {
++        return false;
++    }
++    for (i = 0; i < pingouin_outputs; i++) {
++        PingouinBox b = pingouin_guest_box[i];
++        bool shown = i == 0 || pingouin_heads[i].display;
++        outs[i] = (PingouinImeBox){ b.x, b.y, shown ? b.w : 0, shown ? b.h : 0 };
++    }
++    i = pingouin_ime_output_for(outs, pingouin_outputs, x, y);
++    if (i < 0) {
++        return false;
++    }
++    NSView *view = i == 0 ? cocoaView : pingouin_heads[i].view;
++    if (!view || ![view window]) {
++        return false;
++    }
++    pingouin_ime_fractions(outs[i], x, y, w, h, &u0, &v0, &u1, &v1);
++    NSSize size = [view bounds].size;
++    CGFloat black = view == cocoaView ? [cocoaView pingouinBlackRows] : 0;
++    CGFloat gh = size.height - black;
++    NSRect r = NSMakeRect(u0 * size.width, black + (1 - v1) * gh,
++                          MAX(1, (u1 - u0) * size.width), MAX(1, (v1 - v0) * gh));
++    r = [view convertRect:r toView:nil];
++    *out = [[view window] convertRectToScreen:r];
++    return true;
++}
++
++/*
++ * Where the candidate window goes: the caret; without it (Chromium, foot:
++ * only the window is known) the last click in the VM after the focus came,
++ * else the bottom left of the focused window, else of the VM's window.
++ */
++static NSRect pingouin_ime_caret(void)
++{
++    NSRect r;
++
++    if (pingouin_ime.has_rect && pingouin_ime.exact &&
++        pingouin_ime_to_screen(pingouin_ime.x, pingouin_ime.y, pingouin_ime.w, pingouin_ime.h, &r)) {
++        /* A caret as tall as a whole field (an entry stretched over its window): GTK draws the line in its middle. */
++        if (NSHeight(r) > 40) {
++            r.origin.y = NSMidY(r) - 20;
++            r.size.height = 40;
++        }
++        return r;
++    }
++    if (pingouin_ime_click_at > pingouin_ime_focus_at) {
++        return NSMakeRect(pingouin_ime_click.x, pingouin_ime_click.y - 10, 1, 20);
++    }
++    if (pingouin_ime.has_rect &&
++        pingouin_ime_to_screen(pingouin_ime.x, pingouin_ime.y, pingouin_ime.w, pingouin_ime.h, &r)) {
++        return NSMakeRect(NSMinX(r) + 16, NSMinY(r) + 16, 1, 20);
++    }
++    r = [[cocoaView window] frame];
++    return NSMakeRect(NSMinX(r) + 16, NSMinY(r) + 16, 1, 20);
++}
++
++/*
++ * An input context remembers its own input source and selects it again when
++ * it is activated (AppKit's per-document input source). Ours is activated
++ * and deactivated as fields come and go, so it would switch the Mac back to
++ * the source it had at its last activation (a plain layout) right after the
++ * user picked an input method: it always takes the Mac's current one.
++ */
++static void pingouin_ime_activate(void)
++{
++    if (pingouin_ime_source && ![[pingouin_ime_ctx selectedKeyboardInputSource] isEqualToString:pingouin_ime_source]) {
++        [pingouin_ime_ctx setSelectedKeyboardInputSource:pingouin_ime_source];
++    }
++    [pingouin_ime_ctx activate];
++}
++
++/* The key the input method has now goes to the VM as a key, QEMU's way. */
++static void pingouin_ime_send_key(void)
++{
++    NSEvent *e = pingouin_ime_event;
++
++    if (!e || pingouin_ime_event_sent) {
++        return;
++    }
++    pingouin_ime_event_sent = true;
++    bool_with_bql(^{
++        return [cocoaView handleEventLocked:e];
++    });
++}
++
++/*
++ * Every event QEMU's window code gets (QemuCocoaView handleEvent:), before
++ * its own handling, only with mac-ime on. True: used here.
++ */
++static bool pingouin_ime_key(NSEvent *event)
++{
++    PingouinImeKeyType kt;
++    PingouinImeRoute route;
++    BOOL used;
++
++    switch ([event type]) {
++    case NSEventTypeKeyDown:
++        kt = PINGOUIN_IME_DOWN;
++        break;
++    case NSEventTypeKeyUp:
++        kt = PINGOUIN_IME_UP;
++        break;
++    case NSEventTypeFlagsChanged:
++        kt = PINGOUIN_IME_FLAGS;
++        break;
++    case NSEventTypeLeftMouseDown:
++    case NSEventTypeRightMouseDown:
++        if (pingouin_is_our_window([event window])) {
++            pingouin_ime_click = [NSEvent mouseLocation];
++            pingouin_ime_click_at = CACurrentMediaTime();
++        }
++        return false;
++    default:
++        return false;
++    }
++    pingouin_ime.window_key = pingouin_ime_window_key();
++    if (kt == PINGOUIN_IME_FLAGS) {
++        /*
++         * Modifiers go to the VM; the input method sees them too: a Shift
++         * press and release with no key between switches some to Latin.
++         */
++        bool active = pingouin_ime_active(&pingouin_ime) || pingouin_ime_off.waiting;   /* its context is still on */
++        BOOL used = NO;
++        if (active) {
++            pingouin_ime_activate();
++            used = [pingouin_ime_ctx handleEvent:event];
++        }
++        if (pingouin_ime_debug) {
++            fprintf(stderr, "pingouin-ime: modifier key %d flags 0x%lx: %s\n", [event keyCode],
++                    (unsigned long)[event modifierFlags], !active ? "inactive, only to the VM" :
++                    used ? "input method used it, also to the VM" : "input method did not want it, to the VM");
++        }
++        return false;
++    }
++    route = pingouin_ime_route(&pingouin_ime_keys, &pingouin_ime, kt, [event keyCode],
++                             (uint32_t)[event modifierFlags]);
++    switch (route) {
++    case PINGOUIN_IME_PASS:
++        return false;
++    case PINGOUIN_IME_DROP:
++        return true;
++    case PINGOUIN_IME_SWITCH_PREV:
++    case PINGOUIN_IME_SWITCH_NEXT:
++        if (![event isARepeat]) {
++            pingouin_ime_switch(route == PINGOUIN_IME_SWITCH_PREV);
++        }
++        return true;
++    case PINGOUIN_IME_TO_IM:
++        break;
++    }
++    pingouin_ime_activate();
++    pingouin_ime_event = event;
++    pingouin_ime_event_sent = false;
++    used = [pingouin_ime_ctx handleEvent:event];
++    pingouin_ime_event = nil;
++    if (pingouin_ime_debug) {
++        fprintf(stderr, "pingouin-ime: key %d: input method %s%s\n", [event keyCode], used ? "used it" : "did not want it",
++                pingouin_ime_event_sent ? ", sent to the VM as a key" : "");
++    }
++    if (pingouin_ime_event_sent) {
++        return true;            /* went to the VM as a key: its release follows it */
++    }
++    if (!used) {
++        return false;           /* the input method did not want it: QEMU's path */
++    }
++    pingouin_ime_take(&pingouin_ime_keys, [event keyCode]);
++    return true;
++}
++
++/* One line from the guest's module. Anything unexpected is dropped. */
++static void pingouin_ime_line(const char *line, size_t len, void *opaque)
++{
++    if (pingouin_ime_debug) {
++        fprintf(stderr, "pingouin-ime: guest: %.*s\n", (int)len, line);
++    }
++    @autoreleasepool {
++        id obj = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:line length:len]
++                                                 options:0 error:nil];
++        NSDictionary *d = [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
++        NSString *t = [d[@"t"] isKindOfClass:[NSString class]] ? d[@"t"] : nil;
++        double v;
++
++        if ([t isEqualToString:@"hello"]) {
++            if (!pingouin_json_number(d[@"v"], &v) || v < 1) {
++                return;
++            }
++            if (!pingouin_ime.hello) {
++                info_report("cocoa: mac-ime: the VM's Fcitx5 module is there (protocol %d)", (int)v);
++            }
++            pingouin_ime.hello = true;
++            pingouin_ime.focus = false;
++            pingouin_ime.has_rect = false;
++            pingouin_ime_release_all(&pingouin_ime_keys);
++        } else if ([t isEqualToString:@"focus"] && [d[@"on"] isKindOfClass:[NSNumber class]]) {
++            if (![d[@"on"] boolValue]) {
++                pingouin_ime.focus = false;
++                pingouin_ime.has_rect = false;
++            } else {
++                NSString *kind = d[@"kind"];
++                NSArray *r = d[@"rect"];
++                double x, y, w, h;
++                bool rect = [r isKindOfClass:[NSArray class]] && [r count] == 4 &&
++                            pingouin_json_number(r[0], &x) && pingouin_json_number(r[1], &y) &&
++                            pingouin_json_number(r[2], &w) && pingouin_json_number(r[3], &h) &&
++                            pingouin_ime_rect_ok(x, y, w, h);
++                if (![kind isKindOfClass:[NSString class]] ||
++                    !([kind isEqualToString:@"text"] || [kind isEqualToString:@"password"])) {
++                    return;
++                }
++                bool pw = [kind isEqualToString:@"password"];
++                /*
++                 * Another field (the guest says focus off before it) or a
++                 * password field now: what was marked goes. The same field
++                 * again (its module said hello again) keeps it.
++                 */
++                if (!pingouin_ime.focus || pw != pingouin_ime.password) {
++                    pingouin_ime.focus = false;
++                    pingouin_ime_update();
++                    pingouin_ime_focus_at = CACurrentMediaTime();
++                }
++                pingouin_ime.focus = true;
++                pingouin_ime.password = pw;
++                pingouin_ime.has_rect = rect;
++                if (rect) {
++                    pingouin_ime.x = x; pingouin_ime.y = y; pingouin_ime.w = w; pingouin_ime.h = h;
++                    pingouin_ime.exact = [d[@"exact"] isKindOfClass:[NSNumber class]] && [d[@"exact"] boolValue];
++                }
++            }
++            if (!pingouin_ime.focus) {
++                pingouin_ime_release_all(&pingouin_ime_keys);
++            }
++        } else if ([t isEqualToString:@"rect"] && pingouin_ime.focus) {
++            NSArray *r = d[@"rect"];
++            double x, y, w, h;
++            if ([r isKindOfClass:[NSArray class]] && [r count] == 4 &&
++                pingouin_json_number(r[0], &x) && pingouin_json_number(r[1], &y) &&
++                pingouin_json_number(r[2], &w) && pingouin_json_number(r[3], &h) &&
++                pingouin_ime_rect_ok(x, y, w, h)) {
++                pingouin_ime.has_rect = true;
++                pingouin_ime.x = x; pingouin_ime.y = y; pingouin_ime.w = w; pingouin_ime.h = h;
++                pingouin_ime.exact = [d[@"exact"] isKindOfClass:[NSNumber class]] && [d[@"exact"] boolValue];
++                [pingouin_ime_ctx invalidateCharacterCoordinates];
++            }
++        } else if ([t isEqualToString:@"reset"] && pingouin_ime_marked) {
++            /* The app moved its caret (a click): the input method starts over. */
++            pingouin_ime_set_marked(nil);
++            [pingouin_ime_ctx discardMarkedText];
++        }
++        pingouin_ime_update();
++    }
++}
++
++static void pingouin_ime_gone(void)
++{
++    pingouin_ime.hello = false;
++    pingouin_ime.focus = false;
++    pingouin_ime.has_rect = false;
++    pingouin_ime_update();
++}
++
++static void pingouin_ime_close(void)
++{
++    if (pingouin_ime_src) {
++        dispatch_source_cancel(pingouin_ime_src);
++        dispatch_release(pingouin_ime_src);
++        pingouin_ime_src = NULL;
++    }
++    pingouin_ime_fd = -1;
++    pingouin_ime_gone();
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
++                   dispatch_get_main_queue(), ^{ pingouin_ime_connect(); });
++}
++
++static void pingouin_ime_read(void)
++{
++    char buf[4096];
++    ssize_t n = read(pingouin_ime_fd, buf, sizeof(buf));
++
++    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
++        pingouin_ime_close();
++        return;
++    }
++    if (n > 0) {
++        pingouin_ime_lines_feed(&pingouin_ime_lines, buf, (size_t)n, pingouin_ime_line, NULL);
++    }
++}
++
++static void pingouin_ime_connect(void)
++{
++    static int tries;
++    const char *path = getenv("PINGOUIN_IME_SOCKET");
++    struct sockaddr_un addr = { 0 };
++    int one = 1;
++
++    if (!path || !*path || pingouin_ime_fd >= 0 || strlen(path) >= sizeof(addr.sun_path)) {
++        return;
++    }
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd < 0) {
++        return;
++    }
++    addr.sun_family = AF_UNIX;
++    strcpy(addr.sun_path, path);
++    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
++    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
++        close(fd);
++        if (++tries < 120) {
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
++                           dispatch_get_main_queue(), ^{ pingouin_ime_connect(); });
++        }
++        return;
++    }
++    tries = 0;
++    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
++    pingouin_ime_fd = fd;
++    pingouin_ime_lines_reset(&pingouin_ime_lines);
++    pingouin_ime_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0,
++                                            dispatch_get_main_queue());
++    dispatch_source_set_event_handler(pingouin_ime_src, ^{ pingouin_ime_read(); });
++    dispatch_source_set_cancel_handler(pingouin_ime_src, ^{ close(fd); });
++    dispatch_resume(pingouin_ime_src);
++    /* The guest's module answers with hello and its focus. */
++    pingouin_ime_send(@{ @"t": @"hello", @"v": @1 });
++}
++
++/* A guest reset (QEMU's thread, BQL): its Fcitx5 is gone until it says hello. */
++static void pingouin_ime_guest_reset(void *opaque)
++{
++    dispatch_async(dispatch_get_main_queue(), ^{ pingouin_ime_gone(); });
++}
++
++/* Main thread, with the BQL (from cocoa_display_init). */
++static void pingouin_ime_init(void)
++{
++    const char *path = getenv("PINGOUIN_IME_SOCKET");
++    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++
++    if (!path || !*path) {
++        return;
++    }
++    pingouin_ime_on = true;
++    pingouin_ime_debug = getenv("PINGOUIN_IME_DEBUG") && !strcmp(getenv("PINGOUIN_IME_DEBUG"), "1");
++    pingouin_ime_ctx = [[NSTextInputContext alloc] initWithClient:cocoaView];
++    pingouin_ime_hotkeys_load();
++    [[NSDistributedNotificationCenter defaultCenter]
++        addObserverForName:(NSString *)kTISNotifySelectedKeyboardInputSourceChanged
++                    object:nil
++                     queue:[NSOperationQueue mainQueue]
++                usingBlock:^(NSNotification *note) { pingouin_ime_source_changed(); }];
++    for (NSNotificationName name in @[NSApplicationDidResignActiveNotification,
++                                      NSWindowDidBecomeKeyNotification,
++                                      NSWindowDidResignKeyNotification]) {
++        [nc addObserverForName:name object:nil queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification *note) {
++            if (pingouin_ime_debug && [[note object] isKindOfClass:[NSWindow class]]) {
++                NSWindow *w = [note object];
++                fprintf(stderr, "pingouin-ime: %s: %s level %ld ours %d\n", [[note name] UTF8String],
++                        [NSStringFromClass([w class]) UTF8String], (long)[w level], pingouin_is_our_window(w));
++            }
++            pingouin_ime_update();
++        }];
++    }
++    /* Changed in System Settings meanwhile: read again when the VM comes back. */
++    [nc addObserverForName:NSApplicationDidBecomeActiveNotification object:nil
++                     queue:[NSOperationQueue mainQueue]
++                usingBlock:^(NSNotification *note) {
++        pingouin_ime_hotkeys_load();
++        pingouin_ime_update();
++    }];
++    qemu_register_reset(pingouin_ime_guest_reset, NULL);
++    pingouin_ime_source_changed();
++    info_report("cocoa: mac-ime: on (PINGOUIN_IME_SOCKET): the Mac's input methods type in the "
++                "VM's text fields once its Fcitx5 module says hello");
++    pingouin_ime_connect();
++}
++
++#define PINGOUIN_IME_TRACE(...) do { if (pingouin_ime_debug) { fprintf(stderr, "pingouin-ime: client: " __VA_ARGS__); } } while (0)
++
++/* QEMU's view as the input method's client (only with mac-ime on). */
++@implementation QemuCocoaView (PingouinIme)
++- (NSTextInputContext *)inputContext
++{
++    return pingouin_ime_on && (pingouin_ime_active(&pingouin_ime) || pingouin_ime_off.waiting) ? pingouin_ime_ctx : nil;
++}
++
++- (void)insertText:(id)string replacementRange:(NSRange)replacementRange
++{
++    PINGOUIN_IME_TRACE("insertText %lu chars\n", (unsigned long)[([string isKindOfClass:[NSAttributedString class]] ? [string string] : string) length]);
++    NSString *s = [string isKindOfClass:[NSAttributedString class]] ? [string string] : string;
++    bool was = pingouin_ime_marked != nil;
++
++    if (![s isKindOfClass:[NSString class]]) {
++        return;
++    }
++    pingouin_ime_set_marked(nil);
++    /* Nothing was marked and it is the key's own character: the key itself. */
++    if (!was && pingouin_ime_event && [s isEqualToString:[pingouin_ime_event characters]]) {
++        pingouin_ime_send_key();
++        return;
++    }
++    if ([s length] && pingouin_ime_field()) {
++        pingouin_ime_commit(s);
++    } else if (was) {
++        pingouin_ime_write(@{ @"t": @"cancel" });
++    }
++}
++
++- (void)doCommandBySelector:(SEL)selector
++{
++    if (pingouin_ime_debug) {
++        fprintf(stderr, "pingouin-ime: command %s\n", [NSStringFromSelector(selector) UTF8String]);
++    }
++    /* Return, Tab, arrows, Backspace with nothing marked: the key itself. */
++    pingouin_ime_send_key();
++}
++
++- (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange
++     replacementRange:(NSRange)replacementRange
++{
++    PINGOUIN_IME_TRACE("setMarkedText sel %lu+%lu\n", (unsigned long)selectedRange.location, (unsigned long)selectedRange.length);
++    NSAttributedString *attr = [string isKindOfClass:[NSAttributedString class]] ? string : nil;
++    NSString *s = attr ? [attr string] : string;
++    bool was = pingouin_ime_marked != nil;
++
++    if (![s isKindOfClass:[NSString class]]) {
++        return;
++    }
++    pingouin_ime_set_marked(s);
++    if (![s length]) {
++        if (was) {
++            pingouin_ime_write(@{ @"t": @"cancel" });
++        }
++        return;
++    }
++    if (pingouin_ime_field()) {
++        pingouin_ime_preedit(s, selectedRange, attr);
++    }
++}
++
++- (void)unmarkText
++{
++    PINGOUIN_IME_TRACE("unmarkText\n");
++    /* The input method keeps the marked text as it is. */
++    NSString *s = [[pingouin_ime_marked retain] autorelease];
++
++    pingouin_ime_set_marked(nil);
++    if ([s length] && pingouin_ime_field()) {
++        pingouin_ime_commit(s);
++    }
++}
++
++- (NSRange)selectedRange
++{
++    PINGOUIN_IME_TRACE("selectedRange\n");
++    return NSMakeRange(pingouin_ime_marked ? [pingouin_ime_marked length] : 0, 0);
++}
++
++- (NSRange)markedRange
++{
++    PINGOUIN_IME_TRACE("markedRange\n");
++    return pingouin_ime_marked ? NSMakeRange(0, [pingouin_ime_marked length]) : NSMakeRange(NSNotFound, 0);
++}
++
++- (BOOL)hasMarkedText
++{
++    PINGOUIN_IME_TRACE("hasMarkedText\n");
++    return pingouin_ime_marked != nil;
++}
++
++- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText
++{
++    return @[NSMarkedClauseSegmentAttributeName, NSUnderlineStyleAttributeName];
++}
++
++/*
++ * The input method reads back only what it marked itself (Kotoeri needs that
++ * to convert); the guest's own text is never known here, so never read.
++ */
++- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range
++                                                actualRange:(NSRangePointer)actualRange
++{
++    PINGOUIN_IME_TRACE("attributedSubstring %lu+%lu\n", (unsigned long)range.location, (unsigned long)range.length);
++    NSRange r;
++
++    if (!pingouin_ime_marked || range.location == NSNotFound) {
++        return nil;
++    }
++    r = NSIntersectionRange(range, NSMakeRange(0, [pingouin_ime_marked length]));
++    if (!r.length && range.location != [pingouin_ime_marked length]) {
++        return nil;
++    }
++    if (actualRange) {
++        *actualRange = r;
++    }
++    return [[[NSAttributedString alloc] initWithString:[pingouin_ime_marked substringWithRange:r]] autorelease];
++}
++
++- (NSUInteger)characterIndexForPoint:(NSPoint)point
++{
++    PINGOUIN_IME_TRACE("characterIndexForPoint\n");
++    return NSNotFound;
++}
++
++- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange
++{
++    PINGOUIN_IME_TRACE("firstRect %lu+%lu\n", (unsigned long)range.location, (unsigned long)range.length);
++    if (actualRange) {
++        *actualRange = range;
++    }
++    return pingouin_ime_caret();
++}
++
++- (NSInteger)windowLevel
++{
++    PINGOUIN_IME_TRACE("windowLevel\n");
++    NSWindow *w = pingouin_is_our_window([NSApp keyWindow]) ? [NSApp keyWindow] : [self window];
++    return [w level];
++}
++@end
++
+ /* A guest reset (QEMU's thread, BQL): its firmware and boot draw no pointer. */
+ static void pingouin_pointer_reset(void *opaque)
+ {
+@@ -8790,6 +9723,7 @@
+     }
+     pingouin_shortcuts_init();
+     pingouin_globe_init();
++    pingouin_ime_init();
+ 
+     if (opts->has_show_cursor && opts->show_cursor) {
+         cursor_hide = 0;

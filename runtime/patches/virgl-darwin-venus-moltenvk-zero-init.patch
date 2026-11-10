@@ -1,0 +1,71 @@
+From: OmacVM
+Subject: [PATCH] venus: hide workgroup zero-init on MoltenVK
+
+What: vkGetPhysicalDeviceFeatures2 reports shaderZeroInitializeWorkgroupMemory
+as unsupported when the host driver is MoltenVK.
+
+Why: MoltenVK 1.4.2 (its SPIRV-Cross) compiles a zero-initialized workgroup
+variable into a loop over gl_WorkGroupSize but never declares it when the
+shader sets its size with LocalSize. Metal then refuses the shader ("use of
+undeclared identifier 'gl_WorkGroupSize'"), vkCreateComputePipelines fails,
+and the guest's next vkCmdBindPipeline names an object vkr never created:
+the whole context is lost. WebGPU in Firefox (wgpu) zero-initializes all
+workgroup memory, so every WebGPU compute shader with workgroup memory took
+Firefox down. Without the feature, wgpu (and Dawn, ANGLE) zero the memory
+in the shader themselves. SPIRV-Cross main declares gl_WorkGroupSize from
+LocalSize for this case; drop the patch once MoltenVK ships that.
+
+The driver is recognised by its driverID, asked for whenever the device
+offers it (Vulkan 1.2, or VK_KHR_driver_properties): a guest instance
+created for Vulkan 1.1 (Chrome's Dawn) must get the same answer as a 1.3
+one (Firefox). MoltenVK reports the instance's version as the device's, so
+a version check alone skipped Dawn.
+
+Upstream: MoltenVK/SPIRV-Cross bug, fixed upstream in SPIRV-Cross; this
+workaround is OmacVM-only (not for virglrenderer upstream).
+Test: Firefox WebGPU compute with var<workgroup> (scratch wgtest.js wgmem,
+matmul.js) runs; before, Firefox died at the first dispatch. Chrome
+(Dawn, Vulkan 1.1 instance) runs the same matmul; when this check used
+the instance's version, Dawn still saw the feature and lost its context.
+
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -704,6 +704,38 @@
+ 
+    vn_replace_vkGetPhysicalDeviceFeatures2_args_handle(args);
+    vk->GetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
++
++   /* MoltenVK 1.4.2's SPIRV-Cross turns zero-initialized workgroup variables
++    * into a loop over gl_WorkGroupSize without declaring it when the shader
++    * sets its size with LocalSize: such compute pipelines fail to compile
++    * (WebGPU in Firefox and Chrome zero-initializes all workgroup memory).
++    * Without the feature, apps zero the memory themselves. MoltenVK reports
++    * the instance's version as the device's (1.1 for Chrome's Dawn), so look
++    * for the extension too.
++    */
++   bool has_driver_props = physical_dev->api_version >= VK_API_VERSION_1_2;
++   for (uint32_t i = 0; !has_driver_props && i < physical_dev->extension_count; i++)
++      has_driver_props = !strcmp(physical_dev->extensions[i].extensionName,
++                                 VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
++   if (!has_driver_props)
++      return;
++   VkPhysicalDeviceDriverProperties driver_props = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
++   };
++   VkPhysicalDeviceProperties2 props2 = {
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++      .pNext = &driver_props,
++   };
++   vk->GetPhysicalDeviceProperties2(args->physicalDevice, &props2);
++   if (driver_props.driverID != VK_DRIVER_ID_MOLTENVK)
++      return;
++   for (VkBaseOutStructure *s = (VkBaseOutStructure *)args->pFeatures; s; s = s->pNext) {
++      if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
++         ((VkPhysicalDeviceVulkan13Features *)s)->shaderZeroInitializeWorkgroupMemory = VK_FALSE;
++      else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES)
++         ((VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures *)s)
++            ->shaderZeroInitializeWorkgroupMemory = VK_FALSE;
++   }
+ }
+ 
+ static void

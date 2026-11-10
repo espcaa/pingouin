@@ -1,0 +1,121 @@
+From: OmacVM
+Subject: [PATCH] cocoa: full screen beside the notch
+
+With PINGOUIN_NOTCH=1, full screen on a display with a notch is a borderless
+window over the whole display (menu bar and Dock hidden), the strip beside
+the notch included; the guest puts its bar there. Other displays get
+macOS's own full screen. Applies after pingouin-cocoa-quit-powerdown.patch.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -787,9 +787,19 @@
+     return fixed;
+ }
+ 
++/* Pingouin: with PINGOUIN_NOTCH=1, full screen covers the strip beside the notch too. */
++static bool pingouin_notch_mode(void)
++{
++    const char *v = getenv("PINGOUIN_NOTCH");
++    return v && !strcmp(v, "1");
++}
++
+ - (NSSize) screenSafeAreaSize
+ {
+     NSSize size = [[[self window] screen] frame].size;
++    if (pingouin_notch_mode()) {
++        return size;
++    }
+     NSEdgeInsets insets = [[[self window] screen] safeAreaInsets];
+     size.width -= insets.left + insets.right;
+     size.height -= insets.top + insets.bottom;
+@@ -1673,7 +1683,55 @@
+ - (void)openDocumentation:(NSString *)filename;
+ - (IBAction) do_about_menu_item: (id) sender;
+ - (void)adjustSpeed:(id)sender;
++@end
++
++/*
++ * Pingouin notch mode: macOS full screen keeps windows below the notch. Instead,
++ * on a display with a notch a borderless window covers the whole display, the
++ * menu bar and the Dock hidden; Omarchy's bar sits in the strip beside the
++ * camera. Other displays get macOS's own full screen.
++ */
++@interface QemuWindow : NSWindow
+ @end
++
++@implementation QemuWindow
++- (BOOL)canBecomeKeyWindow { return YES; }
++- (BOOL)canBecomeMainWindow { return YES; }
++@end
++
++static BOOL notchFull;
++static NSRect notchSavedFrame;
++static NSWindowStyleMask notchSavedMask;
++
++/* Enters notch full screen on the window's display, or leaves it. */
++static void pingouin_toggle_notch_full_screen(void)
++{
++    NSWindow *w = [cocoaView window];
++    NSScreen *target = [w screen] ? [w screen] : [NSScreen mainScreen];
++    if (!notchFull) {
++        notchFull = YES;
++        notchSavedFrame = [w frame];
++        notchSavedMask = [w styleMask];
++        [w setStyleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskResizable];
++        [NSApp setPresentationOptions:NSApplicationPresentationHideDock |
++                                      NSApplicationPresentationHideMenuBar];
++        [w setFrame:[target frame] display:YES];
++        [w makeKeyAndOrderFront:nil];
++        [fullScreenMenuItem setTitle:@"Exit Full Screen"];
++        [cocoaView updateScale];
++        [cocoaView updateUIInfo];
++        [cocoaView grabMouse];
++    } else {
++        notchFull = NO;
++        [NSApp setPresentationOptions:NSApplicationPresentationDefault];
++        [w setStyleMask:notchSavedMask];
++        [w setFrame:notchSavedFrame display:YES];
++        [fullScreenMenuItem setTitle:@"Enter Full Screen"];
++        [cocoaView updateScale];
++        [cocoaView updateUIInfo];
++        [cocoaView ungrabMouse];
++    }
++}
+ 
+ static NSRect cocoa_initial_window_frame(void)
+ {
+@@ -1719,7 +1777,7 @@
+         }
+ 
+         // create a window
+-        window = [[NSWindow alloc] initWithContentRect:frame
++        window = [[QemuWindow alloc] initWithContentRect:frame
+             styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskClosable
+             backing:NSBackingStoreBuffered defer:NO];
+         if(!window) {
+@@ -1901,7 +1959,15 @@
+  */
+ - (void) doToggleFullScreen:(id)sender
+ {
+-    [[cocoaView window] toggleFullScreen:sender];
++    NSWindow *w = [cocoaView window];
++    /* Notch full screen only on a display with a notch; elsewhere macOS's own. */
++    if (notchFull ||
++        (pingouin_notch_mode() && !([w styleMask] & NSWindowStyleMaskFullScreen) &&
++         [[w screen] safeAreaInsets].top > 0)) {
++        pingouin_toggle_notch_full_screen();
++        return;
++    }
++    [w toggleFullScreen:sender];
+ }
+ 
+ - (void) setFullGrab:(id)sender
+@@ -2967,7 +3033,7 @@
+ 
+     /* if fullscreen mode is to be used */
+     if (opts->has_full_screen && opts->full_screen) {
+-        [[cocoaView window] toggleFullScreen: nil];
++        [controller doToggleFullScreen:nil];
+     }
+     if (full_grab_enabled) {
+         [controller setFullGrab: nil];

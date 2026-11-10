@@ -1,0 +1,26 @@
+From: OmacVM
+Subject: [PATCH] vrend: only drop the waited fence of the context destroyed
+
+When a context is destroyed while the sync thread waits on a fence,
+vrend_free_fences_for_context cleared fence_waiting->ctx without checking
+that the fence belongs to that context. A fence of another context (or a
+ctx0 fence, which every virgl GL guest uses) then never reported its
+retire. The guest only got it with the next fence, or never if nothing
+else was submitted.
+
+Upstream: yes, a plain bug in virglrenderer (any platform with
+VIRGL_RENDERER_THREAD_SYNC). Not sent.
+Test: glmark2 loops of short runs (a GL context created and destroyed
+every few seconds) in an app VM with async fences.
+
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -7362,7 +7362,7 @@
+          if (fence->ctx == ctx)
+             free_fence_locked(fence);
+       }
+-      if (vrend_state.fence_waiting) {
++      if (vrend_state.fence_waiting && vrend_state.fence_waiting->ctx == ctx) {
+          /* mark the fence invalid as the sync thread is still waiting on it */
+          vrend_state.fence_waiting->ctx = NULL;
+       }

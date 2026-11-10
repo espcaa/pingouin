@@ -1,0 +1,105 @@
+From: OmacVM
+Subject: [PATCH] ui: the guest's size for every scale in FullPanel, tested without AppKit
+
+What: a header with no AppKit in it: which scale the guest asked for
+(1 to 4 in Hyprland's 1/120 steps, anything else is none), the step a size
+must be a multiple of for that scale to fit, the guest's size for a panel
+at that scale (each side rounded up to the next size that fits, at most 8
+pixels more, else the panel's own), and whether a scale fits a size. Used
+by pingouin-cocoa-fullpanel-scale.patch (which explains the why).
+
+Why its own file: so the sizes are tested on every notched MacBook's panel
+and every one of Omarchy's presets without QEMU or a display
+(app/runtime/Tests/display/test-fullpanel-scale.sh applies this patch to an
+empty folder; at build time and in CI).
+
+Upstream: not applicable (OmacVM's FullPanel).
+Test: app/runtime/Tests/display/test-fullpanel-scale.c.
+
+diff --git a/ui/pingouin-fullpanel-scale.h b/ui/pingouin-fullpanel-scale.h
+new file mode 100644
+--- /dev/null
++++ b/ui/pingouin-fullpanel-scale.h
+@@ -0,0 +1,82 @@
++/*
++ * Pingouin: every one of Omarchy's scales in Full screen including notch
++ * (FullPanel, #355), without black bars.
++ *
++ * No AppKit in here, so it is tested on its own
++ * (app/runtime/Tests/display/test-fullpanel-scale.c); ui/cocoa.m feeds it.
++ *
++ * Hyprland takes a scale s = k/120 only when the output's width and height
++ * both divide into whole logical pixels by it. A MacBook's whole panel fits
++ * few of Omarchy's presets (the 13-inch Air's 2940x1912: 1, 1.33, 2, 4; its
++ * 1.25 and 1.6 became 1.33 and 2). FullPanel gives the guest the panel's
++ * size rounded up to the next size that fits the scale the guest wants (a
++ * few pixels more: at most 7 each way for Omarchy's presets), and QEMU shows
++ * it scaled onto the panel, filling it. The guest says which scale it wants
++ * (the display agent's {"scale": s}); QEMU keeps it in the VM's folder, so
++ * the next start offers that size from the first frame.
++ */
++#ifndef PINGOUIN_FULLPANEL_SCALE_H
++#define PINGOUIN_FULLPANEL_SCALE_H
++
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++/* Scales the guest may ask for: 1 to 4, in Hyprland's 1/120 steps. */
++#define PINGOUIN_FP_SCALE_MIN 120
++#define PINGOUIN_FP_SCALE_MAX 480
++/* At most this many pixels more each way (Omarchy's presets need up to 7). */
++#define PINGOUIN_FP_SCALE_GROW_MAX 8
++
++static inline uint32_t pingouin_fp_scale_gcd(uint32_t a, uint32_t b)
++{
++    while (b) {
++        uint32_t t = a % b;
++        a = b;
++        b = t;
++    }
++    return a;
++}
++
++/* A scale from the guest (a number) in 1/120, or 0 when it is none of 1-4. */
++static inline uint32_t pingouin_fp_scale_k(double s)
++{
++    if (!isfinite(s) || s < 0.99 || s > 4.01) {
++        return 0;
++    }
++    long k = lround(s * 120);
++    return k >= PINGOUIN_FP_SCALE_MIN && k <= PINGOUIN_FP_SCALE_MAX ? (uint32_t)k : 0;
++}
++
++/* The step a size must be a multiple of for scale k/120 to fit it. */
++static inline uint32_t pingouin_fp_scale_step(uint32_t k)
++{
++    return k ? k / pingouin_fp_scale_gcd(k, 120) : 1;
++}
++
++/*
++ * The guest's size for a w x h panel at scale k/120: each side rounded up
++ * to the next multiple that fits. k = 0, or a scale whose sizes are more
++ * than PINGOUIN_FP_SCALE_GROW_MAX apart: the panel's own size.
++ */
++static inline void pingouin_fp_scale_size(uint32_t w, uint32_t h, uint32_t k,
++                                        uint32_t *gw, uint32_t *gh)
++{
++    uint32_t step = pingouin_fp_scale_step(k);
++
++    *gw = w;
++    *gh = h;
++    if (!k || step > PINGOUIN_FP_SCALE_GROW_MAX) {
++        return;
++    }
++    *gw = (w + step - 1) / step * step;
++    *gh = (h + step - 1) / step * step;
++}
++
++/* Whether scale k/120 fits a w x h output (Hyprland takes it as it is). */
++static inline bool pingouin_fp_scale_fits(uint32_t w, uint32_t h, uint32_t k)
++{
++    return k && (w * 120) % k == 0 && (h * 120) % k == 0;
++}
++
++#endif

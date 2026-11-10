@@ -1,0 +1,110 @@
+From: OmacVM
+Subject: [PATCH] util: eventfd for macOS
+
+macOS has no eventfd, so virglrenderer dropped VIRGL_RENDERER_THREAD_SYNC
+there and fences could only be polled. An unlinked FIFO opened read-write
+does the job: one fd that can be written and read, also through dups and
+fds passed over the render server's socket (Venus contexts write their
+fence fd from the server's side). One byte per signal; flush reads it
+empty.
+
+Upstream: could go upstream as the non-Linux fallback.
+Test: glmark2 in an app VM (fences reported by the sync thread, 4000 vs
+1250 with polling); Venus fence retirement with vkmark (gpu-venus).
+
+diff --git a/src/virgl_util.c b/src/virgl_util.c
+index f11bf3f..6e100de 100644
+--- a/src/virgl_util.c
++++ b/src/virgl_util.c
+@@ -33,6 +33,12 @@
+ #include <sys/eventfd.h>
+ #endif
+ #include <unistd.h>
++#if !defined(HAVE_EVENTFD_H) && defined(__APPLE__)
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/stat.h>
++#endif
+ 
+ #include "util/os_misc.h"
+ #include "util/u_pointer.h"
+@@ -88,7 +94,7 @@ bool equal_func(const void *key1, const void *key2)
+ 
+ bool has_eventfd(void)
+ {
+-#ifdef HAVE_EVENTFD_H
++#if defined(HAVE_EVENTFD_H) || defined(__APPLE__)
+    return true;
+ #else
+    return false;
+@@ -99,6 +105,28 @@ int create_eventfd(unsigned int initval)
+ {
+ #ifdef HAVE_EVENTFD_H
+    return eventfd(initval, EFD_CLOEXEC | EFD_NONBLOCK);
++#elif defined(__APPLE__)
++   /* macOS has no eventfd. A FIFO opened read-write is one fd that can be
++    * written and read, also through dups and fds passed to another thread
++    * or process, like an eventfd. Its name is removed at once. */
++   const char *dir = getenv("TMPDIR");
++   char path[1024];
++   int fd = -1;
++
++   for (int i = 0; i < 100 && fd < 0; i++) {
++      snprintf(path, sizeof(path), "%s/virgl-eventfd-%d-%08x",
++               dir && *dir ? dir : "/tmp", (int)getpid(), (unsigned)arc4random());
++      if (mkfifo(path, 0600)) {
++         if (errno == EEXIST)
++            continue;
++         return -1;
++      }
++      fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++      unlink(path);
++   }
++   if (fd >= 0 && initval)
++      write_eventfd(fd, initval);
++   return fd;
+ #else
+    (void)initval;
+    return -1;
+@@ -107,6 +135,16 @@ int create_eventfd(unsigned int initval)
+ 
+ int write_eventfd(int fd, uint64_t val)
+ {
++#if !defined(HAVE_EVENTFD_H) && defined(__APPLE__)
++   /* One byte signals; a full FIFO is still a signalled one. */
++   const char one = 1;
++   ssize_t r;
++   (void)val;
++   do {
++      r = write(fd, &one, 1);
++   } while (r < 0 && errno == EINTR);
++   return (r == 1 || (r < 0 && errno == EAGAIN)) ? 0 : -1;
++#else
+    const char *buf = (const char *)&val;
+    size_t count = sizeof(val);
+    ssize_t ret = 0;
+@@ -123,15 +161,23 @@ int write_eventfd(int fd, uint64_t val)
+    }
+ 
+    return count ? -1 : 0;
++#endif
+ }
+ 
+ void flush_eventfd(int fd)
+ {
+     ssize_t len;
+     uint64_t value;
++#if !defined(HAVE_EVENTFD_H) && defined(__APPLE__)
++    /* The FIFO holds one byte per signal: read until it is empty. */
++    do {
++       len = read(fd, &value, sizeof(value));
++    } while ((len == -1 && errno == EINTR) || len > 0);
++#else
+     do {
+        len = read(fd, &value, sizeof(value));
+     } while ((len == -1 && errno == EINTR) || len == sizeof(value));
++#endif
+ }
+ 
+ const struct log_levels_lut {

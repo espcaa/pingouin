@@ -1,0 +1,122 @@
+From: OmacVM
+Subject: [PATCH] cocoa: no frames drawn for a window that cannot be seen
+
+What: no guest frame is copied into the window's surfaces while the window
+cannot be seen (hidden, minimised, wholly covered, on a Space not shown:
+macOS's occlusion state): cocoa_gl_present returns at once and keeps the
+frame dirty. When the window shows again its newest frame is drawn at once
+(present_bh), not at the guest's next flush. qemu.log counts the frames not
+drawn when the window was away 2 s or more. PINGOUIN_PRESENT_HIDDEN=1 draws
+every frame, as before (a capture of a covered window).
+
+Why: out of sight, each guest frame still cost a GPU copy that nobody saw:
+a VM kept running with its window closed (#358), minimised, or full screen
+on another Space.
+
+Upstream: not sent (OmacVM's IOSurface present path).
+Test: app/runtime/Tests/display/test-present-unseen.sh (the wiring in the
+patched ui/cocoa.m at build time). Applies after pingouin-cocoa-close.patch.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -156,6 +156,17 @@
+  * the BQL held.
+  */
+ static bool cocoa_display_closed;
++
++/*
++ * Pingouin: a frame is drawn for the window only while some of it can be seen
++ * (pingouin-cocoa-present-unseen.patch). Written on the main thread (the
++ * window's occlusion), read on QEMU's.
++ */
++static bool pingouin_window_seen = true;
++static unsigned pingouin_frames_unseen;   /* QEMU's thread, BQL */
++#ifdef CONFIG_OPENGL
++static void pingouin_present_seen_again(void);
++#endif
+ 
+ static NSInteger cbchangecount = -1;
+ static QemuClipboardInfo *cbinfo;
+@@ -4134,6 +4145,10 @@
+         }
+         [window center];
+         [window setDelegate: self];
++        [[NSNotificationCenter defaultCenter] addObserver:self
++                                                 selector:@selector(pingouinWindowSeen:)
++                                                     name:NSWindowDidChangeOcclusionStateNotification
++                                                   object:window];
+ 
+         /* Used for displaying pause on the screen */
+         pauseLabel = [NSTextField new];
+@@ -4276,6 +4291,33 @@
+     return NO;
+ }
+ 
++/* Main thread: the window came into sight or went out of it. */
++- (void)pingouinWindowSeen:(NSNotification *)note
++{
++    static double since;
++    NSWindow *w = [note object];
++    bool seen = ([w occlusionState] & NSWindowOcclusionStateVisible) != 0;
++    if (seen == qatomic_read(&pingouin_window_seen)) {
++        return;
++    }
++    qatomic_set(&pingouin_window_seen, seen);
++    if (!seen) {
++        since = CACurrentMediaTime();
++        return;
++    }
++    double away = CACurrentMediaTime() - since;
++#ifdef CONFIG_OPENGL
++    pingouin_present_seen_again();
++#endif
++    with_bql(^{
++        if (away >= 2 && pingouin_frames_unseen) {
++            fprintf(stderr, "pingouin: present: the window was out of sight for %.0f s: %u frames not drawn\n",
++                    away, pingouin_frames_unseen);
++        }
++        pingouin_frames_unseen = 0;
++    });
++}
++
+ /*
+  * Pingouin: Quit, the close button, a logout or a restart press the guest's
+  * power button, and the quit waits (NSTerminateLater): QEMU exits by itself
+@@ -6819,6 +6861,14 @@
+ static bool present_fixed;              /* PINGOUIN_GL_REFRESH=fixed */
+ static bool present_input_first;        /* PINGOUIN_GL_INPUT_FIRST=1 */
+ static QEMUBH *present_bh;
++
++/* Main thread: the window is in sight again: its newest frame now, not at the guest's next flush. */
++static void pingouin_present_seen_again(void)
++{
++    if (present_bh) {
++        qemu_bh_schedule(present_bh);
++    }
++}
+ static CADisplayLink *present_link;     /* created on the main thread */
+ static QemuPresentLink *present_link_target;
+ 
+@@ -7086,7 +7136,22 @@
+     uint32_t w, h;
+     GLint filter = qatomic_read(&zoom_interpolation) ? GL_LINEAR : GL_NEAREST;
+     bool splash = false;
++    static int always = -1;
+ 
++    /*
++     * Pingouin: out of sight (hidden, minimised, covered, another Space) no
++     * frame is copied for the window; the newest one is drawn as it shows
++     * again (pingouinWindowSeen: schedules present_bh).
++     */
++    if (always < 0) {
++        always = getenv("PINGOUIN_PRESENT_HIDDEN") != NULL;
++    }
++    if (!qatomic_read(&pingouin_window_seen) && !always) {
++        gl_dirty = true;
++        pingouin_frames_unseen++;
++        return true;
++    }
++
+     if (gl_scanout_borrow) {
+         DisplayGLTexture texture = gl_scanout_borrow(gl_scanout_id);
+         if (!texture.id) {

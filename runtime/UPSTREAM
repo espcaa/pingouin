@@ -1,0 +1,7 @@
+Provenance: derived from omacvm's app/runtime (https://github.com/gillesgoetsch/omacvm,
+MIT), commit 7f0ac829 (2026-11-09), which builds on Try Omarchy (MIT). See
+../THIRD_PARTY_NOTICES.md.
+
+These files are Pingouin's now: renamed, trimmed and changed. There is no automatic
+sync. To take a fix from a newer omacvm, port the patch by hand, rename it the same
+way, add it to patches.list and check it with ./build.sh.

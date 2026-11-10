@@ -1,0 +1,322 @@
+From: OmacVM
+Subject: [PATCH] ui: display changes settle before the VM's windows follow, tested without AppKit
+
+What: a header with no AppKit in it: the update timer (one update at a
+time, a burst of changes coalesced, one more after an update that caused a
+change, none while locked or asleep), which displays count (active, awake,
+at least 100 x 100 points; one that comes back after 2 s), and the
+full-screen tries per display (4, a pause doubling from 1 s between them,
+a full screen that held 10 s starts over). Used by
+pingouin-cocoa-display-settle.patch (which explains the why).
+
+Why its own file: so the rules are tested without QEMU or a window
+(app/runtime/Tests/display/test-display-settle.sh applies this patch to an
+empty folder; at build time and in CI).
+
+Upstream: upstreamable together with pingouin-cocoa-display-settle.patch.
+Test: app/runtime/Tests/display/test-display-settle.c.
+
+diff --git a/ui/pingouin-display-settle.h b/ui/pingouin-display-settle.h
+new file mode 100644
+--- /dev/null
++++ b/ui/pingouin-display-settle.h
+@@ -0,0 +1,299 @@
++/*
++ * Pingouin: the VM's windows follow the Mac's displays once they settle (#428).
++ *
++ * No AppKit in here, so it is tested on its own
++ * (app/runtime/Tests/display/test-display-settle.c); ui/cocoa.m feeds it.
++ *
++ * macOS reports a display change in steps: a display that is unplugged, or
++ * that wakes from sleep, can show up for a few seconds as inactive at 1 x 1,
++ * and the main window's full-screen Space moves while the displays settle.
++ * Following every step put another window in full screen, each in a new
++ * Space (#428: 33 to 89 Spaces in half a minute, until the VM quit). So:
++ *
++ * - One update at a time, from a timer. A change asks for one; changes in a
++ *   burst move it on (PINGOUIN_DS_SETTLE_S after the last one, at most
++ *   PINGOUIN_DS_MAX_WAIT_S after the first); a change during an update asks
++ *   for one more after it, never one inside it.
++ * - While the screen is locked or the displays sleep, no update runs; one
++ *   comes PINGOUIN_DS_UNLOCK_S after unlock or wake.
++ * - A display counts while it is active, awake and at least
++ *   PINGOUIN_DS_MIN_POINTS wide and high. One that comes (back) gets a window
++ *   once it has counted for PINGOUIN_DS_STABLE_S.
++ * - Full screen for a display's window: at most PINGOUIN_DS_TRIES tries per
++ *   display, also when its window is made again, with a pause between tries
++ *   (PINGOUIN_DS_BACKOFF_S, doubling). A full screen that held for
++ *   PINGOUIN_DS_HOLD_S starts the count over.
++ *
++ * Times are seconds on a clock that only goes forward.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef PINGOUIN_DISPLAY_SETTLE_H
++#define PINGOUIN_DISPLAY_SETTLE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++
++#define PINGOUIN_DS_SETTLE_S   0.5
++#define PINGOUIN_DS_MAX_WAIT_S 3.0
++#define PINGOUIN_DS_UNLOCK_S   1.0
++#define PINGOUIN_DS_MIN_POINTS 100.0
++#define PINGOUIN_DS_STABLE_S   2.0
++#define PINGOUIN_DS_TRIES      4
++#define PINGOUIN_DS_BACKOFF_S  1.0
++#define PINGOUIN_DS_HOLD_S     10.0
++#define PINGOUIN_DS_MAX        16
++
++/* The update timer. */
++typedef struct PingouinDsTimer {
++    bool armed;      /* a timer runs (one at a time) */
++    double due;      /* the update runs then */
++    double first;    /* the first change it waits for */
++    bool running;    /* an update runs now */
++    bool again;      /* a change came during it */
++    bool locked;     /* screen locked or displays asleep */
++} PingouinDsTimer;
++
++typedef enum {
++    PINGOUIN_DS_RUN,      /* run the update now, then pingouin_ds_done */
++    PINGOUIN_DS_REARM,    /* not yet: a timer for *at */
++    PINGOUIN_DS_SKIP,     /* nothing (locked: the unlock asks again) */
++} PingouinDsFire;
++
++/*
++ * A change wants an update in delay seconds. true: arm a timer for *at
++ * (none runs yet); false: the running timer, the running update or the
++ * unlock takes care of it.
++ */
++static inline bool pingouin_ds_ask(PingouinDsTimer *t, double now, double delay,
++                                 double *at)
++{
++    double due = now + (delay > 0 ? delay : 0);
++
++    if (t->locked) {
++        return false;
++    }
++    if (t->running) {
++        t->again = true;
++        return false;
++    }
++    if (!t->armed) {
++        t->armed = true;
++        t->first = now;
++        t->due = due;
++        *at = due;
++        return true;
++    }
++    if (due > t->due) {
++        t->due = due < t->first + PINGOUIN_DS_MAX_WAIT_S ?
++                 due : t->first + PINGOUIN_DS_MAX_WAIT_S;
++        if (t->due < now) {
++            t->due = now;
++        }
++    }
++    return false;
++}
++
++/* The timer fired. */
++static inline PingouinDsFire pingouin_ds_fire(PingouinDsTimer *t, double now,
++                                          double *at)
++{
++    t->armed = false;
++    if (t->locked || t->running) {
++        return PINGOUIN_DS_SKIP;
++    }
++    if (now + 0.001 < t->due) {
++        t->armed = true;
++        *at = t->due;
++        return PINGOUIN_DS_REARM;
++    }
++    t->running = true;
++    return PINGOUIN_DS_RUN;
++}
++
++/*
++ * The update is done. retry > 0: it wants to look again in retry seconds
++ * (a display not settled yet). true: arm a timer for *at.
++ */
++static inline bool pingouin_ds_done(PingouinDsTimer *t, double now, double retry,
++                                  double *at)
++{
++    double delay = t->again ? PINGOUIN_DS_SETTLE_S : retry;
++
++    t->running = false;
++    t->again = false;
++    if (delay <= 0) {
++        return false;
++    }
++    return pingouin_ds_ask(t, now, delay, at);
++}
++
++/* Locked (or the displays asleep) or not. true: arm a timer for *at. */
++static inline bool pingouin_ds_lock(PingouinDsTimer *t, bool locked, double now,
++                                  double *at)
++{
++    bool was = t->locked;
++
++    t->locked = locked;
++    if (locked || !was) {
++        return false;
++    }
++    return pingouin_ds_ask(t, now, PINGOUIN_DS_UNLOCK_S, at);
++}
++
++/*
++ * A display's key: the same monitor keeps it when it is plugged in again
++ * (macOS can give it a new display id): from its vendor, model and serial
++ * number, or its id when it has none.
++ */
++static inline uint32_t pingouin_ds_key(uint32_t vendor, uint32_t model,
++                                     uint32_t serial, uint32_t id)
++{
++    uint32_t h = 2166136261u, part[3] = { vendor, model, serial };
++
++    if (!vendor && !model && !serial) {
++        return id;
++    }
++    for (int i = 0; i < 3; i++) {
++        for (int b = 0; b < 4; b++) {
++            h ^= (part[i] >> (8 * b)) & 0xff;
++            h *= 16777619u;
++        }
++    }
++    return h ? h : 1;
++}
++
++/* What is known of one Mac display (by its key), also while it has no window. */
++typedef struct PingouinDsDisplay {
++    uint32_t id;          /* its key (pingouin_ds_key); 0: a free entry */
++    double seen;          /* last looked at */
++    bool counting;        /* it counts now ... */
++    double counts_since;  /* ... since then */
++    int tries;            /* full-screen tries since one held */
++    double next_try;      /* no try before then */
++    bool full;            /* its window is in full screen ... */
++    double full_since;    /* ... since then */
++} PingouinDsDisplay;
++
++typedef struct PingouinDsDisplays {
++    PingouinDsDisplay d[PINGOUIN_DS_MAX];
++} PingouinDsDisplays;
++
++/* A display the VM can use: active, awake, a real size (points). */
++static inline bool pingouin_ds_counts(bool active, bool asleep, double w,
++                                    double h)
++{
++    return active && !asleep && w >= PINGOUIN_DS_MIN_POINTS &&
++           h >= PINGOUIN_DS_MIN_POINTS;
++}
++
++/* The entry of display id (made if new; the oldest one makes room). */
++static inline PingouinDsDisplay *pingouin_ds_display(PingouinDsDisplays *all,
++                                                 uint32_t id, double now)
++{
++    PingouinDsDisplay *e = NULL;
++
++    for (int i = 0; i < PINGOUIN_DS_MAX; i++) {
++        if (all->d[i].id == id) {
++            all->d[i].seen = now;
++            return &all->d[i];
++        }
++    }
++    for (int i = 0; i < PINGOUIN_DS_MAX; i++) {
++        PingouinDsDisplay *c = &all->d[i];
++        if (!c->id) {
++            e = c;
++            break;
++        }
++        if (!e || c->seen < e->seen) {
++            e = c;
++        }
++    }
++    memset(e, 0, sizeof(*e));
++    e->id = id;
++    e->seen = now;
++    return e;
++}
++
++/*
++ * Each update, for each display: whether it counts now. Returns the seconds
++ * until it may have a window: 0 now, < 0 not (it does not count).
++ */
++static inline double pingouin_ds_look(PingouinDsDisplay *d, bool counts,
++                                    double now)
++{
++    double left;
++
++    if (!counts) {
++        d->counting = false;
++        return -1;
++    }
++    if (!d->counting) {
++        d->counting = true;
++        d->counts_since = now;
++    }
++    left = d->counts_since + PINGOUIN_DS_STABLE_S - now;
++    return left > 0 ? left : 0;
++}
++
++/* Each update, first: a display not listed now (unplugged) does not count. */
++static inline void pingouin_ds_listed(PingouinDsDisplays *all, const uint32_t *ids,
++                                    int n)
++{
++    for (int i = 0; i < PINGOUIN_DS_MAX; i++) {
++        bool listed = false;
++
++        for (int k = 0; k < n && !listed; k++) {
++            listed = all->d[i].id && all->d[i].id == ids[k];
++        }
++        if (!listed) {
++            all->d[i].counting = false;
++        }
++    }
++}
++
++/*
++ * May its window try full screen now? false with *wait > 0: in *wait
++ * seconds; false with *wait < 0: no tries left (it stays as it is).
++ */
++static inline bool pingouin_ds_may_try(const PingouinDsDisplay *d, double now,
++                                     double *wait)
++{
++    if (d->tries >= PINGOUIN_DS_TRIES) {
++        *wait = -1;
++        return false;
++    }
++    if (now < d->next_try) {
++        *wait = d->next_try - now;
++        return false;
++    }
++    *wait = 0;
++    return true;
++}
++
++/* Its window asked macOS for full screen. */
++static inline void pingouin_ds_tried(PingouinDsDisplay *d, double now)
++{
++    d->tries++;
++    d->next_try = now + PINGOUIN_DS_BACKOFF_S * (double)(1 << (d->tries - 1));
++}
++
++/* Its window is in full screen now (full), or not any more / gone (!full). */
++static inline void pingouin_ds_full(PingouinDsDisplay *d, bool full, double now)
++{
++    if (full) {
++        if (!d->full) {
++            d->full = true;
++            d->full_since = now;
++        }
++        return;
++    }
++    if (d->full && now - d->full_since >= PINGOUIN_DS_HOLD_S) {
++        d->tries = 0;
++        d->next_try = 0;
++    }
++    d->full = false;
++}
++
++#endif /* PINGOUIN_DISPLAY_SETTLE_H */

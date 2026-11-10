@@ -1,0 +1,459 @@
+From: OmacVM
+Subject: [PATCH] cocoa: no Dock, menu bar or hot corner from inside full screen
+
+What: the other displays' full-screen windows ask macOS for the same
+presentation as the main window (Dock and menu bar hidden, not auto-hidden),
+and while the VM has the pointer in full screen the Mac's cursor never
+reaches a corner of its display or the Dock's edge: within 200 points of
+them it is detached from the mouse and stays where it is, and the guest's
+pointer moves on by the mouse's motion (each event's delta: macOS's own
+motion after its acceleration, in points). The guest's pointer reaches the
+edges and corners; the Mac's cursor is kept at least 3 points off them.
+Edges shared with another display stay open. The maths is in
+ui/pingouin-pointer-guard.h (pingouin-cocoa-pointer-guard.patch). The cursor
+is given back where the guest's pointer is when it leaves the zone or our
+windows, on leaving full screen, on a Space change, on ungrab and on quit;
+events queued before that still move the pointer by their delta. When the
+Mac's cursor is the only pointer shown (show-cursor=on: VMs whose guest
+hides its own pointer) the detached cursor follows the guest's pointer,
+the gap off the edges, each warp taken out of the next delta (the way GLFW
+does): not detaching there would give back the hot corners and the Dock,
+and a frozen cursor is the only pointer the user sees. The guest gets the
+guard's place in whichever of our windows has it, tested the guard's way
+(the top row counts); in none, no position is sent (never the held
+cursor's place).
+The Dock's side is read again on each full screen. All of it follows the
+immersive option (on by default; immersive=off keeps macOS's behaviour; the
+app's setting "Keep the Dock and hot corners away in full screen").
+
+Why: in the user's 2.8.0/2.9.0 RC test the Dock came up at the edge of the
+external display (its full-screen Space used macOS's default auto-hide), and
+a hot corner set to "put display to sleep" fired from inside the full-screen
+VM. The presentation option alone did not keep the Dock away on the other
+display (tried), and moving the cursor back after it reached a corner did
+not stop the hot corner (tried: the display went to sleep), so the cursor
+must never get there.
+2.8.0 to 2.9.0 RC4 warped the detached cursor along on every event. A warp
+comes back in the next event's delta (SDL and GLFW correct for this on
+macOS), so each delta carried all the earlier ones and the pointer raced
+near corners and the Dock's edge (user, 2026-10-05: "at the corners it 20x
+the acceleration"; the test's model of that code: the 20th step is 19 times
+the motion). Now the detached cursor is not moved (or, when it is the
+pointer shown, moved with one warp in flight) and every warp is taken out
+of the next delta. AppKit can hand one event to a view twice; it counts once.
+RC5 review: at the top edge the window test (NSPointInRect, top edge out)
+missed the guard's place and the guest got the held cursor's place, up to
+200 points off; the shown cursor (show-cursor=on) stood still in the zone;
+events queued before a let-go jumped back to the held place.
+Known limit: a flick that lands on the corner in one event has reached it
+before the guard sees the event.
+
+Upstream: not applicable (OmacVM's display windows; QEMU has one window).
+Test: app/runtime/Tests/display/test-pointer-guard.c (motion in the centre,
+near a corner, along the Dock's edge, across the zone's border and a shared
+display edge, the same event twice, a flick, events queued before a let-go,
+a click on another display's window (let go and hold again, also with
+motion queued behind the release), the shown cursor following, the place in
+our windows incl. the top row, the notch strip and an external; run at
+build time and in CI). PINGOUIN_POINTER_DEBUG=1 logs when the let-go's warp
+is taken out of a motion (qemu.log: "pingouin-pointer: guard: ...").
+By hand: full screen on the MacBook and an external display, mouse and
+trackpad: the pointer moves the same everywhere; pushed into each corner and
+along each edge: no Dock, no menu bar, no hot corner (notes:
+pointer-corners track).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 6b3270a..010a4e6 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -40,6 +40,7 @@
+ #include "ui/cocoa-pinch.h"
+ #include "ui/cocoa-scroll.h"
+ #include "ui/kbd-state.h"
++#include "ui/pingouin-pointer-guard.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+ #include "system/runstate-action.h"
+@@ -466,6 +467,18 @@ static bool pingouin_map_pointer(int output, double u, double v,
+ static int pingouin_active_outputs(void);
+ static bool pingouin_is_our_window(NSWindow *w);
+ static bool pingouin_pointer_over_ours(void);
++static void pingouin_guard_corners(NSEvent *event);
++static int pingouin_guarded_target(NSView **view, int *output, NSPoint *p);
++static PingouinGuard pingouin_guard;         /* the full-screen pointer guard */
++static bool pingouin_guard_place;          /* this event's place is the guard's */
++/* The displays and our windows the guard last saw (main thread). */
++static PingouinGuardScreens pingouin_guard_scr;
++static PingouinRect pingouin_guard_displays[16];
++static PingouinRect pingouin_guard_ours_rects[PINGOUIN_MAX_OUTPUTS];
++static int pingouin_guard_ours_output[PINGOUIN_MAX_OUTPUTS];
++static int pingouin_dock_edge_cache = -1;
++static int pingouin_dock_edge(void);
++static void pingouin_corner_release(void);
+ static bool pingouin_is_head_console(unsigned int index);
+ static bool pingouin_test_mode(void);
+ static void pingouin_displays_update(void);
+@@ -1535,6 +1548,9 @@ static bool pingouin_notch_mode(void)
+     if (!isMouseGrabbed) {
+         return;
+     }
++    if (isAbsoluteEnabled) {
++        pingouin_guard_corners(event);
++    }
+ 
+     with_bql(^{
+         if (isAbsoluteEnabled &&
+@@ -1543,10 +1559,24 @@ static bool pingouin_notch_mode(void)
+         } else if (isAbsoluteEnabled) {
+             CGFloat d = (CGFloat)screen.height / [self frame].size.height;
+             NSPoint p = [event locationInWindow];
++            NSView *gv = self;
++            int go = 0, guarded;
++            NSPoint gp;
++
++            /*
++             * The detached cursor's new place (see pingouin_guard_corners);
++             * never the event's own location then (the held cursor's).
++             */
++            guarded = pingouin_guarded_target(&gv, &go, &gp);
++            if (guarded > 0 && gv == self) {
++                p = [self convertPoint:gp toView:nil];
++            }
+ 
+             /* Note that the origin for Cocoa mouse coords is bottom left, not top left. */
+-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * d, 0, screen.width);
+-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y * d, 0, screen.height);
++            if (!guarded || (guarded > 0 && gv == self)) {
++                qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * d, 0, screen.width);
++                qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y * d, 0, screen.height);
++            }
+         } else {
+             qemu_input_queue_rel(dcl.con, INPUT_AXIS_X, [event deltaX]);
+             qemu_input_queue_rel(dcl.con, INPUT_AXIS_Y, [event deltaY]);
+@@ -1652,6 +1682,7 @@ static bool pingouin_notch_mode(void)
+     else
+         [[self window] setTitle:@"QEMU - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)"];
+     [self hideCursor];
++    pingouin_corner_release();
+     CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
+     isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
+ }
+@@ -1665,6 +1696,7 @@ static bool pingouin_notch_mode(void)
+     else
+         [[self window] setTitle:@"QEMU"];
+     [self unhideCursor];
++    pingouin_corner_release();
+     CGAssociateMouseAndMouseCursorPosition(TRUE);
+     isMouseGrabbed = FALSE;
+     [self raiseAllButtons];
+@@ -1685,6 +1717,7 @@ static bool pingouin_notch_mode(void)
+         if (isAbsoluteEnabled) {
+             [self ungrabMouse];
+         } else {
++            pingouin_corner_release();
+             CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
+         }
+     }
+@@ -1753,9 +1786,19 @@ static bool pingouin_notch_mode(void)
+ - (bool) pingouinQueuePointer:(NSEvent *)event view:(NSView *)view output:(int)output
+ {
+     NSPoint p = [view convertPoint:[event locationInWindow] fromView:nil];
+-    NSSize size = [view bounds].size;
++    NSSize size;
+     double nx, ny;
+ 
++    /*
++     * The cursor detached: this event's location is where it was, not where
++     * the motion took it. Use the new place, in whichever window it is; in
++     * none, the guest's pointer stays (buttons still go).
++     */
++    if (pingouin_guarded_target(&view, &output, &p) < 0) {
++        return true;
++    }
++    size = [view bounds].size;
++
+     if (size.width <= 0 || size.height <= 0 ||
+         !pingouin_map_pointer(output, p.x / size.width, 1.0 - p.y / size.height,
+                             &nx, &ny)) {
+@@ -1783,6 +1826,9 @@ static bool pingouin_notch_mode(void)
+         }
+         [self grabMouse];
+     }
++    if (isAbsoluteEnabled) {
++        pingouin_guard_corners(event);
++    }
+     with_bql(^{
+         if (button >= 0) {
+             qemu_input_queue_btn(dcl.con, button, down);
+@@ -1987,6 +2033,7 @@ static NSRect cocoa_initial_window_frame(void)
+ - (void)applicationWillTerminate:(NSNotification *)aNotification
+ {
+     COCOA_DEBUG("QemuCocoaAppController: applicationWillTerminate\n");
++    pingouin_corner_release();
+ 
+     with_bql(^{
+         shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+@@ -2066,11 +2113,13 @@ static bool powerdownPending;
+ - (void)windowWillExitFullScreen:(NSNotification *)notification
+ {
+     pingouin_main_full_settled = false;
++    pingouin_corner_release();
+ }
+ 
+ - (void)windowDidEnterFullScreen:(NSNotification *)notification
+ {
+     pingouin_main_full_settled = true;
++    pingouin_dock_edge_cache = -1;
+     [fullScreenMenuItem setTitle:@"Exit Full Screen"];
+     [cocoaView updateScale];
+     [cocoaView updateUIInfo];
+@@ -3279,6 +3328,211 @@ static bool pingouin_main_full_screen(void)
+            ([[cocoaView window] styleMask] & NSWindowStyleMaskFullScreen);
+ }
+ 
++/*
++ * While the VM has the pointer in full screen, the Mac's cursor never reaches
++ * a corner of its display (a macOS hot corner: one put the Mac's display to
++ * sleep from inside the VM) nor the Dock's edge (on another display than the
++ * main window's the Dock came up there). Moving the cursor back after it got
++ * there is too late, so within 200 points of a corner or the Dock's edge the
++ * cursor is detached from the mouse and stays where it is, and the guest's
++ * pointer moves on by the mouse's motion: the same motion macOS moves the
++ * cursor by, so it feels the same there. The maths is in
++ * ui/pingouin-pointer-guard.h. Edges shared with another display stay open.
++ * Off with immersive=off; leaving the zone, our windows, full screen, the
++ * Space or the VM gives the cursor back where the pointer is.
++ */
++/*
++ * The guard's place as a point in one of our views: 1. 0: this event has its
++ * own place. -1: the guard has the place but it is in none of our windows;
++ * the caller sends no position (the event's location is the held cursor's,
++ * up to 200 points off). Membership is tested in CoreGraphics' space the way
++ * the guard tests it, so the window's top row (where the guard stops the
++ * pointer) counts.
++ */
++static int pingouin_guarded_target(NSView **view, int *output, NSPoint *p)
++{
++    double wx, wy;
++    int i, o;
++
++    if (!pingouin_guard_place) {
++        return 0;
++    }
++    i = pingouin_guard_window_point(&pingouin_guard_scr, pingouin_guard.x,
++                                  pingouin_guard.y, &wx, &wy);
++    o = i < 0 ? -1 : pingouin_guard_ours_output[i];
++    if (o >= 0 && o < pingouin_outputs) {
++        NSView *v = o ? pingouin_heads[o].view : cocoaView;
++
++        if (v) {
++            *view = v;
++            *output = o;
++            *p = [v convertPoint:NSMakePoint(wx, wy) fromView:nil];
++            return 1;
++        }
++    }
++    return -1;
++}
++
++static void pingouin_guard_apply(const PingouinGuardStep *st)
++{
++    if (st->warp) {
++        CGWarpMouseCursorPosition(CGPointMake(st->wx, st->wy));
++    }
++    if (st->detach) {
++        /* Without this the cursor stalls for a moment after a warp. */
++        CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
++        if (src) {
++            CGEventSourceSetLocalEventsSuppressionInterval(src, 0);
++            CFRelease(src);
++        }
++        CGAssociateMouseAndMouseCursorPosition(false);
++    }
++    if (st->attach) {
++        CGAssociateMouseAndMouseCursorPosition(true);
++    }
++}
++
++/*
++ * The Mac's displays and our visible windows (CoreGraphics' space) into
++ * pingouin_guard_scr, with the output each window shows.
++ */
++static void pingouin_guard_screens(void)
++{
++    PingouinGuardScreens *s = &pingouin_guard_scr;
++    CGDirectDisplayID ids[16];
++    uint32_t n = 0;
++    CGFloat top = NSMaxY([[[NSScreen screens] firstObject] frame]);
++
++    memset(s, 0, sizeof(*s));
++    if (CGGetActiveDisplayList(16, ids, &n) != kCGErrorSuccess) {
++        n = 0;
++    }
++    for (uint32_t i = 0; i < n && s->ndisplays < 16; i++) {
++        CGRect r = CGDisplayBounds(ids[i]);
++        pingouin_guard_displays[s->ndisplays++] =
++            (PingouinRect){ r.origin.x, r.origin.y, r.size.width, r.size.height };
++    }
++    for (int i = 0; i < pingouin_outputs && s->nours < PINGOUIN_MAX_OUTPUTS; i++) {
++        NSWindow *w = i ? pingouin_heads[i].window : [cocoaView window];
++        NSRect f;
++
++        if (!w || ![w isVisible] ||
++            !([w occlusionState] & NSWindowOcclusionStateVisible)) {
++            continue;
++        }
++        f = [w frame];
++        pingouin_guard_ours_output[s->nours] = i;
++        pingouin_guard_ours_rects[s->nours++] =
++            pingouin_guard_rect_from_cocoa(top, f.origin.x, f.origin.y,
++                                         f.size.width, f.size.height);
++    }
++    s->displays = pingouin_guard_displays;
++    s->ours = pingouin_guard_ours_rects;
++    s->dock_edge = pingouin_dock_edge();
++}
++
++static void pingouin_corner_release(void)
++{
++    PingouinGuardStep st;
++
++    pingouin_guard_place = false;
++    if (!pingouin_guard.held) {
++        return;
++    }
++    pingouin_guard_screens();
++    memset(&st, 0, sizeof(st));
++    pingouin_guard_release(&pingouin_guard, &pingouin_guard_scr, &st);
++    pingouin_guard_apply(&st);
++}
++
++/* The edge the Dock sits on (read again on each full screen). */
++static int pingouin_dock_edge(void)
++{
++    if (pingouin_dock_edge_cache < 0) {
++        CFPropertyListRef v = CFPreferencesCopyAppValue(CFSTR("orientation"),
++                                                        CFSTR("com.apple.dock"));
++        pingouin_dock_edge_cache = PINGOUIN_DOCK_BOTTOM;
++        if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
++            if (CFStringCompare((CFStringRef)v, CFSTR("left"), 0) == kCFCompareEqualTo) {
++                pingouin_dock_edge_cache = PINGOUIN_DOCK_LEFT;
++            } else if (CFStringCompare((CFStringRef)v, CFSTR("right"), 0) == kCFCompareEqualTo) {
++                pingouin_dock_edge_cache = PINGOUIN_DOCK_RIGHT;
++            }
++        }
++        if (v) {
++            CFRelease(v);
++        }
++    }
++    return pingouin_dock_edge_cache;
++}
++
++static void pingouin_guard_corners(NSEvent *event)
++{
++    PingouinGuardStep st;
++    PingouinGuardScreens s;
++    CGEventRef cg = [event CGEvent], now;
++    CGPoint loc, cur;
++    double dx = 0, dy = 0;
++    bool on = immersive_mode_enabled && pingouin_main_full_screen();
++
++    pingouin_guard_place = false;
++    if (!on) {
++        pingouin_corner_release();
++        /* Events queued before the let-go still get the pointer's place. */
++        if (!pingouin_guard.let_go) {
++            return;
++        }
++    }
++    switch ([event type]) {
++    case NSEventTypeMouseMoved:
++    case NSEventTypeLeftMouseDragged:
++    case NSEventTypeRightMouseDragged:
++    case NSEventTypeOtherMouseDragged:
++        /* macOS's motion after its acceleration, in points (the cursor's own). */
++        dx = [event deltaX];
++        dy = [event deltaY];
++        break;
++    case NSEventTypeLeftMouseDown:
++    case NSEventTypeLeftMouseUp:
++    case NSEventTypeRightMouseDown:
++    case NSEventTypeRightMouseUp:
++    case NSEventTypeOtherMouseDown:
++    case NSEventTypeOtherMouseUp:
++        break;
++    default:
++        /* Entered and the like: AppKit's, made from a motion the guard saw. */
++        pingouin_guard_place = pingouin_guard.held;
++        return;
++    }
++    now = CGEventCreate(NULL);
++    if (!cg || !now) {
++        if (now) {
++            CFRelease(now);
++        }
++        pingouin_guard_place = pingouin_guard.held;
++        return;
++    }
++    cur = CGEventGetLocation(now);
++    CFRelease(now);
++    loc = CGEventGetLocation(cg);
++    pingouin_guard_screens();
++    s = pingouin_guard_scr;
++    if (!on) {
++        s.nours = 0;    /* never takes hold */
++    }
++    /* The Mac's cursor is the only pointer shown (show-cursor=on): it follows. */
++    pingouin_guard.follow = !cursor_hide;
++    pingouin_guard_event(&pingouin_guard, &s, [event timestamp], loc.x, loc.y,
++                       dx, dy, cur.x, cur.y, &st);
++    pingouin_guard_apply(&st);
++    pingouin_guard_place = st.place;
++    if (st.let_go_out && getenv("PINGOUIN_POINTER_DEBUG") &&
++        !strcmp(getenv("PINGOUIN_POINTER_DEBUG"), "1")) {
++        info_report("pingouin-pointer: guard: let-go warp taken out of a motion "
++                    "(%.1f,%.1f)", st.ldx, st.ldy);
++    }
++}
++
+ /* A display's rectangle in points, top-left origin (CoreGraphics' global space). */
+ static PingouinBox pingouin_display_box(NSScreen *s, bool below_notch)
+ {
+@@ -3694,6 +3948,22 @@ static void pingouin_heads_moved(void)
+     return NO;
+ }
+ 
++/*
++ * The other displays' full-screen Spaces hide the Dock and the menu bar like
++ * the main window's (macOS's default there auto-hides them: the Dock came up
++ * at the bottom edge of an external display).
++ */
++- (NSApplicationPresentationOptions)window:(NSWindow *)window
++      willUseFullScreenPresentationOptions:(NSApplicationPresentationOptions)proposedOptions
++{
++    if (!immersive_mode_enabled) {
++        return proposedOptions;
++    }
++    return (proposedOptions & ~(NSApplicationPresentationAutoHideDock |
++                                NSApplicationPresentationAutoHideMenuBar)) |
++           NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar;
++}
++
+ /*
+  * A click on another display's window makes it key. The keyboard and the
+  * main window's pointer tracking belong to the main window: hand it back.
+@@ -4228,6 +4498,14 @@ static void pingouin_displays_init(void)
+     }
+ #endif
+     pingouin_head_delegate = [[PingouinHeadDelegate alloc] init];
++    /* Another Space: the detached cursor must move there (see pingouin_guard_corners). */
++    [[[NSWorkspace sharedWorkspace] notificationCenter]
++        addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification
++                    object:nil
++                     queue:[NSOperationQueue mainQueue]
++                usingBlock:^(NSNotification *note) {
++        pingouin_corner_release();
++    }];
+     [[NSNotificationCenter defaultCenter]
+         addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                     object:nil

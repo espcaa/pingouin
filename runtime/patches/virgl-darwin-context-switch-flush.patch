@@ -1,0 +1,41 @@
+virglrenderer: flush a GL context before switching away from it (macOS)
+
+What: vrend_sync_make_current(), vrend's switch to another GL context with a
+fence the next context waits for, calls glFlush() after glFenceSync() and
+before the switch. Two callers cross contexts on the Mac, both there and
+back: the re-stride of a Vulkan window without a copy (Hyprland's context ->
+the blitter's -> Hyprland's, virgl-vulkan-windows-iosurface.patch) and the GL
+fallback of vrend_renderer_blit_int (the guest's context -> the blitter's ->
+the guest's).
+Why: a glWaitSync in another context waits only for a fence that was flushed
+(ARB_sync). eglMakeCurrent and glXMakeCurrent flush the context they leave,
+and upstream relies on that; QEMU's Cocoa make_current is a plain
+CGLSetCurrentContext, which does not, and Apple's glWaitSync on an unflushed
+fence does not wait. So the next context's draw ran before the other
+context's commands were even sent. Hyprland showed a Vulkan window with that
+buffer's previous frame in the first composite after every new frame (Zed's
+caret one character back for a frame, #499), a continuous FIFO window was one
+swapchain cycle late, and a mailbox window tore. With this patch the ordering
+note in vrend_resource_heap_refresh (virgl-vulkan-windows-iosurface.patch)
+holds.
+Upstream: could go upstream (on EGL and GLX the extra flush finds nothing to
+send).
+Test: Tests/virgl/test-vulkan-window-handover.c (build time, on the GPU: the
+real vrend_blitter_restride and vrend_sync_make_current with shared CGL
+contexts, blitter -> guest and guest -> blitter; both fail without this
+patch); VM rows in the track notes vk-flicker.md.
+
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -2969,6 +2969,11 @@
+ 
+ void vrend_sync_make_current(virgl_gl_context gl_cxt) {
+    GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++   /* The other context's glWaitSync only waits for a fence that was flushed
++    * (ARB_sync). eglMakeCurrent and glXMakeCurrent flush the context they
++    * leave; macOS's CGLSetCurrentContext does not, so the other context ran
++    * before this one's commands were even sent. */
++   glFlush();
+    vrend_clicbs->make_current(gl_cxt);
+    glWaitSync(sync, 0, GL_TIMEOUT_IGNORED);
+    glDeleteSync(sync);

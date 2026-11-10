@@ -1,0 +1,353 @@
+From: OmacVM
+Subject: [PATCH] ui: one pointer between the VM and Omanotch's strip in full screen
+
+What: when the pointer leaves a view of the VM up into Omanotch's strip
+(macOS full screen below a notch, absolute pointer, VM has it), QEMU sends
+one last tablet position: the top row of the guest's hidden NOTCH output,
+behind the camera (ui/pingouin-notch-park.h). The main view and the views of
+the other outputs (with an external display holding the main window, the
+MacBook's display is one of those). The guest's layout message now also
+keeps NOTCH's box. The next motion over the VM brings the guest's pointer
+back, as before. At that edge the Mac's cursor now changes with the guest's
+frame: hidden (up) or shown (back) until a guest frame drawn after the move
+is on the main window's layer, at most 80 ms (PINGOUIN_PARK_HOLD=0: at once,
+as before).
+
+Why: since full screen moved to its own Space (3.0.x), the strip is
+another app's window above ours. QEMU shows the Mac's arrow at once when
+the pointer leaves, but the guest's arrow stayed on the VM's top rows until
+notchcast hid it with Hyprland's cursor:invisible, which Hyprland applies
+only on a periodic tick (85-540 ms measured on the MacBook Air): two arrows
+on the way up, and on the way back no arrow until it was shown again.
+With the guest's pointer out of sight in NOTCH, the guest never has to hide
+it (notchcast reads omacvm.notchpointer=1, sent by OmacVM.app). Measured
+on the Air, 20 crossings each way (frames with a missing / an extra
+cursor): slow moves 255/98 -> 14/0, fast moves 37/251 -> 4/63 (single
+frames of render latency), tracks/notch-cursor-flicker.md.
+
+Upstream: not applicable (OmacVM's notch strip).
+Test: app/runtime/Tests/display/test-notch-park.c (the logic);
+src/tests/notch-cursor-flicker/ (recording on a notched Mac, manual).--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -47,6 +47,7 @@
+ #include "ui/pingouin-gpu-memory.h"
+ #include "ui/pingouin-desktop-restart.h"
+ #include "ui/pingouin-clean-size.h"
++#include "ui/pingouin-notch-park.h"
+ #include "hw/core/boards.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+@@ -505,6 +506,7 @@
+ - (void) pingouinHeadEvent:(NSEvent *)event view:(NSView *)view output:(int)output
+                   button:(int)button down:(bool)down;
+ - (void) pingouinUngrabAfterDrag;
++- (void) pingouinParkInNotch:(NSEvent *)event view:(NSView *)view output:(int)output;
+ - (void) pingouinGuestAtTop:(bool)top;
+ @end
+ 
+@@ -970,6 +972,12 @@
+ typedef struct PingouinBox { double x, y, w, h; } PingouinBox;
+ static bool pingouin_map_pointer(int output, double u, double v,
+                                double *nx, double *ny);
++static bool pingouin_notch_park_target(int output, double *nx, double *ny);
++static void pingouin_park_hold_start(bool up);
++static int pingouin_park_hold_now(void);
++static void pingouin_park_frame_shown(double flushed);
++static bool pingouin_parked;              /* the guest's pointer waits in NOTCH */
++static int pingouin_park_hold_on;         /* any thread: a hold waits for a frame */
+ static int pingouin_active_outputs(void);
+ static bool pingouin_is_our_window(NSWindow *w);
+ static bool pingouin_pointer_over_ours(void);
+@@ -1273,7 +1281,13 @@
+     bool hw = isMouseGrabbed && pingouin_hwc_active(&pingouin_hwc, isAbsoluteEnabled);
+     bool hide = !hw && pingouin_pointer_hide_mac(&pingouin_ptr, cursor_hide, isMouseGrabbed,
+                                                isAbsoluteEnabled);
++    int hold = pingouin_park_hold_now();
+ 
++    /* At the strip's edge: as the guest's frame says (pingouin_park_hold_start). */
++    if (hold) {
++        hide = hold < 0;
++    }
++
+     pingouin_hwc_apply(hw);
+     if (hide == pingouin_mac_cursor_hidden) {
+         return;
+@@ -2508,6 +2522,7 @@
+ - (void) mouseExited:(NSEvent *)event
+ {
+     pingouin_pointer_left(&pingouin_ptr);
++    [self pingouinParkInNotch:event view:self output:0];
+     /*
+      * OmacVM: with several outputs the pointer may just be on the next one,
+      * or crossing the strip between them in the middle of a drag (the
+@@ -2517,7 +2532,51 @@
+         (pingouin_active_outputs() < 2 ||
+          (!pingouin_pointer_over_ours() && ![NSEvent pressedMouseButtons]))) {
+         [self ungrabMouse];
++    }
++}
++
++/*
++ * OmacVM: up into Omanotch's strip in full screen below a notch, the guest's
++ * pointer goes into its hidden NOTCH output in the same moment (one cursor:
++ * the Mac's shows on the strip at once; ui/pingouin-notch-park.h says why).
++ * The next motion over the VM brings it back. The main view and the views
++ * of the other outputs (the MacBook's display can be one of those when an
++ * external display has the main window).
++ */
++- (void) pingouinParkInNotch:(NSEvent *)event view:(NSView *)view output:(int)output
++{
++    NSPoint p = [view convertPoint:[event locationInWindow] fromView:nil];
++    NSSize size = [view bounds].size;
++    NSWindow *w = [view window];
++    PingouinParkIn in = {
++        .absolute = isAbsoluteEnabled,
++        .grabbed = isMouseGrabbed,
++        .full_screen = w && ([w styleMask] & NSWindowStyleMaskFullScreen),
++        .notch_inset = w ? [[w screen] safeAreaInsets].top : 0,
++        .exit_y = p.y,
++        .view_h = size.height,
++    };
++    double nx, ny;
++
++    if (!pingouin_park_wanted(&in) || !pingouin_notch_park_target(output, &nx, &ny)) {
++        return;
++    }
++    with_bql(^{
++        qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, lround(nx * INPUT_EVENT_ABS_MAX),
++                             0, INPUT_EVENT_ABS_MAX);
++        qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, lround(ny * INPUT_EVENT_ABS_MAX),
++                             0, INPUT_EVENT_ABS_MAX);
++        qemu_input_event_sync();
++    });
++    /* the main window's frames are the ones QEMU watches (the hold below) */
++    pingouin_parked = output == 0;
++    if (pingouin_parked && pingouin_mac_cursor_hidden) {
++        pingouin_park_hold_start(true);
+     }
++    if (pingouin_pointer_debug) {
++        fprintf(stderr, "pingouin-pointer: up into the strip (output %d): guest pointer to NOTCH (%.4f, %.4f)\n",
++                output, nx, ny);
++    }
+ }
+ 
+ /* OmacVM: a drag that ended outside every window of ours lets go of the pointer. */
+@@ -2532,6 +2591,10 @@
+ - (void) mouseEntered:(NSEvent *)event
+ {
+     if (isAbsoluteEnabled && !isMouseGrabbed) {
++        /* back from the strip: the Mac's cursor until the guest's shows */
++        if (pingouin_parked) {
++            pingouin_park_hold_start(false);
++        }
+         [self grabMouse];
+     }
+ }
+@@ -6024,6 +6087,7 @@
+             pingouin_present_gravity(layer, surf);
+             [layer setContents:(id)surf];
+             [CATransaction commit];
++            pingouin_park_frame_shown(flushed);
+             IOSurfaceDecrementUseCount(surf);
+             CFRelease(surf);
+         });
+@@ -6115,7 +6179,7 @@
+ }
+ 
+ /* Any thread: put a finished frame on the layer. */
+-static void cocoa_gl_present_show(IOSurfaceRef surf, GLint filter)
++static void cocoa_gl_present_show(IOSurfaceRef surf, GLint filter, double flushed)
+ {
+     CALayer *layer = [cocoaView layer];
+     NSString *f = filter == GL_LINEAR ? kCAFilterLinear : kCAFilterNearest;
+@@ -6128,6 +6192,11 @@
+     pingouin_present_gravity(layer, surf);
+     [layer setContents:(id)surf];
+     [CATransaction commit];
++    if (qatomic_read(&pingouin_park_hold_on)) {
++        dispatch_async(dispatch_get_main_queue(), ^{
++            pingouin_park_frame_shown(flushed);
++        });
++    }
+ }
+ 
+ /* Main thread: give the link the rate present_sync.hz names. */
+@@ -6324,7 +6393,7 @@
+         surface_put(drop.surf);
+     }
+     if (show) {
+-        cocoa_gl_present_show(surf, filter);
++        cocoa_gl_present_show(surf, filter, flushed);
+         surface_put(surf);
+     }
+     if (wake) {
+@@ -6502,7 +6571,7 @@
+         surface_put(stale[i].surf);
+     }
+     if (show.surf) {
+-        cocoa_gl_present_show(show.surf, show.filter);
++        cocoa_gl_present_show(show.surf, show.filter, show.flushed);
+         surface_put(show.surf);
+         /* The guest may have drawn while the queue was full. */
+         qemu_bh_schedule(present_bh);
+@@ -6755,6 +6824,7 @@
+ static PingouinBox pingouin_guest_box[PINGOUIN_MAX_OUTPUTS];
+ static PingouinBox pingouin_guest_bounds;
+ static bool pingouin_guest_known;
++static PingouinBox pingouin_guest_notch;    /* Omanotch's hidden output (w 0: none) */
+ static NSString *pingouin_last_layout;
+ 
+ /*
+@@ -6883,6 +6953,127 @@
+     return true;
+ }
+ 
++/* NOTCH's top row above an output's middle, from the layout the guest reported. */
++static bool pingouin_notch_park_target(int output, double *nx, double *ny)
++{
++    const PingouinBox *s, *n = &pingouin_guest_notch;
++    const PingouinBox *a = &pingouin_guest_bounds;
++
++    if (!pingouin_guest_known || output < 0 || output >= PINGOUIN_MAX_OUTPUTS) {
++        return false;
++    }
++    s = &pingouin_guest_box[output];
++    return pingouin_park_place((PingouinParkBox){ s->x, s->y, s->w, s->h },
++                             (PingouinParkBox){ n->x, n->y, n->w, n->h },
++                             (PingouinParkBox){ a->x, a->y, a->w, a->h }, nx, ny);
++}
++
++/*
++ * At the strip's edge the Mac's cursor changes with the guest's frame, not
++ * before it. The guest draws its own pointer a frame or two after QEMU
++ * moved it (Hyprland, virgl, this present): up into the strip the guest's
++ * arrow still showed on the VM's top rows next to the Mac's for that long,
++ * and back into the VM there was no arrow at all. Now the Mac's cursor
++ * stays hidden (up) or shown (back) until a guest frame flushed after the
++ * move is on the layer, at most PINGOUIN_PARK_HOLD_MAX_MS. Main thread.
++ * PINGOUIN_PARK_HOLD=0: off (as before); PINGOUIN_PARK_MARGIN_MS: how long
++ * after the move a flushed frame may still be one drawn before it.
++ */
++#define PINGOUIN_PARK_HOLD_MAX_MS 80
++static int pingouin_park_hold;            /* -1 hidden (up), 1 shown (back), 0 none */
++static unsigned pingouin_park_hold_gen;
++static double pingouin_park_hold_at;      /* CACurrentMediaTime() of the move */
++
++static int pingouin_park_hold_now(void)
++{
++    return pingouin_park_hold;
++}
++
++static void pingouin_park_hold_end(const char *why)
++{
++    pingouin_park_hold = 0;
++    qatomic_set(&pingouin_park_hold_on, 0);
++    if (pingouin_pointer_debug) {
++        fprintf(stderr, "pingouin-pointer: %.4f strip hold ends (%s)\n", CACurrentMediaTime(), why);
++    }
++    [cocoaView pingouinUpdateMacCursor];
++}
++
++static double pingouin_park_margin(void)
++{
++    static double m = -1;
++    if (m < 0) {
++        const char *e = getenv("PINGOUIN_PARK_MARGIN_MS");
++        m = e ? MAX(0, atof(e)) / 1000.0 : 0.004;
++    }
++    return m;
++}
++
++static void pingouin_park_hold_start(bool up)
++{
++    static int on = -1;
++    unsigned gen;
++
++    if (on < 0) {
++        const char *e = getenv("PINGOUIN_PARK_HOLD");
++        on = !(e && !strcmp(e, "0"));
++    }
++    if (!up) {
++        pingouin_parked = false;
++    }
++    /* only where QEMU sees the guest's frames go on screen */
++    bool frames = false;
++#ifdef CONFIG_OPENGL
++    frames = present_ctx != NULL;
++#endif
++    if (!on || !frames) {
++        return;
++    }
++    pingouin_park_hold = up ? -1 : 1;
++    pingouin_park_hold_at = CACurrentMediaTime();
++    gen = ++pingouin_park_hold_gen;
++    qatomic_set(&pingouin_park_hold_on, 1);
++    if (pingouin_pointer_debug) {
++        fprintf(stderr, "pingouin-pointer: %.4f strip hold starts (%s)\n", pingouin_park_hold_at,
++                up ? "up: Mac cursor hidden" : "back: Mac cursor shown");
++    }
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, PINGOUIN_PARK_HOLD_MAX_MS * NSEC_PER_MSEC),
++                   dispatch_get_main_queue(), ^{
++        if (pingouin_park_hold && pingouin_park_hold_gen == gen) {
++            pingouin_park_hold_end("no frame in time");
++        }
++    });
++}
++
++/*
++ * Main thread: a guest frame flushed at `flushed` is on the main layer now.
++ * Up: the Mac's cursor shows at once. Back: it hides one refresh later
++ * (Core Animation shows the layer's new contents a refresh after the
++ * cursor's change: hidden now, there was no arrow for that refresh).
++ */
++static void pingouin_park_frame_shown(double flushed)
++{
++    unsigned gen = pingouin_park_hold_gen;
++    NSInteger hz;
++
++    if (!pingouin_park_hold || flushed < pingouin_park_hold_at + pingouin_park_margin()) {
++        return;
++    }
++    if (pingouin_park_hold < 0) {
++        pingouin_park_hold_end("the guest's frame is on screen");
++        return;
++    }
++    hz = [[[cocoaView window] screen] maximumFramesPerSecond];
++    pingouin_park_hold_at = INFINITY;     /* one end only */
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
++                                 (int64_t)(NSEC_PER_SEC / (hz > 0 ? hz : 60))),
++                   dispatch_get_main_queue(), ^{
++        if (pingouin_park_hold && pingouin_park_hold_gen == gen) {
++            pingouin_park_hold_end("the guest's frame is on screen, a refresh later");
++        }
++    });
++}
++
+ static int pingouin_active_outputs(void)
+ {
+     return pingouin_mac_count;
+@@ -7560,6 +7751,7 @@
+ - (void)mouseEntered:(NSEvent *)e { [self send:e button:-1 down:false]; }
+ - (void)mouseExited:(NSEvent *)e
+ {
++    [cocoaView pingouinParkInNotch:e view:self output:output];
+     if ([cocoaView isMouseGrabbed] && !pingouin_pointer_over_ours() &&
+         ![NSEvent pressedMouseButtons]) {
+         [cocoaView ungrabMouse];
+@@ -8058,6 +8250,7 @@
+     bool first = true;
+ 
+     memset(pingouin_guest_box, 0, sizeof(pingouin_guest_box));
++    memset(&pingouin_guest_notch, 0, sizeof(pingouin_guest_notch));
+     pingouin_guest_known = false;
+     for (NSDictionary *m in monitors) {
+         if (![m isKindOfClass:[NSDictionary class]]) {
+@@ -8083,6 +8276,8 @@
+                 pingouin_guest_box[index] = (PingouinBox){ x, y, w, h };
+                 pingouin_guest_known = true;
+             }
++        } else if ([name isKindOfClass:[NSString class]] && [name isEqualToString:@"NOTCH"]) {
++            pingouin_guest_notch = (PingouinBox){ x, y, w, h };
+         }
+     }
+     pingouin_guest_bounds = (PingouinBox){ minx, miny, maxx - minx, maxy - miny };

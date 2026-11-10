@@ -1,0 +1,221 @@
+virglrenderer: integer outputs are written through a float temporary
+
+What: the guest's TGSI writes results straight to integer outputs (integer
+colour buffers, gl_SampleMask, gl_FragStencilRefARB, gl_Layer,
+gl_ViewportIndex, gl_PrimitiveID): it folds floatBitsToUint(f(x)) or uint(i)
+into "OP OUT[n], ...". Each instruction's GLSL then had to know the output's
+type, and many did not: float math converted the value (uint(1.0 / x)),
+integer ops went through uintBitsToFloat() and back, texture fetches, queries,
+image/buffer loads, CMP, SEQ... did not compile. Now every such output is
+written like a float temporary (vec4 int_out_tmp<n>, same GLSL as for a TEMP
+register, for every opcode, named after the TGSI register) and stored once
+with its bits (floatBitsToUint/Int) at every return and before every vertex a
+geometry shader emits. Which components a shader writes comes from tgsi_scan
+(new: output_writemask), so a store before the write in the text (a loop) is
+not missed, and only those are stored to a colour output (with framebuffer
+fetch the others keep the fetched value). gl_FragStencilRefARB comes from .y,
+the others from .x; gl_SampleMask only [0] (hosts refuse [1..3] for 32 samples
+or fewer). Precise results keep precise on their temporary. Reads of the output
+read the temporary (not FBFETCH). Float outputs and temporaries get the same
+GLSL as before.
+Not covered (they keep upstream's per-instruction GLSL): integer outputs
+declared as an array range, every output of a shader that reads or writes any
+output with an indirect index (the index could reach past a temporary), and
+integer colour outputs with logic ops (they have their own temporaries); no
+guest driver we know sends these to integer outputs.
+Why: dEQP-GLES3 builtin_functions.precision.sqrt/length read 315 for
+sqrt(99463) instead of its bits; the shaders that did not compile stopped the
+guest's whole context. Same on Linux hosts.
+Upstream bug (same code upstream); upstreamable; not sent.
+Applies after virgl-shader-core-glsl-version.patch.
+Tests: Tests/virgl/test-core-glsl-shaders.c: 18 opcode kinds (float math,
+compares, conversions, integer ops, TEX, TXF, TXQ, and image/buffer LOAD, RESQ,
+atomics as text only: the Mac has no images) into uint and int colour outputs,
+an integer op into gl_SampleMask, gl_Layer from a geometry shader (also written
+after an EmitVertex in a loop), colour outputs declared in reverse order, a
+full-writemask gl_SampleMask, the stencil value, an output also written or
+read indirectly, partial writes (also after a framebuffer fetch), a precise
+write; compiled by the Mac's OpenGL where it has the feature; all fail without
+this patch.
+--- a/src/gallium/auxiliary/tgsi/tgsi_scan.h
++++ b/src/gallium/auxiliary/tgsi/tgsi_scan.h
+@@ -54,6 +54,7 @@
+    uint8_t input_cylindrical_wrap[PIPE_MAX_SHADER_INPUTS];
+    uint8_t output_semantic_name[PIPE_MAX_SHADER_OUTPUTS]; /**< TGSI_SEMANTIC_x */
+    uint8_t output_semantic_index[PIPE_MAX_SHADER_OUTPUTS];
++   uint8_t output_writemask[PIPE_MAX_SHADER_OUTPUTS]; /**< components written (direct index) */
+ 
+    uint8_t num_system_values;
+    uint8_t system_value_semantic_name[PIPE_MAX_SHADER_INPUTS];
+--- a/src/gallium/auxiliary/tgsi/tgsi_scan.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_scan.c
+@@ -244,6 +244,9 @@
+                   info->indirect_files |= (1u << dst->Register.File);
+                   info->indirect_files_written |= (1u << dst->Register.File);
+                }
++               if (dst->Register.File == TGSI_FILE_OUTPUT && !dst->Register.Indirect &&
++                   (unsigned)dst->Register.Index < PIPE_MAX_SHADER_OUTPUTS)
++                  info->output_writemask[dst->Register.Index] |= dst->Register.WriteMask;
+                if (dst->Register.Dimension && dst->Dimension.Indirect)
+                   info->dimension_indirect_files |= (1u << dst->Register.File);
+             }
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -164,6 +164,9 @@
+    bool is_int : 1;
+    bool fbfetch_used : 1;
+    bool needs_override : 1;
++   /* integer output written through int_out_tmp<first> (see emit_int_output_stores) */
++   bool int_temp : 1;
++   unsigned int_temp_written : 4;
+ };
+ 
+ struct vrend_io_range {
+@@ -1928,6 +1931,26 @@
+          break;
+       }
+ 
++      /* Integer outputs (gl_SampleMask, gl_Layer, integer colour buffers...)
++       * are written like a float temporary, and stored once with their bits
++       * (emit_int_output_stores()): every instruction's result then has the
++       * same GLSL as for a temporary, whatever type it computes. Not with
++       * logic ops, which have their own temporaries, and not in shaders that
++       * read or write any output with an indirect index (it could reach this
++       * one past the temporary). */
++      ctx->outputs[i].int_temp = ctx->outputs[i].first == ctx->outputs[i].last &&
++         ctx->outputs[i].first < PIPE_MAX_SHADER_OUTPUTS &&
++         !(ctx->info.indirect_files & (1u << TGSI_FILE_OUTPUT)) &&
++         (ctx->outputs[i].is_int ||
++          (ctx->outputs[i].name == TGSI_SEMANTIC_COLOR &&
++           iter->processor.Processor == TGSI_PROCESSOR_FRAGMENT &&
++           !ctx->key->fs.logicop_enabled &&
++           (ctx->outputs[i].type == VEC_UINT || ctx->outputs[i].type == VEC_INT)));
++      /* which components the shader writes anywhere (tgsi_scan): the
++       * stores also come before writes later in the text (loops) */
++      if (ctx->outputs[i].int_temp)
++         ctx->outputs[i].int_temp_written = ctx->info.output_writemask[ctx->outputs[i].first];
++
+       if (ctx->outputs[i].glsl_no_index)
+          snprintf(ctx->outputs[i].glsl_name, 64, "%s", name_prefix);
+       else {
+@@ -2605,10 +2628,58 @@
+ 
+ #define emit_ucompare(op) emit_buff(&ctx->glsl_strbufs, "%s = %s(uintBitsToFloat(%s(%s(%s(%s), %s(%s))%s) * %s(0xffffffff)));\n", dsts[0], get_string(dinfo.dstconv), get_string(dinfo.udstconv), op, get_string(sinfo.svec4), srcs[0], get_string(sinfo.svec4), srcs[1], writemask, get_string(dinfo.udstconv))
+ 
++/* Store the integer outputs written through int_out_tmp<first> (see
++ * int_temp): the float temporary's bits, as int or uint. Before the shader
++ * returns and before every vertex a geometry shader emits. Named after the
++ * TGSI register: ctx->outputs is sorted again after the body is written. */
++static void emit_int_output_stores(const struct dump_ctx *ctx,
++                                   struct vrend_glsl_strbufs *glsl_strbufs)
++{
++   static const char comps[] = "xyzw";
++   for (uint32_t i = 0; i < ctx->num_outputs; i++) {
++      const struct vrend_shader_io *output = &ctx->outputs[i];
++      if (!output->int_temp || !output->int_temp_written)
++         continue;
++      bool is_uint = output->type == VEC_UINT;
++      const char *cast = is_uint ? "floatBitsToUint" : "floatBitsToInt";
++      if (output->name == TGSI_SEMANTIC_COLOR) {
++         /* fsout_c<n>, uvec4 or ivec4 like the guest's colour buffer; only
++          * the written components (with framebuffer fetch the others keep
++          * the fetched value) */
++         if (output->int_temp_written == 0xf) {
++            emit_buff(glsl_strbufs, "%s = %s(int_out_tmp%d);\n", output->glsl_name, cast,
++                      output->first);
++         } else {
++            char mask[5] = "";
++            for (int c = 0, n = 0; c < 4; c++)
++               if (output->int_temp_written & (1 << c))
++                  mask[n++] = comps[c];
++            emit_buff(glsl_strbufs, "%s.%s = %s(int_out_tmp%d.%s);\n", output->glsl_name, mask,
++                      cast, output->first, mask);
++         }
++      } else {
++         /* gl_SampleMask[0] (the hosts' sample counts fit in one int; [1..3]
++          * are refused), gl_Layer, gl_ViewportIndex, gl_PrimitiveID: x;
++          * gl_FragStencilRefARB: y. The first written one if that is not. */
++         int c = output->name == TGSI_SEMANTIC_STENCIL ? 1 : 0;
++         if (!(output->int_temp_written & (1 << c))) {
++            c = 0;
++            while (!(output->int_temp_written & (1 << c)))
++               c++;
++         }
++         emit_buff(glsl_strbufs, "%s%s = %s(int_out_tmp%d.%c);\n", output->glsl_name,
++                   output->name == TGSI_SEMANTIC_SAMPLEMASK ? "[0]" : "", cast,
++                   output->first, comps[c]);
++      }
++   }
++}
++
+ static void handle_vertex_proc_exit(const struct dump_ctx *ctx,
+                                     struct vrend_glsl_strbufs *glsl_strbufs,
+                                     bool *has_clipvertex_so)
+ {
++    emit_int_output_stores(ctx, glsl_strbufs);
++
+     if (ctx->so && !ctx->key->gs_present && !ctx->key->tes_present)
+        emit_so_movs(ctx, glsl_strbufs, has_clipvertex_so);
+ 
+@@ -2772,6 +2843,8 @@
+ static void handle_fragment_proc_exit(const struct dump_ctx *ctx,
+                                       struct vrend_glsl_strbufs *glsl_strbufs)
+ {
++    emit_int_output_stores(ctx, glsl_strbufs);
++
+     if (ctx->key->pstipple_enabled)
+        emit_pstipple_pass(glsl_strbufs);
+ 
+@@ -4498,6 +4571,12 @@
+             }
+          }
+ 
++         if (output->int_temp) {
++            /* as a float temporary: no output-specific conversion */
++            strbuf_fmt(&dst_bufs[i], "int_out_tmp%d%s", output->first, writemask);
++            break;
++         }
++
+          if (ctx->glsl_ver_required >= 140 && output->name == TGSI_SEMANTIC_CLIPVERTEX) {
+             if (ctx->prog_type == TGSI_PROCESSOR_TESS_CTRL) {
+                strbuf_fmt(&dst_bufs[i], "%s[gl_InvocationID]", output->glsl_name);
+@@ -4932,6 +5011,10 @@
+          if (inst->Instruction.Opcode == TGSI_OPCODE_FBFETCH) {
+             output->fbfetch_used = true;
+             ctx->shader_req_bits |= SHADER_REQ_FBFETCH;
++         } else if (output->int_temp) {
++            strbuf_fmt(src_buf, "%s(vec4(%sint_out_tmp%d)%s)", get_string(stypeprefix), prefix,
++                       output->first, swizzle);
++            break;
+          }
+ 
+          enum vrend_type_qualifier srcstypeprefix = stypeprefix;
+@@ -6065,6 +6148,7 @@
+    case TGSI_OPCODE_EMIT:
+       if (likely((unsigned) inst->Src[0].Register.Index < MAX_IMMEDIATE)) {
+          struct immed *imd = &ctx->imm[inst->Src[0].Register.Index];
++         emit_int_output_stores(ctx, &ctx->glsl_strbufs);
+          if (ctx->so && ctx->key->gs_present)
+             emit_so_movs(ctx, &ctx->glsl_strbufs, &ctx->has_clipvertex_so);
+          if (ctx->cfg->has_cull_distance && ctx->key->gs.emit_clip_distance)
+@@ -6755,6 +6839,12 @@
+ 
+    if (ctx->require_dummy_value)
+       emit_hdr(glsl_strbufs, "vec4 dummy_value = vec4(0.0, 0.0, 0.0, 0.0);\n");
++
++   for (i = 0; i < ctx->num_outputs; i++) {
++      if (ctx->outputs[i].int_temp)
++         emit_hdrf(glsl_strbufs, "%svec4 int_out_tmp%d;\n",
++                   ctx->outputs[i].precise ? "precise " : "", ctx->outputs[i].first);
++   }
+ 
+    if (ctx->write_mul_utemp) {
+       emit_hdr(glsl_strbufs, "uvec4 mul_utemp;\n");
+@@ -8247,6 +8337,7 @@
+    if (!tgsi_scan_shader(tokens, &ctx.info))
+       goto fail;
+ 
++
+    /* if we are in core profile mode we should use GLSL 1.40 */
+    if (cfg->glsl_version >= 140)
+       ctx.glsl_ver_required = require_glsl_ver(&ctx, 140);

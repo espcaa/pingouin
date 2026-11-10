@@ -1,0 +1,199 @@
+From: OmacVM
+Subject: [PATCH] ui: when the VM takes the pointer without a click, and when the Mac's cursor hides
+
+What: a header with no AppKit in it: when the VM's window takes an absolute
+pointer by itself (a motion over the VM, or the window key, the app active
+or full screen with the pointer on it; not during a click, not after
+Ctrl+Alt+G until the pointer left), and when the Mac's cursor is hidden over
+the VM (only once the guest draws its own pointer: its display agent said
+hello since the last reset). Used by pingouin-cocoa-pointer-start.patch (which
+explains the why). Also the image QEMU gives the Mac's cursor (an empty one
+while hidden, the arrow again after) and when
+a motion or the watch while hidden sets it again; used by
+pingouin-cocoa-cursor-stays-hidden.patch.
+
+Why its own file: so the logic is tested against the start, reboot, focus
+and let-go sequences without QEMU or a display
+(app/runtime/Tests/display/test-pointer-start.sh applies this patch to an
+empty folder; at build time and in CI).
+
+Upstream: not applicable (OmacVM's pointer policy).
+Test: app/runtime/Tests/display/test-pointer-start.c.
+
+diff --git a/ui/pingouin-pointer-start.h b/ui/pingouin-pointer-start.h
+new file mode 100644
+index 0000000..6be1735
+--- /dev/null
++++ b/ui/pingouin-pointer-start.h
+@@ -0,0 +1,171 @@
++/*
++ * Pingouin: when the VM's window takes the pointer by itself, when the
++ * Mac's cursor is hidden over it, and its image then.
++ *
++ * No AppKit in here, so it is tested on its own
++ * (app/runtime/Tests/display/test-pointer-start.c); ui/cocoa.m feeds it.
++ *
++ * Upstream QEMU takes an absolute pointer (virtio-tablet) only when the
++ * mouse enters the view, or on a click. After a VM start the window opens
++ * under the pointer; after a guest reboot, or when the window becomes key
++ * again, the pointer is already on it. Nothing enters, so the guest saw no
++ * motion and its pointer sat in the middle until the user clicked once.
++ * Now the first motion over the VM takes it, and so does the window
++ * becoming key (or the app active, or full screen) with the pointer on it.
++ *
++ * The Mac's cursor: when the guest draws its own pointer (show-cursor=off),
++ * it was hidden as soon as the VM had the pointer, also while the guest was
++ * still booting and drew none: no pointer at all. Now it is hidden only
++ * once the guest says it draws its pointer (the guest's display agent said
++ * hello on the display port), and shown again from a guest reset until it
++ * says so again. Both pointers sit at the same place meanwhile (absolute).
++ */
++#ifndef PINGOUIN_POINTER_START_H
++#define PINGOUIN_POINTER_START_H
++
++#include <stdbool.h>
++
++/* What ui/cocoa.m knows at a motion or at a moment it may take the pointer. */
++typedef struct PingouinPointerIn {
++    bool absolute;  /* the guest's pointer is absolute (virtio-tablet) */
++    bool grabbed;   /* the VM has the pointer now */
++    bool active;    /* QEMU is the app in front */
++    bool key;       /* one of our windows is key */
++    bool over;      /* the pointer is on the VM's picture, nothing above it */
++    bool buttons;   /* a mouse button is down (a click or drag in progress) */
++} PingouinPointerIn;
++
++typedef struct PingouinPointerStart {
++    bool off;       /* PINGOUIN_POINTER_START=0: upstream's way (enter or click) */
++    bool let_go;    /* the user let go (Ctrl+Alt+G) and has not left the VM */
++    bool drawing;   /* the guest draws its own pointer (said hello since reset) */
++} PingouinPointerStart;
++
++/*
++ * Take the pointer now? Only an absolute one: taking a relative pointer
++ * captures the Mac's cursor, which stays a click (as upstream). Not during
++ * a click (the click itself takes it, as before) nor after the user let go
++ * with the pointer still on the VM.
++ */
++static inline bool pingouin_pointer_take(const PingouinPointerStart *s,
++                                       const PingouinPointerIn *in)
++{
++    return !s->off && in->absolute && !in->grabbed && in->active && in->key &&
++           in->over && !in->buttons && !s->let_go;
++}
++
++/* The user let go of the pointer (Ctrl+Alt+G): not taken again while on the VM. */
++static inline void pingouin_pointer_let_go(PingouinPointerStart *s)
++{
++    s->let_go = true;
++}
++
++/*
++ * The pointer left the VM, our windows stopped being key (another app,
++ * another Space), or the VM took the pointer: a let-go is over.
++ */
++static inline void pingouin_pointer_left(PingouinPointerStart *s)
++{
++    s->let_go = false;
++}
++
++/* The guest's display agent said hello: Omarchy draws its pointer now. */
++static inline void pingouin_pointer_guest_hello(PingouinPointerStart *s)
++{
++    s->drawing = true;
++}
++
++/* The guest was reset: firmware and boot draw no pointer. */
++static inline void pingouin_pointer_guest_reset(PingouinPointerStart *s)
++{
++    s->drawing = false;
++}
++
++/*
++ * Is the Mac's cursor hidden? hide_setting: the guest draws its own pointer
++ * (show-cursor=off; Pingouin.app sets it for VMs with guest-pointer). A
++ * relative pointer holds the Mac's cursor still, so it is always hidden
++ * then (upstream); an absolute one only once the guest draws its own.
++ */
++static inline bool pingouin_pointer_hide_mac(const PingouinPointerStart *s,
++                                           bool hide_setting, bool grabbed,
++                                           bool absolute)
++{
++    if (!grabbed || !hide_setting) {
++        return false;
++    }
++    return !absolute || s->off || s->drawing;
++}
++
++/*
++ * The image QEMU gives the Mac's cursor over the VM. Hidden alone was not
++ * enough: whether the cursor is hidden belongs to the window server, and
++ * other processes and macOS undo it (a background helper showing it, an
++ * app or Space switch), while QEMU still counted it hidden and never hid
++ * it again: the Mac's arrow sat over the guest's pointer until the user
++ * switched away and back. So while hidden its image is an empty one too:
++ * whoever shows it again shows nothing. QEMU sets one image of its own
++ * at most; when it shows the cursor again the arrow comes back.
++ */
++typedef enum PingouinCursorImage {
++    PINGOUIN_CURSOR_APPKIT,   /* AppKit's own (the arrow): QEMU sets none */
++    PINGOUIN_CURSOR_GUEST,    /* the guest's pointer image (hardware cursor) */
++    PINGOUIN_CURSOR_EMPTY,    /* an empty one: hidden, or the guest hides its pointer */
++} PingouinCursorImage;
++
++/*
++ * hw: the Mac's cursor carries the guest's pointer (ui/pingouin-hw-cursor.h);
++ * guest_shown: the guest shows its pointer on some output; hide: the Mac's
++ * cursor is hidden (pingouin_pointer_hide_mac, or the notch strip's hold).
++ */
++static inline PingouinCursorImage pingouin_pointer_image(bool hw, bool guest_shown,
++                                                     bool hide)
++{
++    if (hw) {
++        return guest_shown ? PINGOUIN_CURSOR_GUEST : PINGOUIN_CURSOR_EMPTY;
++    }
++    return hide ? PINGOUIN_CURSOR_EMPTY : PINGOUIN_CURSOR_APPKIT;
++}
++
++/* How often a motion may ask the window server whether the hidden cursor shows. */
++#define PINGOUIN_POINTER_LOOK_S 0.1
++
++/*
++ * While QEMU has the cursor hidden it also asks every PINGOUIN_POINTER_WATCH_S
++ * without a motion: a show while the pointer rests (the user types) left
++ * the arrow over the VM until the next move. Only while hidden.
++ */
++#define PINGOUIN_POINTER_WATCH_S 0.5
++
++/* A motion: ask the window server now? (*last: when it was asked last; seconds) */
++static inline bool pingouin_pointer_look_due(double now, double *last)
++{
++    if (now >= *last && now - *last < PINGOUIN_POINTER_LOOK_S) {
++        return false;
++    }
++    *last = now;
++    return true;
++}
++
++/*
++ * A motion over the VM, or the watch while hidden, with QEMU's image in
++ * place (want not APPKIT): set it again? appkit_has_it: AppKit's current cursor is that image; AppKit
++ * puts its own back (at a window's edge), and then it is set again at
++ * once. hidden: QEMU hid the cursor; looked: the window server was asked
++ * (pingouin_pointer_look_due), shown: its answer. A show by another process
++ * or by macOS changes nothing AppKit sees, and the image macOS shows then
++ * may be its own arrow: the empty one is set again.
++ */
++static inline bool pingouin_pointer_image_again(PingouinCursorImage want, bool appkit_has_it,
++                                              bool hidden, bool looked, bool shown)
++{
++    if (want == PINGOUIN_CURSOR_APPKIT) {
++        return false;
++    }
++    if (!appkit_has_it) {
++        return true;
++    }
++    return want == PINGOUIN_CURSOR_EMPTY && hidden && looked && shown;
++}
++
++#endif

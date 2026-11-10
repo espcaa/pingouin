@@ -1,0 +1,140 @@
+From: OmacVM
+Subject: [PATCH] cocoa: closing the window can keep the VM running
+
+What: the VM window's close button follows OmacVM.app's "Closing the
+window" (#358, pingouin-close.h): Shut down (the default: the guest's power
+button, as before), Keep running (the app is hidden, the VM goes on; a click
+on the Dock icon, the app switcher or opening the app shows the same session
+again, a full-screen window in its own Space; Quit still shuts the guest
+down) or Ask (a sheet that names the VM: Shut Down, the default, Keep
+Running, or Cancel with Esc). QEMU started as the OmacVM app reads the app's setting when the
+window closes, so a change while the VM runs counts; else
+PINGOUIN_CLOSE_ACTION from the start. qemu.log says what happened. The Dock
+icon also brings a minimised window back.
+
+Why: #358 (@Vocllum): a VM that keeps running without its window, like the
+other VM apps.
+
+Upstream: not sent (OmacVM.app's setting).
+Test: app/runtime/Tests/display/test-close.sh (the rules, and the wiring in
+the patched ui/cocoa.m at build time). Applies after
+pingouin-cocoa-close-logic.patch and pingouin-cocoa-keys-last.patch, before
+pingouin-cocoa-no-app-nap.patch.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -52,6 +52,7 @@
+ #include "ui/pingouin-ime.h"
+ #include "ui/pingouin-ime-shift.h"
+ #include "ui/pingouin-fullpanel.h"
++#include "ui/pingouin-close.h"
+ #include "hw/core/boards.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+@@ -4776,9 +4777,88 @@
+ - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)theApplication
+ {
+     return NO;
++}
++
++/*
++ * Pingouin: closing the window (#358, pingouin-close.h). The app's setting at the
++ * moment of closing: QEMU started as the Pingouin app reads its own defaults
++ * (a change while the VM runs counts), else what the app passed at the start.
++ */
++static PingouinClose pingouin_close_now(void)
++{
++    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
++    bool app = [bid hasPrefix:@"app.pingouin.Pingouin"];
++    NSString *live = nil;
++    if (app) {
++        CFPreferencesAppSynchronize((CFStringRef)bid);
++        id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"closeAction"];
++        live = [v isKindOfClass:[NSString class]] ? v : nil;
++    }
++    return pingouin_close_pick(app, live ? [live UTF8String] : NULL, getenv("PINGOUIN_CLOSE_ACTION"));
+ }
+ 
+ /*
++ * Keep running: the app is hidden (also a full-screen window, which keeps its
++ * Space for when it comes back), the VM goes on. A click on the Dock icon,
++ * the app switcher or Quit work as for any hidden app; Quit shuts the guest
++ * down as before.
++ */
++- (void)pingouinKeepRunning
++{
++    fprintf(stderr, "pingouin: close: the window is hidden, the VM keeps running (the Dock icon shows it again)\n");
++    [NSApp hide:self];
++}
++
++/* Ask: Shut Down (the default, Return), Keep Running, Cancel (Esc). */
++- (void)pingouinAskClose
++{
++    NSWindow *w = [cocoaView window];
++    if ([w attachedSheet]) {
++        return;
++    }
++    NSString *name = qemu_name ? [NSString stringWithUTF8String:qemu_name] : nil;
++    NSAlert *alert = [[NSAlert new] autorelease];
++    [alert setMessageText:[name length] ? [NSString stringWithFormat:@"Shut down \u201c%@\u201d?", name]
++                                        : @"Shut down the VM?"];
++    [alert setInformativeText:@"Keep Running hides the window and the VM goes on in the background. "
++                               "Click the Dock icon to come back to it."];
++    [alert addButtonWithTitle:@"Shut Down"];
++    [alert addButtonWithTitle:@"Keep Running"];
++    [alert addButtonWithTitle:@"Cancel"];
++    void (^done)(NSModalResponse) = ^(NSModalResponse r) {
++        if (r == NSAlertFirstButtonReturn) {
++            fprintf(stderr, "pingouin: close: asked: shut down\n");
++            [NSApp terminate:self];
++        } else if (r == NSAlertSecondButtonReturn) {
++            fprintf(stderr, "pingouin: close: asked: keep running\n");
++            [self pingouinKeepRunning];
++        } else {
++            fprintf(stderr, "pingouin: close: asked: cancelled\n");
++        }
++    };
++    if ([w isVisible] && ![w isMiniaturized]) {
++        [alert beginSheetModalForWindow:w completionHandler:done];
++    } else {
++        done([alert runModal]);
++    }
++}
++
++/* The Dock icon (or the app opened again) while the window is hidden or minimised. */
++- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag
++{
++    NSWindow *w = [cocoaView window];
++    if ([NSApp isHidden]) {
++        [NSApp unhide:self];
++    }
++    if (w && [w isMiniaturized]) {
++        [w deminiaturize:self];
++    } else if (w && ![w isVisible] && !getenv("PINGOUIN_COCOA_HIDDEN")) {
++        [w makeKeyAndOrderFront:self];
++    }
++    return NO;
++}
++
++/*
+  * Pingouin: Quit, the close button, a logout or a restart press the guest's
+  * power button, and the quit waits (NSTerminateLater): QEMU exits by itself
+  * once the guest is off (-action shutdown=poweroff). A guest that does not
+@@ -5010,6 +5090,17 @@
+ - (BOOL)windowShouldClose:(id)sender
+ {
+     COCOA_DEBUG("QemuCocoaAppController: windowShouldClose\n");
++    /* Pingouin: Pingouin.app's "Closing the window" (#358). */
++    switch (pingouin_close_now()) {
++    case PINGOUIN_CLOSE_KEEP:
++        [self pingouinKeepRunning];
++        return NO;
++    case PINGOUIN_CLOSE_ASK:
++        [self pingouinAskClose];
++        return NO;
++    case PINGOUIN_CLOSE_SHUTDOWN:
++        break;
++    }
+     [NSApp terminate: sender];
+     /* If the user allows the application to quit then the call to
+      * NSApp terminate will never return. If we get here then the user

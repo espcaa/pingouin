@@ -1,0 +1,256 @@
+# Patches Pingouin applies, in order, per source tree (read by build.sh).
+# Each line: a patch file, then "# why". Applied with `patch -p1 -f`. TAP: = patches/ in
+# startergo/homebrew-virglrenderer @ de31b78a88b2f9eea04dff32438e6283b400edf7; others = runtime/patches/.
+# FORCED = not wanted for itself; needed so a wanted patch applies (or compiles). 
+#   libslirp v4.9.4  sha256 3998863b020aeda34bddc567097c6efba55a78cdf6eeee6bcd42c11ef23967da
+#   qemu c3d48b7d1e89604920e5b81b91140c2ad39a1943 (11.1.1)  sha256 7563781d7dec46f11509801e027f852597235d29ca7afa44a07ed9d8b108b8cd
+#   virglrenderer 1.3.0  sha256 065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3
+#   SPIRV-Tools v2026.3  sha256 fff0667b25dfb98177da3cc4cc61ac277d076786df42baaf8d9635a25bdf9226
+#   tap tarball  sha256 373db13456610847b97a2d442f1b7cd2ffa0c9a60c6850dc2185d40b09dfa5e4
+
+[libslirp]   # 3 patches
+libslirp-darwin-icmp-matching.patch          # ICMP (ping) replies matched correctly on Darwin
+libslirp-ipv4-udp-translation.patch          # IPv4 UDP reply address translation fix
+libslirp-nonblocking-datagram-sockets.patch  # non-blocking UDP/ICMP: a send macOS can't take is dropped, VM doesn't freeze
+
+[qemu]   # 102 patches
+qemu-texture-borrowing-11.1.patch            # base: Cocoa GL display / virgl texture borrowing (startergo)
+qemu-gpu-spike-resolution-fix.patch          # GL dirty flag cleared after render (CPU spike fix)
+qemu-cocoa-product-identity.patch            # base identity hooks (Dock/app name); later cocoa patches build on it
+qemu-cocoa-dynamic-display.patch             # dynamic resolution / resize
+qemu-cocoa-immersive-mode.patch              # immersive fullscreen separate from keyboard capture
+qemu-cocoa-full-grab-focus.patch             # full grab while window is key (Cmd keys)
+qemu-cocoa-full-grab-reenable.patch          # re-enable grab tap after macOS disables it
+qemu-sdl-audio-device-selection.patch        # audio device selection
+qemu-hda-full-ring-recovery.patch            # HDA recovery when the ring fills
+qemu-hda-no-catch-up.patch                   # HDA: no burst catch-up after main-loop stall
+qemu-9p-guest-owner.patch                    # 9p shared folder ownership
+qemu-darwin-strchrnul-compat.patch           # build fix: no 15.4-only strchrnul on 15.0 target
+qemu-hvf-free-page-reclaim.patch             # HVF free page reporting -> memory back to macOS
+qemu-hvf-mapped-sections.patch               # HVF only unmaps mapped sections (reclaim correctness)
+qemu-hvf-free-page-reclaim-reusable.patch    # MADV_FREE_REUSABLE give-back off the BQL
+qemu-hvf-own-view-sweep.patch                # guest RAM counted once (QEMU's own view remapped)
+qemu-darwin-gpu-fence-poll.patch             # GPU fence polling on Darwin
+qemu-cocoa-pinch-zoom.patch                  # virtio pinch touchpad
+qemu-cocoa-precise-scroll.patch              # precise/hi-res scrolling
+qemu-cocoa-iso-section-grave-swap.patch      # ISO keyboard §/` swap
+qemu-cocoa-injected-text.patch               # FORCED: adds Carbon to meson frameworks line that present-iosurface edits; injected-text translation itself unwanted but harmless
+pingouin-cocoa-identity.patch                  # app name/icon from env (rebrand later)
+pingouin-cocoa-quit-powerdown.patch            # Quit = guest power button (clean shutdown)
+pingouin-cocoa-notch.patch                     # full screen beside the notch (PINGOUIN_NOTCH)
+pingouin-cocoa-window-size.patch               # window keeps its size; guest follows window
+pingouin-cocoa-fullscreen-size.patch           # fullscreen at real size on notched Macs
+qemu-cocoa-modifiers-input-only.patch        # modifiers only from input events
+qemu-sdl-audio-capture-thread.patch          # recording device opened off the BQL (no hang)
+qemu-sdl-audio-playback-thread.patch         # playback device off the BQL (no hang on dead device)
+qemu-sdl-audio-out-size-logic.patch          # header for out-size
+qemu-sdl-audio-out-size.patch                # playback buffer sizes the device accepts (AirPods)
+qemu-darwin-main-loop-qos.patch              # main loop at user-interactive QoS (audio/GPU stability)
+qemu-darwin-disk-flush-barrier.patch         # guest flush = F_BARRIERFSYNC (data safety)
+qemu-darwin-surface-memory.patch             # display surfaces in anon memory, no temp files under BQL
+pingouin-cocoa-displays.patch                  # FORCED: multi-display windows; fullscreen-area and much later cocoa context depend on it
+qemu-cocoa-hidden-for-tests.patch            # FORCED: context for fullscreen-start; inert unless PINGOUIN_COCOA_HIDDEN/PINGOUIN_BACKGROUND
+qemu-virtio-gpu-display-event-race.patch     # no lost display event
+qemu-virtio-gpu-mapping-entries.patch        # big buffers in fragmented guest memory attach
+pingouin-cocoa-pointer-guard.patch             # FORCED: header used by fullscreen-edges (pure maths)
+pingouin-cocoa-fullscreen-edges.patch          # FORCED: include line is context for system-shortcuts & later; no Dock/menu bar/hot corner from fullscreen
+pingouin-cocoa-fullscreen-area.patch           # fullscreen keeps its size over guest reboots
+qemu-cocoa-gl-view-flush.patch               # glFlush after surface texture work (GPU memory leak)
+qemu-virgl-2d-resource-scanout.patch         # 2D/dumb buffers created as scanouts (memory-pressure treats them as screens)
+qemu-cocoa-gl-async-fence.patch              # async virgl fences with Cocoa GL (sync thread)
+qemu-virtio-gpu-blob-alignment.patch         # blob alignment for 16 KiB host pages
+qemu-cocoa-gl-present-on-flush.patch         # show frame when guest flushes (not on 30 ms tick)
+qemu-cocoa-gl-present-iosurface.patch        # IOSurface fast present path
+qemu-hvf-virgl-blob-subregion.patch          # no MAP_FIXED blob mappings under HVF
+qemu-virt-small-high-window.patch            # Venus on M1/M2: a small high PCIe window (highmem-mmio-size) so the hostmem BAR fits
+qemu-cocoa-gl-present-vsync.patch            # present on the display's refresh (120Hz, no judder)
+qemu-cocoa-gl-present-color.patch            # colour-space tagged frames (correct sRGB/P3); HDR parts opt-in
+pingouin-cocoa-shortcuts-logic.patch           # header for system-shortcuts
+pingouin-cocoa-system-shortcuts.patch          # macOS shortcuts go to the VM while it has the keyboard
+pingouin-cocoa-pointer-start-logic.patch       # header for pointer-start
+pingouin-cocoa-pointer-start.patch             # pointer taken without a click; Mac cursor hides once guest draws
+qemu-cocoa-idle-refresh.patch                # refresh tick slows when idle (power)
+pingouin-cocoa-graphics-memory.patch           # FORCED: context for fullpanel; adds memory lines to app menu
+pingouin-cocoa-restart-desktop.patch           # FORCED: context for fullpanel; adds Restart Desktop menu item
+pingouin-cocoa-boot-splash.patch               # boot splash (its art: pingouin-splash-penguin); context for clean-size/fullpanel
+pingouin-cocoa-fullscreen-own-space.patch      # fullscreen always in its own Space
+pingouin-cocoa-shutdown-events.patch           # no events into QEMU after display cleanup (quit crash fix)
+pingouin-cocoa-fullscreen-start.patch          # fullscreen start shows nothing until ready
+pingouin-cocoa-hw-cursor-logic.patch           # FORCED: header for hw-cursor
+pingouin-cocoa-hw-cursor.patch                 # FORCED: context for fullpanel, symbols used by cursor-stays-hidden; inert unless PINGOUIN_HW_CURSOR=1
+pingouin-cocoa-globe-key.patch                 # FORCED: context for fullpanel; globe key to VM ON by default, PINGOUIN_GLOBE_KEY=mac disables
+pingouin-cocoa-quit-clean.patch                # no self-quit; quit during boot presses power again
+pingouin-cocoa-clean-size-logic.patch          # FORCED: header for clean-size
+pingouin-cocoa-clean-size.patch                # FORCED: fullpanel edits its code; scale-step size snapping, opt-in PINGOUIN_CLEAN_SIZE=1 (cocoa-defaults)
+pingouin-cocoa-touchid-panel.patch             # FORCED: defines pingouin_touchid_up used by ime; inert unless PINGOUIN_TOUCHID_PANEL
+pingouin-cocoa-tap-permission.patch            # grab tap dropped when Accessibility revoked (stuck-keys fix)
+pingouin-cocoa-notch-park-logic.patch          # FORCED: header for notch-park
+pingouin-cocoa-notch-park.patch                # FORCED: context for fullpanel; pointer parking into Omanotch strip (fullscreen below notch)
+pingouin-cocoa-ime-logic.patch                 # FORCED: header for ime
+pingouin-cocoa-ime.patch                       # FORCED: context for fullpanel; inert unless PINGOUIN_IME_SOCKET
+pingouin-cocoa-fullpanel-logic.patch           # FullPanel decisions header
+pingouin-cocoa-fullpanel.patch                 # FullPanel: fullscreen over notch strip (PINGOUIN_FULLPANEL=1)
+pingouin-cocoa-fullpanel-scale-logic.patch     # FullPanel scale header
+pingouin-cocoa-fullpanel-scale.patch           # FullPanel at every scale without black bars
+pingouin-cocoa-fullpanel-window-gone.patch     # FullPanel crash fix when window freed (#402)
+pingouin-cocoa-keys-last.patch                 # FORCED: context for tap-no-ask; inert unless PINGOUIN_KEYS_LAST=1
+pingouin-cocoa-tap-no-ask.patch                # no "control this Mac" prompt at every start
+pingouin-cocoa-close-logic.patch               # FORCED: header for close
+pingouin-cocoa-close.patch                     # FORCED: context for modifier-state; default = shut down (as before), reads app.pingouin.Pingouin closeAction / PINGOUIN_CLOSE_ACTION
+pingouin-cocoa-present-unseen.patch            # no frames drawn for invisible window (power)
+pingouin-cocoa-idle-refresh-unseen.patch       # invisible window keeps slow tick
+pingouin-cocoa-modifier-state-logic.patch      # header for modifier-state
+pingouin-cocoa-modifier-state.patch            # modifier keys follow event flags (#412 stuck Shift)
+pingouin-cocoa-display-settle-logic.patch      # header for display-settle
+pingouin-cocoa-display-settle.patch            # windows follow displays once settled (#428 Space loop)
+pingouin-cocoa-fullpanel-retake-logic.patch    # header for fullpanel-retake
+pingouin-cocoa-fullpanel-retake.patch          # FullPanel retakes strip after display change
+pingouin-cocoa-fullpanel-late-arm-logic.patch  # header for late-arm
+pingouin-cocoa-fullpanel-late-arm.patch        # FullPanel when entered with lid closed (#716)
+qemu-audio-own-thread.patch                  # audio on its own RT thread (opt-in PINGOUIN_AUDIO_THREAD=1; fixes crackle under GPU load)
+qemu-cocoa-gl-present-bh-main-thread.patch   # present BH only on main-loop thread (race fix)
+qemu-console-gl-render-lock.patch            # GPU lock for AppKit-thread virgl draws
+qemu-cocoa-gl-context-depth.patch            # GL contexts don't read the 2D surface (race fix)
+qemu-virtio-gpu-virgl-unlocked.patch         # virgl runs without BQL (opt-in PINGOUIN_GPU_UNLOCKED=1)
+pingouin-cocoa-cursor-stays-hidden.patch       # Mac cursor stays hidden over the VM
+pingouin-cocoa-no-app-nap.patch                # no App Nap slowing the VM
+pingouin-cocoa-defaults.patch                  # Pingouin default: size snapping opt-in
+pingouin-splash-penguin.patch                  # boot splash: the icon's stripes + penguin, still, on by default
+
+[virglrenderer]   # 131 patches (OpenGL + Venus/Vulkan on MoltenVK; no video, no KosmicKrisp)
+TAP:virglrenderer-macos-unified.patch                   # tap base: virglrenderer on macOS (CGL)
+TAP:virglrenderer-venus-metal-func-ptrs.patch           # tap: Venus Metal function pointers
+TAP:virglrenderer-gallium-endian.patch                  # tap base: build fix on macOS
+TAP:virglrenderer-macos-a8-swizzle.patch                # tap: A8 format swizzle on core profile
+TAP:virglrenderer-corefoundation-link.patch             # tap: link CoreFoundation
+TAP:virglrenderer-a8-shader-swizzle.patch               # tap: A8 shader swizzle
+TAP:virglrenderer-a8-shader-swizzle-texture.patch       # tap: A8 shader swizzle (textures)
+TAP:virglrenderer-a8-unpack-alignment.patch             # tap: A8 unpack alignment
+TAP:virglrenderer-bgra-upload-swizzle-core.patch        # tap: BGRA uploads on core profile
+TAP:virglrenderer-msaa-assertion-fix.patch              # tap: MSAA assertion crash fix
+TAP:virglrenderer-ignore-surface0-clear.patch           # tap: ignore clear of surface 0
+TAP:virglrenderer-venus-errno-debug.patch               # tap: Venus errno debug output
+TAP:virglrenderer-macos-profile-forcing.patch           # tap: force core profile on macOS
+TAP:virglrenderer-macos-egl-profile.patch               # tap: profile selection on macOS
+TAP:virglrenderer-texture-swizzle-core.patch            # tap: texture swizzle emulation on core profile
+TAP:virglrenderer-bgra-unified.patch                    # tap: BGRA handling
+TAP:virglrenderer-core-profile-frag-datalocation.patch  # tap: frag data location on core profile
+TAP:virglrenderer-macos-core-profile-fixes.patch        # tap: misc core-profile fixes
+TAP:virglrenderer-gles-dual-source-output.patch         # tap: GLES dual-source blending (Alacritty and other terminals)
+virgl-native-opengl.patch                               # native OpenGL (CGL) path: browser compatibility
+virgl-texture-integer-samplers.patch                    # integer samplers compile (Chrome GPU process hang)
+virgl-transfer-row-size.patch                           # no transfer overruns guest buffer rows
+virgl-shader-failure-skip-draws.patch                   # refused shader skips draws instead of killing the context
+virgl-context-loss-report.patch                         # context loss reported to guest (GL robustness reset)
+virgl-shader-variant-null-checks.patch                  # fuzzer crash fix
+virgl-shader-size-limits.patch                          # fuzzer fix: no 4 GiB shader allocations
+virgl-venus-lost-context-fences.patch                   # a lost Venus context signals its fences instead of hanging the guest
+virgl-core-instance-id.patch                            # gl_InstanceID on core profile (instanced WebGL)
+virgl-transform-feedback-end.patch                      # crash fix in glEndTransformFeedback
+virgl-stream-output-checks.patch                        # fuzzer abort fix
+virgl-gl-error-skip-command.patch                       # GL error no longer kills context
+virgl-buffer-binding-checks.patch                       # GPU fault / macOS panic protection
+virgl-draw-range-checks.patch                           # GPU fault protection (draw ranges)
+virgl-uniform-buffer-checks.patch                       # GPU fault protection (UBOs)
+virgl-shader-index-clamp.patch                          # shader array indexes clamped (GPU fault protection)
+virgl-vertex-format-checks.patch                        # refuse vertex formats/offsets GL would refuse
+virgl-uniform-buffer-alignment.patch                    # UBO offset alignment
+virgl-uniform-block-array.patch                         # uniform block arrays bound as declared
+virgl-draw-gl-error-check.patch                         # GL error during draw setup skips the draw
+virgl-vertex-unused-first-input.patch                   # unused first vertex input fix
+virgl-resource-memory-budget.patch                      # guest GPU memory budget (runaway guest guard)
+virgl-control-queue-flush.patch                         # flush after resource/transfer cmds (Apple GL memory)
+virgl-venus-robust-buffer-access.patch                  # Venus devices always get robust buffer access
+virgl-resource-budget-context-loss.patch                # refused resource loses its context, not the VM
+virgl-venus-memory-budget.patch                         # Venus memory and shm blobs count against the GPU memory budget (shared budget API memory-pressure builds on)
+virgl-darwin-thread-sync.patch                          # eventfd emulation: async fences / sync thread on macOS
+virgl-darwin-fence-wait.patch                           # fence wait without spinning a core
+virgl-darwin-venus-in-process.patch                     # run the Venus render server in process on macOS
+virgl-fence-waiting-ctx.patch                           # fence of another context no longer lost on ctx destroy
+virgl-thread-sync-fallback.patch                        # poll fences if sync thread fails (guest hang fix)
+virgl-darwin-vulkan-beside.patch                        # load the Vulkan loader and driver from the app runtime
+virgl-darwin-stream-sockets.patch                       # stream sockets on macOS
+virgl-darwin-venus-heap-check.patch                     # fail a Metal export without a heap
+virgl-darwin-venus-metal-entrypoints.patch              # no Metal export or import without the entry points
+virgl-darwin-venus-ext-table.patch                      # keep the extension table in step
+virgl-darwin-venus-host-pages.patch                     # Metal-exported memory in whole host pages
+virgl-shader-core-glsl-version.patch                    # core profile GLSL version
+virgl-shader-shadow-lod-extension.patch                 # shadow lod extension on core
+virgl-shader-integer-outputs.patch                      # integer fragment outputs on core
+virgl-blitter-core-glsl-version.patch                   # blitter GLSL on core
+virgl-blitter-integer-msaa.patch                        # blitter integer MSAA
+virgl-framebuffer-no-attachments.patch                  # FBO without attachments
+virgl-caps-sampler-limit.patch                          # sampler limit caps
+virgl-darwin-fence-wait-busy.patch                      # sync thread doesn't spin during submits (CPU)
+virgl-darwin-memory-pressure.patch                      # guest GPU memory follows macOS memory pressure
+virgl-gpu-guard-desktop-reserve.patch                   # FORCED (lost-context-count builds on it): GPU memory reserve for the desktop; default list adds gnome-shell, kwin_wayland, plasmashell
+virgl-darwin-venus-moltenvk-zero-init.patch             # hide workgroup zero-init on MoltenVK
+virgl-set-type-without-egl.patch                        # dma-buf import (PIPE_RESOURCE_SET_TYPE) without EGL no longer kills compositor context
+virgl-use-program-cache.patch                           # perf: glUseProgram only on change (WebGL)
+virgl-gpu-guard-dropped-placeholder.patch               # FORCED (with desktop-reserve): a lost app's dropped buffer keeps an empty stand-in
+virgl-gpu-guard-critical-grace.patch                    # FORCED (with desktop-reserve): at critical memory pressure an app may replace its buffers
+virgl-legacy-vertex-cache.patch                         # perf: vertex state only on change (Apple GL)
+pingouin-virgl-index-range-cache-no-video.patch         # perf: index range read once per write (original minus its video-encoder hunk)
+virgl-transfer-upload-pbo.patch                         # perf: big uploads via PBO
+virgl-const-uniform-buffer.patch                        # perf: constants via UBOs
+virgl-vulkan-windows-iosurface.patch                    # Vulkan windows without a copy on macOS (IOSurface window buffers)
+virgl-darwin-context-switch-flush.patch                 # flush before CGL context switch (frame-late fix)
+virgl-shader-sampler-swizzle.patch                      # sampler swizzle in GLSL (Mac refused shader)
+virgl-const-buffer0-resource.patch                      # const buffer 0 as guest buffer (read zeros)
+virgl-shader-array-sampler-2d-view.patch                # 2D view behind 2D_ARRAY sampler
+virgl-view-swizzle-shared-texture.patch                 # per-view swizzles on a shared texture
+virgl-sysval-block-check.patch                          # assert abort fix (#547)
+virgl-query-results-init.patch                          # no stack bytes in logs/pipeline status
+virgl-query-result-unanswered.patch                     # unanswered query no longer hangs guest
+virgl-shader-separable-pervertex.patch                  # separable shaders link on Apple GL
+virgl-pipeline-validate-log.patch                       # invalid pipeline logged, context survives
+virgl-shader-clip-distances.patch                       # clip distances without cull distances (GL 4.1)
+virgl-shader-arrays-of-arrays.patch                     # arrays_of_arrays only where supported
+virgl-caps-tess-outputs.patch                           # tess output limits reported
+virgl-shader-separable-patch-varyings.patch             # separable patch varyings on Apple GL
+virgl-shader-tess-clip-varyings.patch                   # tess clip varyings (Metal pipeline crash)
+virgl-shader-vs-tes-clip-varyings.patch                 # VS->TES clip varyings
+virgl-shader-separable-patch-fill-writes.patch          # padding patch varyings written
+virgl-shader-indirect-temps.patch                       # indirect temps as arrays
+virgl-shader-vs-tcs-clip-varyings.patch                 # VS->TCS clip varyings
+virgl-shader-clip-copyback.patch                        # clip distances 4..7 copy-back
+virgl-venus-linear-modifier-usage.patch                 # Venus asks the host about the LINEAR modifier with INPUT_ATTACHMENT
+virgl-venus-image-limits.patch                          # Venus image descriptions, binds and layout queries within the host's limits
+virgl-venus-view-limits.patch                           # Venus views and samplers within their image, buffer and enums
+virgl-venus-missing-entries.patch                       # Venus proc table entries are never NULL
+virgl-venus-guest-asserts.patch                         # Venus refuses what reached vkr's asserts
+virgl-venus-buffer-binds.patch                          # Venus buffer binds stay inside their memory
+virgl-venus-lost-context-count.patch                    # a lost Venus context counts in the status file, with its app's name
+virgl-venus-command-limits.patch                        # Venus vkCmd* indices, counts and offsets stay inside what they name
+virgl-venus-descriptor-limits.patch                     # Venus descriptor sets and pipeline layouts stay inside what the driver sized
+virgl-venus-render-pass-limits.patch                    # Venus render passes, framebuffers and begins stay inside the pass
+virgl-venus-pipeline-limits.patch                       # Venus pipeline create infos stay inside what the driver indexes
+virgl-venus-command-state.patch                         # Venus commands come where Vulkan allows them
+virgl-venus-spirv-scan.patch                            # Venus SPIR-V is scanned before the Mac's shader compilers
+virgl-venus-copy-regions.patch                          # Venus copies, blits and resolves stay inside their images and buffers
+virgl-venus-pipeline-formats.patch                      # Venus attachment formats are ones the device renders to
+virgl-venus-submit-counts.patch                         # Venus submit chains fit the submit's counts
+virgl-venus-pool-frees.patch                            # Venus frees name objects of their own pool, once
+virgl-venus-dedicated-memory.patch                      # Venus dedicated memory goes before its image or buffer
+virgl-venus-temp-zero.patch                             # Venus replies carry zeros where nothing was written
+virgl-venus-thread-budget.patch                         # Venus guest threads stay inside one budget
+virgl-venus-pass-views.patch                            # Venus pass views live while the pass is open
+virgl-venus-test-pause.patch                            # Venus test hook (NULL in QEMU) for the cross-ring tests; ring-lock is written on it
+virgl-venus-ring-lock.patch                             # Venus rings of one app take turns on its objects
+virgl-venus-command-holds.patch                         # Venus command buffers hold the views their passes named
+virgl-venus-secondary-holds.patch                       # Venus primaries hold the secondaries they executed
+virgl-venus-chain-repeats.patch                         # Venus refuses a structure type twice in a chain
+virgl-venus-ignored-values.patch                        # Venus takes values Vulkan ignores, refuses blend states the drivers read past
+virgl-venus-unset-state.patch                           # Venus refuses draws with a descriptor set or index buffer never bound
+virgl-venus-alias-memory.patch                          # Venus binds an app's image to a swapchain's memory on both drivers
+virgl-venus-disjoint-alias-format.patch                 # Venus makes an image that aliases one plane of a disjoint YCbCr image on MoltenVK
+virgl-venus-spirv-validate.patch                        # Venus validates guest SPIR-V with SPIRV-Tools after the scan
+virgl-venus-encoder-cap.patch                           # Venus ends an app's context before Metal ends QEMU on too many passes
+virgl-venus-host-memory.patch                           # Venus charges recordings and objects for the Mac memory they take
+virgl-venus-submit-state.patch                          # Venus submits only primaries the guest ended, whose secondaries are what they executed
+virgl-venus-refusal-text.patch                          # Venus logs a refusal's reason whole
+
+[spirv-tools]   # 3 patches (SPIRV-Tools 2026.3, the validator Venus runs on guest SPIR-V)
+spirv-tools-val-catch-throws.patch            # validator ends in an error, never the process or the clock
+spirv-tools-val-function-private-layout.patch # layout decorations on Function/Private types at every SPIR-V version (MoltenVK accepts them)
+spirv-tools-val-no-debug-source.patch         # messages leave out the shader's debug source

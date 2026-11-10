@@ -1,0 +1,218 @@
+virglrenderer: the blitter's shaders use a GLSL version core profiles accept
+
+What: the GL blitter's desktop shaders were "#version 130". The version line now
+follows the host's GLSL version, the same number the shader translator gets
+(vrend_renderer_get_glsl_version(), new): 4.00 if the host has it (macOS: 4.10),
+1.50 from 1.50, else 1.30 as before. The ARB_texture_multisample (colour and
+depth multisample blits) and ARB_texture_cube_map_array "#extension" lines are
+left out where that version has them in core, and depth blits from cube map
+arrays get the cube map array line below 4.00 (they did not compile there,
+an upstream bug). GLES is unchanged.
+Why: Apple's core profile refuses GLSL 1.30, so the blit vertex shader failed at
+every QEMU start ("version '130' is not supported") and every blit that needs a
+shader (format conversion, swizzle, sRGB, depth, multisample resolve to another
+format) drew nothing.
+Upstreamable; not sent.
+Tests: Tests/virgl/test-blitter-shaders.c (builds the blitter's real shaders for
+every target and type with the Mac's OpenGL and links them; depth blits also
+at GLSL 1.50).
+--- a/src/vrend/vrend_blitter.c
++++ b/src/vrend/vrend_blitter.c
+@@ -62,6 +62,9 @@
+    virgl_gl_context gl_context;
+    bool initialised;
+    bool use_gles;
++   /* desktop GL: GLSL version of the blit shaders and their #version line */
++   int glsl_ver;
++   char glsl_header[16];
+ 
+    GLuint vaoid;
+ 
+@@ -123,11 +126,13 @@
+    return pu.u;
+ }
+ 
+-static GLint blit_shader_build_and_check(GLenum shader_type, const char *buf)
++static GLint blit_shader_build_and_check(const struct vrend_blitter_ctx *blit_ctx,
++                                         GLenum shader_type, const char *buf)
+ {
+    GLint param;
+    GLint id = glCreateShader(shader_type);
+-   glShaderSource(id, 1, (const char **)&buf, NULL);
++   const char *sources[] = { blit_ctx->glsl_header, buf };
++   glShaderSource(id, 2, sources, NULL);
+    glCompileShader(id);
+ 
+    glGetShaderiv(id, GL_COMPILE_STATUS, &param);
+@@ -136,7 +141,7 @@
+       int len;
+       glGetShaderInfoLog(id, 65536, &len, infolog);
+       virgl_error("Shader failed to compile\n%s\n", infolog);
+-      virgl_error("GLSL:\n%s\n", buf);
++      virgl_error("GLSL:\n%s%s\n", blit_ctx->glsl_header, buf);
+       glDeleteShader(id);
+       return 0;
+    }
+@@ -286,13 +291,14 @@
+    const char *ext_str = "";
+    bool msaa = nr_samples > 1;
+ 
+-   if (msaa && !blit_ctx->use_gles)
+-      ext_str = "#extension GL_ARB_texture_multisample : enable\n";
+-   else if (tgsi_tex_target == TGSI_TEXTURE_CUBE_ARRAY ||
+-            tgsi_tex_target == TGSI_TEXTURE_SHADOWCUBE_ARRAY) {
++   if (msaa && !blit_ctx->use_gles) {
++      if (blit_ctx->glsl_ver < 150)
++         ext_str = "#extension GL_ARB_texture_multisample : enable\n";
++   } else if (tgsi_tex_target == TGSI_TEXTURE_CUBE_ARRAY ||
++              tgsi_tex_target == TGSI_TEXTURE_SHADOWCUBE_ARRAY) {
+       if (blit_ctx->use_gles)
+          ext_str = "#extension GL_EXT_texture_cube_map_array : require\n";
+-      else
++      else if (blit_ctx->glsl_ver < 400)
+          ext_str = "#extension GL_ARB_texture_cube_map_array : require\n";
+    }
+ 
+@@ -338,7 +344,7 @@
+    VREND_DEBUG(dbg_blit, NULL, "-- Blit FS color shader MSAA: %d -----------------\n"
+                "%s\n---------------------------------------\n", msaa, shader_buf);
+ 
+-   return blit_shader_build_and_check(GL_FRAGMENT_SHADER, shader_buf);
++   return blit_shader_build_and_check(blit_ctx, GL_FRAGMENT_SHADER, shader_buf);
+ }
+ 
+ static GLuint blit_build_frag_depth(struct vrend_blitter_ctx *blit_ctx, enum tgsi_texture_type tgsi_tex_target, bool msaa)
+@@ -352,19 +358,28 @@
+ 
+    blit_get_swizzle(tgsi_tex_target, flags, &swizzle_and_type);
+ 
+-   if (msaa)
+-      snprintf(shader_buf, 4096, blit_ctx->use_gles ?
+-                                 (swizzle_and_type.is_array ?  FS_TEXFETCH_DS_MSAA_ARRAY_GLES :  FS_TEXFETCH_DS_MSAA_GLES)
+-                                 : FS_TEXFETCH_DS_MSAA_GL,
+-         vrend_shader_samplertypeconv(blit_ctx->use_gles, tgsi_tex_target), swizzle_and_type.type, swizzle_and_type.swizzle);
++   if (msaa && !blit_ctx->use_gles)
++      snprintf(shader_buf, 4096, FS_TEXFETCH_DS_MSAA_GL,
++               blit_ctx->glsl_ver < 150 ? "#extension GL_ARB_texture_multisample : enable\n" : "",
++               vrend_shader_samplertypeconv(blit_ctx->use_gles, tgsi_tex_target), swizzle_and_type.type, swizzle_and_type.swizzle);
++   else if (msaa)
++      snprintf(shader_buf, 4096,
++               swizzle_and_type.is_array ? FS_TEXFETCH_DS_MSAA_ARRAY_GLES : FS_TEXFETCH_DS_MSAA_GLES,
++               vrend_shader_samplertypeconv(blit_ctx->use_gles, tgsi_tex_target), swizzle_and_type.type, swizzle_and_type.swizzle);
++   else if (!blit_ctx->use_gles)
++      snprintf(shader_buf, 4096, FS_TEXFETCH_DS_GL,
++               (tgsi_tex_target == TGSI_TEXTURE_CUBE_ARRAY ||
++                tgsi_tex_target == TGSI_TEXTURE_SHADOWCUBE_ARRAY) && blit_ctx->glsl_ver < 400 ?
++                  "#extension GL_ARB_texture_cube_map_array : require\n" : "",
++               vrend_shader_samplertypeconv(blit_ctx->use_gles, tgsi_tex_target), swizzle_and_type.swizzle);
+    else
+-      snprintf(shader_buf, 4096, blit_ctx->use_gles ? FS_TEXFETCH_DS_GLES : FS_TEXFETCH_DS_GL,
++      snprintf(shader_buf, 4096, FS_TEXFETCH_DS_GLES,
+          vrend_shader_samplertypeconv(blit_ctx->use_gles, tgsi_tex_target), swizzle_and_type.swizzle);
+ 
+    VREND_DEBUG(dbg_blit, NULL, "-- Blit FS depth shader MSAA: %d -----------------\n"
+                "%s\n---------------------------------------\n", msaa, shader_buf);
+ 
+-   return blit_shader_build_and_check(GL_FRAGMENT_SHADER, shader_buf);
++   return blit_shader_build_and_check(blit_ctx, GL_FRAGMENT_SHADER, shader_buf);
+ }
+ 
+ static GLuint blit_get_frag_tex_writedepth(struct vrend_blitter_ctx *blit_ctx, enum pipe_texture_target pipe_tex_target, unsigned nr_samples)
+@@ -453,6 +468,20 @@
+    return prog_id;
+ }
+ 
++/* GLES shaders carry their own #version. On desktop GL, core profiles need
++ * not accept GLSL 1.30 (macOS refuses it), so use the newest version the blit
++ * shaders need that the host supports (the version the shader translator gets,
++ * vrend_renderer_get_glsl_version()): 4.00 makes cube map arrays core, 1.50
++ * multisample textures. */
++static void blit_set_glsl_version(struct vrend_blitter_ctx *blit_ctx, int host_glsl_ver)
++{
++   if (blit_ctx->use_gles)
++      return;
++   blit_ctx->glsl_ver = host_glsl_ver >= 400 ? 400 : host_glsl_ver >= 150 ? 150 : 130;
++   snprintf(blit_ctx->glsl_header, sizeof(blit_ctx->glsl_header),
++            "#version %d\n", blit_ctx->glsl_ver);
++}
++
+ static void vrend_renderer_init_blit_ctx(struct vrend_blitter_ctx *blit_ctx)
+ {
+    struct virgl_gl_ctx_param ctx_params;
+@@ -482,11 +511,12 @@
+    }
+ 
+    vrend_sync_make_current(blit_ctx->gl_context);
++   blit_set_glsl_version(blit_ctx, vrend_renderer_get_glsl_version());
+    glGenVertexArrays(1, &blit_ctx->vaoid);
+    glGenFramebuffers(1, &blit_ctx->fb_id);
+ 
+    glGenBuffers(1, &blit_ctx->vbo_id);
+-   blit_ctx->vs = blit_shader_build_and_check(GL_VERTEX_SHADER,
++   blit_ctx->vs = blit_shader_build_and_check(blit_ctx, GL_VERTEX_SHADER,
+         blit_ctx->use_gles ? VS_PASSTHROUGH_GLES : VS_PASSTHROUGH_GL);
+ 
+    for (i = 0; i < 4; i++) {
+--- a/src/vrend/vrend_blitter.h
++++ b/src/vrend/vrend_blitter.h
+@@ -27,10 +27,10 @@
+ #include "util/os_misc.h"
+ #include "util/macros.h"
+ 
+-/* shaders for blitting */
++/* shaders for blitting; desktop GL shaders get their #version line from
++ * the blitter (blit_ctx->glsl_header) */
+ 
+ #define FS_HEADER_GL                               \
+-   "#version 130\n"                             \
+    "// Blitter\n"                               \
+    "%s"                                         \
+ 
+@@ -54,7 +54,6 @@
+    "precision mediump float;\n"                 \
+ 
+ #define HEADER_GL                               \
+-   "#version 130\n"                             \
+    "// Blitter\n"                               \
+ 
+ #define HEADER_GLES                             \
+@@ -166,11 +165,11 @@
+    "   gl_FragDepth = float(texture(samp, tc%s).x);\n"  \
+    "}\n"
+ 
+-#define FS_TEXFETCH_DS_GL HEADER_GL FS_TEXFETCH_DS_BODY
++#define FS_TEXFETCH_DS_GL HEADER_GL "%s" FS_TEXFETCH_DS_BODY
+ #define FS_TEXFETCH_DS_GLES HEADER_GLES FS_TEXFETCH_DS_BODY
+ 
+ #define FS_TEXFETCH_DS_MSAA_BODY                                         \
+-   "#extension GL_ARB_texture_multisample : enable\n"                    \
++   "%s"                                                                  \
+    "uniform sampler%s samp;\n"                                           \
+    "in vec4 tc;\n"                                                       \
+    "void main() {\n"                                                     \
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -12551,6 +12551,12 @@
+    }
+ 
+    return (major_local * 100) + minor_local;
++}
++
++/* the host's GLSL version, as the shader translator gets it (e.g. 410), or -1 */
++int vrend_renderer_get_glsl_version(void)
++{
++   return get_glsl_version();
+ }
+ 
+ static void vrend_fill_caps_glsl_version(int gl_ver, int gles_ver,
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -212,6 +212,8 @@
+ vrend_renderer_get_pipe_callbacks(void);
+ 
+ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags);
++
++int vrend_renderer_get_glsl_version(void);
+ 
+ void vrend_insert_format(struct vrend_format_table *entry, uint32_t bindings, uint32_t flags);
+ bool vrend_check_framebuffer_mixed_color_attachements(void);

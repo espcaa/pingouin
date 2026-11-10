@@ -1,0 +1,259 @@
+From: OmacVM
+Subject: [PATCH] cocoa: the refresh tick slows down while it has nothing to do
+
+What: QEMU's display refresh timer (gui_update) runs at the Mac display's
+rate for every listener (8 ms on a 120 Hz panel). It now slows to 2 s
+after a second without work for it: a 2D update or a new scanout (boot,
+consoles), an update of an extra output's window (those draw on the tick),
+a main-window frame not shown yet, or PINGOUIN_GL_PRESENT_ON_TICK. The next
+such update brings the display's rate back at once (QEMU re-arms the timer
+when a listener's interval drops). The main window's GL frames do not
+count: dpy_gl_update puts them on screen (or the present timer and the
+display link do), so a blinking cursor keeps the slow tick.
+PINGOUIN_IDLE_REFRESH=0 keeps the display's rate. GL mode only; QEMU's log
+says which.
+
+Why: with virtio-gpu the tick has nothing to do while the screen does not
+change (the device's gfx_update does nothing). It only checked the
+pasteboard and woke QEMU's main loop 60-120 times a second on an idle
+Omarchy desktop, also with the window minimised or hidden.
+The slow tick was 500 ms at first; 2 s since idle-power round 4 (nothing
+it still does at idle is needed sooner: two more wakeups a second saved).
+
+Upstream: not sent (QEMU's VNC server slows its own refresh the same way;
+the Cocoa GL present path and OmacVM's extra outputs are OmacVM patches).
+Test: Tests/display/test-idle-refresh.c runs the rate logic, taken from the
+patched ui/cocoa.m, in every build. Idle wakeups and CPU of QEMU per process
+(proc_pid_rusage) before and after, window shown and minimised (numbers in
+the idle-power PR); a notification and a console switch after idle still
+show at once. Applies after qemu-cocoa-gl-present-color.patch.
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -99,6 +99,8 @@ static void cocoa_switch(DisplayChangeListener *dcl,
+                          DisplaySurface *surface);
+ 
+ static void cocoa_refresh(DisplayChangeListener *dcl);
++static void cocoa_refresh_set(DisplayChangeListener *l, int output, uint64_t ms);
++static void cocoa_refresh_activity(void);
+ static void cocoa_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on);
+ static void cocoa_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor);
+ 
+@@ -971,8 +973,7 @@ - (void) updateUIInfoLocked
+         }
+ 
+         if (refreshRate) {
+-            qemu_console_listener_set_refresh(&dcl,
+-                                              MAX(1u, 1000000u / refreshRate));
++            cocoa_refresh_set(&dcl, 0, MAX(1u, 1000000u / refreshRate));
+             info.refresh_rate = refreshRate;
+         }
+ 
+@@ -3023,6 +3024,7 @@ static void cocoa_gl_update(DisplayChangeListener *dcl,
+         surface_gl_update_texture(dgc.gls, surface, x, y, w, h);
+         gl_dirty = true;
+     });
++    cocoa_refresh_activity();
+ }
+ 
+ static void cocoa_gl_switch(DisplayChangeListener *dcl,
+@@ -3035,6 +3037,7 @@ static void cocoa_gl_switch(DisplayChangeListener *dcl,
+ 
+     cocoa_switch(dcl, new_surface);
+     gl_dirty = true;
++    cocoa_refresh_activity();
+ }
+ 
+ static void cocoa_gl_render(void)
+@@ -4150,9 +4153,12 @@ - (void)tick:(CADisplayLink *)link
+ }
+ @end
+ 
++static void cocoa_refresh_tick(bool pending);
++
+ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
+ {
+     cocoa_refresh(dcl);
++    cocoa_refresh_tick(gl_dirty);
+ 
+     if (gl_dirty) {
+ 
+@@ -4188,6 +4194,7 @@ static void cocoa_gl_scanout_disable(DisplayChangeListener *dcl)
+ {
+     gl_scanout_borrow = NULL;
+     gl_dirty = true;
++    cocoa_refresh_activity();
+ 
+     cocoa_gl_log("scanout disable");
+ }
+@@ -4201,6 +4208,7 @@ static void cocoa_gl_scanout_texture(DisplayChangeListener *dcl,
+     gl_scanout_id = backing_id;
+     gl_scanout_borrow = backing_borrow;
+     gl_dirty = true;
++    cocoa_refresh_activity();
+ 
+     cocoa_gl_log("scanout texture id=%u region=%ux%u+%u+%u",
+                  backing_id, w, h, x, y);
+@@ -4229,6 +4237,7 @@ static void cocoa_gl_scanout_flush(DisplayChangeListener *dcl,
+ #endif
+     if (on_tick) {
+         /* cocoa_gl_refresh draws it. */
++        cocoa_refresh_activity();
+     } else if (present_ctx) {
+         if (present_vsync) {
+             os_unfair_lock_lock(&present_lock);
+@@ -4329,6 +4338,104 @@ static bool pingouin_is_head_console(unsigned int index)
+ static bool pingouin_guest_known;
+ static NSString *pingouin_last_layout;
+ 
++/*
++ * QEMU's refresh tick (gui_update) runs at the Mac display's rate for every
++ * listener: 120 wakeups a second on a ProMotion panel, also while the guest
++ * shows nothing new. With virtio-gpu the main window's GL frames do not need
++ * it (dpy_gl_update puts them on screen, or the present timer and display
++ * link do) and the device's gfx_update does nothing. What still needs the
++ * tick: 2D updates and new scanouts (boot, consoles), the extra outputs'
++ * windows (drawn on the tick), a frame that could not be shown yet, and
++ * PINGOUIN_GL_PRESENT_ON_TICK. After a second without any of these the
++ * listeners tick every 2 s; the next one brings the display's rate back
++ * at once (re-arming the timer). A blinking cursor or a clock on the main
++ * output keeps the slow tick. PINGOUIN_IDLE_REFRESH=0 keeps the display's
++ * rate. Only in GL mode: other devices may need the tick to see changes.
++ * All of it with the BQL.
++ */
++#define COCOA_REFRESH_SLOW_MS  2000
++#define COCOA_REFRESH_QUIET_MS 1000
++static uint64_t cocoa_refresh_fast[PINGOUIN_MAX_OUTPUTS];   /* 0: QEMU's default */
++static bool cocoa_refresh_slow;
++static bool cocoa_refresh_busy;           /* an update since the last tick */
++static int64_t cocoa_refresh_busy_ms;
++
++static bool cocoa_refresh_idle_enabled(void)
++{
++    static int on = -1;
++
++    if (on < 0) {
++        const char *e = getenv("PINGOUIN_IDLE_REFRESH");
++        on = display_opengl && !(e && !strcmp(e, "0"));
++        info_report("cocoa: refresh tick %s", on
++                    ? "every 2 s while nothing changes on screen"
++                    : "at the display's rate (PINGOUIN_IDLE_REFRESH=0)");
++    }
++    return on;
++}
++
++static uint64_t cocoa_refresh_interval(int output)
++{
++    uint64_t ms = cocoa_refresh_fast[output];
++
++    if (cocoa_refresh_slow) {
++        ms = MAX(ms ? ms : GUI_REFRESH_INTERVAL_DEFAULT, COCOA_REFRESH_SLOW_MS);
++    }
++    return ms;
++}
++
++static void cocoa_refresh_apply(void)
++{
++    for (int i = 0; i < pingouin_outputs; i++) {
++        DisplayChangeListener *l = i ? &pingouin_heads[i].dcl : &dcl;
++
++        if (l->ds) {
++            qemu_console_listener_set_refresh(l, cocoa_refresh_interval(i));
++        }
++    }
++}
++
++/* The listener's rate while the guest draws: the display's refresh. */
++static void cocoa_refresh_set(DisplayChangeListener *l, int output, uint64_t ms)
++{
++    cocoa_refresh_fast[output] = ms;
++    qemu_console_listener_set_refresh(l, cocoa_refresh_interval(output));
++}
++
++/* A display update: tick at the display's rate again. */
++static void cocoa_refresh_activity(void)
++{
++    cocoa_refresh_busy = true;
++    if (cocoa_refresh_slow) {
++        cocoa_refresh_slow = false;
++        cocoa_refresh_apply();
++    }
++}
++
++/*
++ * Every tick of the main listener (inside gui_update). pending: the main
++ * window has a frame it has not shown yet (this tick tries again).
++ */
++static void cocoa_refresh_tick(bool pending)
++{
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++
++    if (!cocoa_refresh_idle_enabled()) {
++        return;
++    }
++    if (pending) {
++        cocoa_refresh_activity();
++    }
++    if (cocoa_refresh_busy) {
++        cocoa_refresh_busy = false;
++        cocoa_refresh_busy_ms = now;
++    } else if (!cocoa_refresh_slow &&
++               now - cocoa_refresh_busy_ms >= COCOA_REFRESH_QUIET_MS) {
++        cocoa_refresh_slow = true;
++        cocoa_refresh_apply();
++    }
++}
++
+ static void pingouin_send_layout(void);
+ static void pingouin_full_next(void);
+ 
+@@ -4720,6 +4827,7 @@ static void pingouin_head_gfx_update(DisplayChangeListener *dcl,
+         surface_gl_update_texture(dgc.gls, hd->surface, x, y, w, h);
+     });
+     hd->dirty = true;
++    cocoa_refresh_activity();
+ }
+ 
+ static void pingouin_head_gfx_switch(DisplayChangeListener *dcl,
+@@ -4735,6 +4843,7 @@ static void pingouin_head_gfx_switch(DisplayChangeListener *dcl,
+     });
+     hd->surface = new_surface;
+     hd->dirty = true;
++    cocoa_refresh_activity();
+ }
+ 
+ static void pingouin_head_refresh(DisplayChangeListener *dcl)
+@@ -4756,6 +4865,7 @@ static void pingouin_head_scanout_disable(DisplayChangeListener *dcl)
+ 
+     hd->borrow = NULL;
+     hd->dirty = true;
++    cocoa_refresh_activity();
+ }
+ 
+ static void pingouin_head_scanout_texture(DisplayChangeListener *dcl,
+@@ -4769,6 +4879,7 @@ static void pingouin_head_scanout_texture(DisplayChangeListener *dcl,
+     hd->scanout_id = backing_id;
+     hd->borrow = backing_borrow;
+     hd->dirty = true;
++    cocoa_refresh_activity();
+ }
+ 
+ static void pingouin_head_scanout_flush(DisplayChangeListener *dcl,
+@@ -4776,6 +4887,7 @@ static void pingouin_head_scanout_flush(DisplayChangeListener *dcl,
+                                       uint32_t w, uint32_t h)
+ {
+     ((PingouinHead *)dcl)->dirty = true;
++    cocoa_refresh_activity();
+ }
+ 
+ static const DisplayChangeListenerOps pingouin_head_gl_ops = {
+@@ -5127,8 +5239,8 @@ static void pingouin_heads_ui_info(void)
+     with_bql(^{
+         for (int i = 1; i < pingouin_outputs; i++) {
+             if (prefresh[i]) {
+-                qemu_console_listener_set_refresh(&pingouin_heads[i].dcl,
+-                                                  MAX(1u, 1000000u / prefresh[i]));
++                cocoa_refresh_set(&pingouin_heads[i].dcl, i,
++                                  MAX(1u, 1000000u / prefresh[i]));
+             }
+             qemu_console_set_ui_info(pingouin_heads[i].dcl.con, &pinfos[i], false);
+         }

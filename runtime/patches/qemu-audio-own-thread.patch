@@ -1,0 +1,953 @@
+From: OmacVM
+Subject: [PATCH] audio: the sound on its own real-time thread (HDA DMA, mixer)
+
+What: with PINGOUIN_AUDIO_THREAD=1 the HDA codec's DMA timers and the
+mixer's audio timer run as ticks on one thread of their own
+(audio/audio-rt.c, "pingouin-audio"), every 1 ms at macOS's time-constraint
+policy (user-interactive QoS if refused), instead of in QEMU's main loop.
+The thread never takes the BQL. One recursive lock, audio_rt_lock(),
+guards what the ticks touch: the mixer (every audio_be_* call takes it),
+the HDA codec's streams and the HDA controller's stream registers (its
+MMIO handlers take it). Lock order: BQL, audio lock, a backend's own lock.
+On the thread the controller's DMA goes straight to guest RAM under RCU
+(anything that is not RAM fails the transfer instead of taking the BQL),
+and its buffer-completion interrupt is raised from a bottom half. The
+thread sleeps while no stream runs or the VM is stopped. qemu.log:
+"OmacVM: sound path: own audio thread" (or "QEMU's main loop") at the
+start, "OmacVM: sound: own audio thread, <policy>, every 1000 us" when it
+starts. Without the variable nothing changes (the lock is a no-op).
+PINGOUIN_AUDIO_THREAD_PERIOD_US (250-10000) is for measurements.
+
+Why: the main loop also runs the VM's GPU (virgl) and competes with every
+vCPU for the Mac's cores. Each time it ran late, the sound card's DMA and
+the mixer stopped, QEMU's 93 ms ring drained, and refilled at 1/32 of real
+time: stalls in a row (an app opening, a page scrolling) added up to a
+break. On its own thread the sound no longer waits for the GPU.
+
+With the main loop out of the way QEMU's ring only has to cover the
+thread's own jitter: the app uses a 32 ms ring at 48 kHz instead of 93 ms.
+While the main loop holds the BQL, vCPUs that leave the guest still wait
+for it; the guest's own buffers cover that, as before.
+
+Applies after qemu-hda-no-catch-up.patch and the SDL audio patches.
+Upstream: not sent (OmacVM only for now; the env switch is ours).
+Test: app/runtime/Tests/audio (measure.sh, glitches.py), the audio lane's
+notes (work/tracks/audio-crackle.md, 2026-10-16) have the runs;
+src/tests/audio-timing.sh checks the wiring.
+
+--- a/include/qemu/audio.h
++++ b/include/qemu/audio.h
+@@ -240,4 +240,23 @@
+ #define TYPE_AUDIO_BACKEND "audio-backend"
+ OBJECT_DECLARE_TYPE(AudioBackend, AudioBackendClass, AUDIO_BACKEND)
+ 
++/*
++ * Pingouin: the sound's own real-time thread (audio/audio-rt.c), on with
++ * PINGOUIN_AUDIO_THREAD=1. A tick runs every period on that thread with the
++ * audio lock held; the lock guards the mixer and the sound devices' state.
++ */
++typedef struct AudioRtTick {
++    void (*fn)(void *opaque);
++    void *opaque;
++    bool registered;
++} AudioRtTick;
++
++bool audio_rt_enabled(void);
++void audio_rt_lock(void);
++void audio_rt_unlock(void);
++bool audio_rt_on_thread(void);
++void audio_rt_tick_add(AudioRtTick *t, void (*fn)(void *), void *opaque);
++void audio_rt_tick_del(AudioRtTick *t);
++int64_t audio_rt_period(void);
++
+ #endif /* QEMU_AUDIO_H */
+--- a/audio/meson.build
++++ b/audio/meson.build
+@@ -3,6 +3,7 @@
+   'audio.c',
+   'audio-be.c',
+   'audio-mixeng-be.c',
++  'audio-rt.c',
+   'mixeng.c',
+   'noaudio.c',
+   'wavaudio.c',
+--- a/audio/audio-be.c
++++ b/audio/audio-be.c
+@@ -1,4 +1,8 @@
+ /* SPDX-License-Identifier: MIT */
++/*
++ * Pingouin: every call takes the audio lock (audio/audio-rt.c): with the
++ * sound on its own thread the mixer is no longer guarded by the BQL alone.
++ */
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/audio.h"
+@@ -35,7 +39,12 @@
+     assert(callback_fn != NULL);
+     assert(as != NULL);
+ 
+-    return klass->open_in(be, sw, name, callback_opaque, callback_fn, as);
++    SWVoiceIn *ret;
++
++    audio_rt_lock();
++    ret = klass->open_in(be, sw, name, callback_opaque, callback_fn, as);
++    audio_rt_unlock();
++    return ret;
+ }
+ 
+ SWVoiceOut *audio_be_open_out(
+@@ -52,7 +61,12 @@
+     assert(callback_fn != NULL);
+     assert(as != NULL);
+ 
+-    return klass->open_out(be, sw, name, callback_opaque, callback_fn, as);
++    SWVoiceOut *ret;
++
++    audio_rt_lock();
++    ret = klass->open_out(be, sw, name, callback_opaque, callback_fn, as);
++    audio_rt_unlock();
++    return ret;
+ }
+ 
+ void audio_be_close_out(AudioBackend *be, SWVoiceOut *sw)
+@@ -63,7 +77,9 @@
+         return;
+     }
+ 
+-    return klass->close_out(be, sw);
++    audio_rt_lock();
++    klass->close_out(be, sw);
++    audio_rt_unlock();
+ }
+ 
+ void audio_be_close_in(AudioBackend *be, SWVoiceIn *sw)
+@@ -74,7 +90,9 @@
+         return;
+     }
+ 
+-    return klass->close_in(be, sw);
++    audio_rt_lock();
++    klass->close_in(be, sw);
++    audio_rt_unlock();
+ }
+ 
+ bool audio_be_is_active_out(AudioBackend *be, SWVoiceOut *sw)
+@@ -85,7 +103,12 @@
+         return false;
+     }
+ 
+-    return klass->is_active_out(be, sw);
++    bool ret;
++
++    audio_rt_lock();
++    ret = klass->is_active_out(be, sw);
++    audio_rt_unlock();
++    return ret;
+ }
+ 
+ bool audio_be_is_active_in(AudioBackend *be, SWVoiceIn *sw)
+@@ -96,7 +119,12 @@
+         return false;
+     }
+ 
+-    return klass->is_active_in(be, sw);
++    bool ret;
++
++    audio_rt_lock();
++    ret = klass->is_active_in(be, sw);
++    audio_rt_unlock();
++    return ret;
+ }
+ 
+ size_t audio_be_write(AudioBackend *be, SWVoiceOut *sw, void *buf, size_t size)
+@@ -107,7 +135,12 @@
+         return 0;
+     }
+ 
+-    return klass->write(be, sw, buf, size);
++    size_t ret;
++
++    audio_rt_lock();
++    ret = klass->write(be, sw, buf, size);
++    audio_rt_unlock();
++    return ret;
+ }
+ 
+ size_t audio_be_read(AudioBackend *be, SWVoiceIn *sw, void *buf, size_t size)
+@@ -118,7 +151,12 @@
+         return 0;
+     }
+ 
+-    return klass->read(be, sw, buf, size);
++    size_t ret;
++
++    audio_rt_lock();
++    ret = klass->read(be, sw, buf, size);
++    audio_rt_unlock();
++    return ret;
+ }
+ 
+ int audio_be_get_buffer_size_out(AudioBackend *be, SWVoiceOut *sw)
+@@ -129,7 +167,12 @@
+         return 0;
+     }
+ 
+-    return klass->get_buffer_size_out(be, sw);
++    int ret;
++
++    audio_rt_lock();
++    ret = klass->get_buffer_size_out(be, sw);
++    audio_rt_unlock();
++    return ret;
+ }
+ 
+ void audio_be_set_active_out(AudioBackend *be, SWVoiceOut *sw, bool on)
+@@ -142,7 +185,9 @@
+         return;
+     }
+ 
+-    return klass->set_active_out(be, sw, on);
++    audio_rt_lock();
++    klass->set_active_out(be, sw, on);
++    audio_rt_unlock();
+ }
+ 
+ void audio_be_set_active_in(AudioBackend *be, SWVoiceIn *sw, bool on)
+@@ -155,7 +200,9 @@
+         return;
+     }
+ 
+-    return klass->set_active_in(be, sw, on);
++    audio_rt_lock();
++    klass->set_active_in(be, sw, on);
++    audio_rt_unlock();
+ }
+ 
+ void audio_be_set_volume_out(AudioBackend *be, SWVoiceOut *sw, Volume *vol)
+@@ -166,7 +213,9 @@
+         return;
+     }
+ 
++    audio_rt_lock();
+     klass->set_volume_out(be, sw, vol);
++    audio_rt_unlock();
+ }
+ 
+ void audio_be_set_volume_in(AudioBackend *be, SWVoiceIn *sw, Volume *vol)
+@@ -177,7 +226,9 @@
+         return;
+     }
+ 
++    audio_rt_lock();
+     klass->set_volume_in(be, sw, vol);
++    audio_rt_unlock();
+ }
+ 
+ CaptureVoiceOut *audio_be_add_capture(
+@@ -191,7 +242,12 @@
+     assert(as != NULL);
+     assert(ops != NULL);
+ 
+-    return klass->add_capture(be, as, ops, cb_opaque);
++    CaptureVoiceOut *ret;
++
++    audio_rt_lock();
++    ret = klass->add_capture(be, as, ops, cb_opaque);
++    audio_rt_unlock();
++    return ret;
+ }
+ 
+ void audio_be_del_capture(AudioBackend *be, CaptureVoiceOut *cap, void *cb_opaque)
+@@ -202,7 +258,9 @@
+         return;
+     }
+ 
++    audio_rt_lock();
+     klass->del_capture(be, cap, cb_opaque);
++    audio_rt_unlock();
+ }
+ 
+ #ifdef CONFIG_GIO
+--- a/audio/audio_int.h
++++ b/audio/audio_int.h
+@@ -229,6 +229,8 @@
+ 
+     bool timer_running;
+     uint64_t timer_last;
++    /* Pingouin: the audio timer as a tick on the sound's own thread */
++    AudioRtTick rt_tick;
+     VMChangeStateEntry *vmse;
+ };
+ 
+--- a/audio/audio-mixeng-be.c
++++ b/audio/audio-mixeng-be.c
+@@ -585,12 +585,19 @@
+     }
+     return 0;
+ }
++
++static void audio_rt_timer(void *opaque);
+ 
+ static void audio_reset_timer(AudioMixengBackend *s)
+ {
+     if (audio_is_timer_needed(s)) {
+-        timer_mod_anticipate_ns(s->ts,
+-            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->period_ticks);
++        if (audio_rt_enabled()) {
++            /* Pingouin: on the sound's own thread, every audio_rt_period(). */
++            audio_rt_tick_add(&s->rt_tick, audio_rt_timer, s);
++        } else {
++            timer_mod_anticipate_ns(s->ts,
++                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->period_ticks);
++        }
+         if (!s->timer_running) {
+             s->timer_running = true;
+             s->timer_last = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+@@ -598,6 +605,7 @@
+         }
+     } else {
+         timer_del(s->ts);
++        audio_rt_tick_del(&s->rt_tick);
+         if (s->timer_running) {
+             s->timer_running = false;
+             trace_audio_timer_stop();
+@@ -613,6 +621,23 @@
+     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+     diff = now - s->timer_last;
+     if (diff > s->period_ticks * 3 / 2) {
++        trace_audio_timer_delayed(diff / SCALE_MS);
++    }
++    s->timer_last = now;
++
++    audio_run(s, "timer");
++    audio_reset_timer(s);
++}
++
++/* Pingouin: the audio timer's run on the sound's own thread (audio lock held). */
++static void audio_rt_timer(void *opaque)
++{
++    int64_t now, diff;
++    AudioMixengBackend *s = opaque;
++
++    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    diff = now - s->timer_last;
++    if (diff > audio_rt_period() * 3 / 2) {
+         trace_audio_timer_delayed(diff / SCALE_MS);
+     }
+     s->timer_last = now;
+@@ -1389,6 +1414,7 @@
+     HWVoiceOut *hwo = NULL;
+     HWVoiceIn *hwi = NULL;
+ 
++    audio_rt_lock();
+     while ((hwo = audio_pcm_hw_find_any_enabled_out(s, hwo))) {
+         if (k->enable_out) {
+             k->enable_out(hwo, running);
+@@ -1401,6 +1427,7 @@
+         }
+     }
+     audio_reset_timer (s);
++    audio_rt_unlock();
+ }
+ 
+ static const VMStateDescription vmstate_audio;
+@@ -1471,6 +1498,10 @@
+     AudioMixengBackendClass *k = AUDIO_MIXENG_BACKEND_GET_CLASS(s);
+     HWVoiceOut *hwo, *hwon;
+     HWVoiceIn *hwi, *hwin;
++
++    /* Pingouin: no tick of the sound's thread runs on what is freed here. */
++    audio_rt_lock();
++    audio_rt_tick_del(&s->rt_tick);
+ 
+     QLIST_FOREACH_SAFE(hwo, &s->hw_head_out, entries, hwon) {
+         SWVoiceCap *sc;
+@@ -1517,6 +1548,7 @@
+     }
+ 
+     vmstate_unregister(NULL, &vmstate_audio, s);
++    audio_rt_unlock();
+ }
+ 
+ static bool vmstate_audio_needed(void *opaque)
+--- a/hw/audio/hda-codec.c
++++ b/hw/audio/hda-codec.c
+@@ -178,6 +178,8 @@
+     int64_t run_ns;
+     int64_t pace_ns;
+     int64_t budget;
++    /* Pingouin: the timer as a tick on the sound's own thread (audio-rt.c) */
++    AudioRtTick rt_tick;
+ };
+ 
+ struct HDAAudioState {
+@@ -264,7 +266,7 @@
+ 
+ out_timer:
+ 
+-    if (st->running) {
++    if (st->running && !audio_rt_enabled()) {
+         timer_mod_anticipate_ns(st->buft, now + HDA_TIMER_TICKS);
+     }
+ }
+@@ -389,7 +391,7 @@
+ 
+ out_timer:
+ 
+-    if (st->running) {
++    if (st->running && !audio_rt_enabled()) {
+         timer_mod_anticipate_ns(st->buft, now + HDA_TIMER_TICKS);
+     }
+ }
+@@ -447,9 +449,17 @@
+         st->run_ns = now;
+         st->pace_ns = 0;
+         st->budget = 0;
+-        timer_mod_anticipate_ns(st->buft, now + HDA_TIMER_TICKS);
++        if (audio_rt_enabled()) {
++            /* Pingouin: the guest's DMA moves on the sound's own thread. */
++            audio_rt_tick_add(&st->rt_tick, st->output ? hda_audio_output_timer
++                                                       : hda_audio_input_timer,
++                              st);
++        } else {
++            timer_mod_anticipate_ns(st->buft, now + HDA_TIMER_TICKS);
++        }
+     } else {
+         timer_del(st->buft);
++        audio_rt_tick_del(&st->rt_tick);
+     }
+     if (st->output) {
+         audio_be_set_active_out(st->state->audio_be, st->voice.out, st->running);
+@@ -500,11 +510,13 @@
+     if (st->output) {
+         cb = hda_audio_output_cb;
+         timer_del(st->buft);
++        audio_rt_tick_del(&st->rt_tick);
+         st->voice.out = audio_be_open_out(st->state->audio_be, st->voice.out,
+                                      st->node->name, st, cb, &st->as);
+     } else {
+         cb = hda_audio_input_cb;
+         timer_del(st->buft);
++        audio_rt_tick_del(&st->rt_tick);
+         st->voice.in = audio_be_open_in(st->state->audio_be, st->voice.in,
+                                    st->node->name, st, cb, &st->as);
+     }
+@@ -754,11 +766,13 @@
+     int i;
+ 
+     dprint(a, 1, "%s\n", __func__);
++    audio_rt_lock();
+     for (i = 0; i < ARRAY_SIZE(a->st); i++) {
+         st = a->st + i;
+         if (st->node == NULL) {
+             continue;
+         }
++        audio_rt_tick_del(&st->rt_tick);
+         timer_free(st->buft);
+         if (st->output) {
+             audio_be_close_out(a->audio_be, st->voice.out);
+@@ -766,6 +780,7 @@
+             audio_be_close_in(a->audio_be, st->voice.in);
+         }
+     }
++    audio_rt_unlock();
+ }
+ 
+ static int hda_audio_post_load(void *opaque, int version)
+@@ -781,6 +796,7 @@
+             a->running_real[16 + i] = a->running_compat[i];
+     }
+ 
++    audio_rt_lock();
+     for (i = 0; i < ARRAY_SIZE(a->st); i++) {
+         st = a->st + i;
+         if (st->node == NULL)
+@@ -790,6 +806,7 @@
+         hda_audio_set_amp(st);
+         hda_audio_set_running(st, a->running_real[st->output * 16 + st->stream]);
+     }
++    audio_rt_unlock();
+     return 0;
+ }
+ 
+@@ -800,12 +817,14 @@
+     int i;
+ 
+     dprint(a, 1, "%s\n", __func__);
++    audio_rt_lock();
+     for (i = 0; i < ARRAY_SIZE(a->st); i++) {
+         st = a->st + i;
+         if (st->node != NULL) {
+             hda_audio_set_running(st, false);
+         }
+     }
++    audio_rt_unlock();
+ }
+ 
+ static bool vmstate_hda_audio_stream_buf_needed(void *opaque)
+--- a/hw/audio/intel-hda.c
++++ b/hw/audio/intel-hda.c
+@@ -33,6 +33,10 @@
+ #include "qobject/qdict.h"
+ #include "qapi/error.h"
+ #include "qom/object.h"
++#include "qemu/audio.h"
++#include "qemu/main-loop.h"
++#include "qemu/rcu.h"
++#include "system/memory.h"
+ 
+ /* --------------------------------------------------------------------- */
+ /* hda bus                                                               */
+@@ -183,6 +187,8 @@
+     MemoryRegion container;
+     MemoryRegion mmio;
+     MemoryRegion alias;
++    /* Pingouin: the interrupt of a DMA done on the sound's own thread */
++    QEMUBH *irq_bh;
+     uint32_t rirb_count;
+     int64_t wall_base_ns;
+ 
+@@ -393,6 +399,53 @@
+     }
+ }
+ 
++/*
++ * Pingouin: DMA from the sound's own thread (audio-rt.c), which never takes
++ * the BQL: guest RAM only, straight through the PCI device's address space
++ * under RCU. Anything else (MMIO would need the BQL) fails the transfer.
++ */
++static bool intel_hda_dma_ram(IntelHDAState *d, dma_addr_t addr, void *buf,
++                              dma_addr_t len, bool to_guest)
++{
++    const MemTxAttrs attrs = { .memory = true };
++    AddressSpace *as = pci_get_address_space(&d->pci);
++    uint8_t *b = buf;
++
++    RCU_READ_LOCK_GUARD();
++    smp_mb();
++    while (len > 0) {
++        hwaddr xlat, l = len;
++        MemoryRegion *mr = address_space_translate(as, addr, &xlat, &l,
++                                                   to_guest, attrs);
++
++        if (!l || !memory_access_is_direct(mr, to_guest, attrs)) {
++            return false;
++        }
++        uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
++        if (to_guest) {
++            memcpy(p, b, l);
++            memory_region_set_dirty(mr, xlat, l);
++        } else {
++            memcpy(b, p, l);
++        }
++        addr += l;
++        b += l;
++        len -= l;
++    }
++    return true;
++}
++
++static void intel_hda_update_irq(IntelHDAState *d);
++
++static void intel_hda_irq_bh(void *opaque)
++{
++    IntelHDAState *d = opaque;
++
++    audio_rt_lock();
++    intel_hda_update_irq(d);
++    audio_rt_unlock();
++}
++
+ static bool intel_hda_xfer(HDACodecDevice *dev, uint32_t stnr, bool output,
+                            uint8_t *buf, uint32_t len)
+ {
+@@ -403,6 +456,8 @@
+     uint32_t s, copy, left;
+     IntelHDAStream *st;
+     bool irq = false;
++    /* Pingouin: called on the sound's own thread (no BQL) */
++    bool rt = !bql_locked();
+ 
+     st = output ? d->st + 4 : d->st;
+     for (s = 0; s < 4; s++) {
+@@ -430,8 +485,15 @@
+         dprint(d, 3, "dma: entry %d, pos %d/%d, copy %d\n",
+                st->be, st->bp, st->bpl[st->be].len, copy);
+ 
+-        pci_dma_rw(&d->pci, st->bpl[st->be].addr + st->bp, buf, copy, !output,
+-                   attrs);
++        if (rt) {
++            if (!intel_hda_dma_ram(d, st->bpl[st->be].addr + st->bp, buf, copy,
++                                   !output)) {
++                memset(buf, 0, copy);
++            }
++        } else {
++            pci_dma_rw(&d->pci, st->bpl[st->be].addr + st->bp, buf, copy,
++                       !output, attrs);
++        }
+         st->lpib += copy;
+         st->bp += copy;
+         buf += copy;
+@@ -454,13 +516,22 @@
+     if (d->dp_lbase & 0x01) {
+         s = st - d->st;
+         addr = intel_hda_addr(d->dp_lbase & ~0x01, d->dp_ubase);
+-        stl_le_pci_dma(&d->pci, addr + 8 * s, st->lpib, attrs);
++        if (rt) {
++            uint32_t pos = cpu_to_le32(st->lpib);
++            intel_hda_dma_ram(d, addr + 8 * s, &pos, sizeof(pos), true);
++        } else {
++            stl_le_pci_dma(&d->pci, addr + 8 * s, st->lpib, attrs);
++        }
+     }
+     dprint(d, 3, "dma: --\n");
+ 
+     if (irq) {
+         st->ctl |= (1 << 26); /* buffer completion interrupt */
+-        intel_hda_update_irq(d);
++        if (rt) {
++            qemu_bh_schedule(d->irq_bh);
++        } else {
++            intel_hda_update_irq(d);
++        }
+     }
+     return true;
+ }
+@@ -1049,15 +1120,22 @@
+     IntelHDAState *d = opaque;
+     const IntelHDAReg *reg = intel_hda_reg_find(d, addr);
+ 
++    /* Pingouin: the streams' registers are the sound thread's too */
++    audio_rt_lock();
+     intel_hda_reg_write(d, reg, val, MAKE_64BIT_MASK(0, size * 8));
++    audio_rt_unlock();
+ }
+ 
+ static uint64_t intel_hda_mmio_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     IntelHDAState *d = opaque;
+     const IntelHDAReg *reg = intel_hda_reg_find(d, addr);
++    uint64_t val;
+ 
+-    return intel_hda_reg_read(d, reg, MAKE_64BIT_MASK(0, size * 8));
++    audio_rt_lock();
++    val = intel_hda_reg_read(d, reg, MAKE_64BIT_MASK(0, size * 8));
++    audio_rt_unlock();
++    return val;
+ }
+ 
+ static const MemoryRegionOps intel_hda_mmio_ops = {
+@@ -1078,6 +1156,7 @@
+     IntelHDAState *d = INTEL_HDA(dev);
+     HDACodecDevice *cdev;
+ 
++    audio_rt_lock();
+     intel_hda_regs_reset(d);
+     d->wall_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+ 
+@@ -1087,6 +1166,7 @@
+         d->state_sts |= (1 << cdev->cad);
+     }
+     intel_hda_update_irq(d);
++    audio_rt_unlock();
+ }
+ 
+ static void intel_hda_realize(PCIDevice *pci, Error **errp)
+@@ -1133,12 +1213,15 @@
+ 
+     hda_codec_bus_init(DEVICE(pci), &d->codecs, sizeof(d->codecs),
+                        intel_hda_response, intel_hda_xfer);
++    d->irq_bh = qemu_bh_new_guarded(intel_hda_irq_bh, d,
++                                    &DEVICE(d)->mem_reentrancy_guard);
+ }
+ 
+ static void intel_hda_exit(PCIDevice *pci)
+ {
+     IntelHDAState *d = INTEL_HDA(pci);
+ 
++    g_clear_pointer(&d->irq_bh, qemu_bh_delete);
+     msi_uninit(&d->pci);
+ }
+ 
+@@ -1148,12 +1231,14 @@
+     int i;
+ 
+     dprint(d, 1, "%s\n", __func__);
++    audio_rt_lock();
+     for (i = 0; i < ARRAY_SIZE(d->st); i++) {
+         if (d->st[i].ctl & 0x02) {
+             intel_hda_parse_bdl(d, &d->st[i]);
+         }
+     }
+     intel_hda_update_irq(d);
++    audio_rt_unlock();
+     return 0;
+ }
+ 
+--- /dev/null
++++ b/audio/audio-rt.c
+@@ -0,0 +1,264 @@
++/*
++ * Pingouin: the sound's own real-time thread.
++ *
++ * QEMU moves the sound in its main loop: the HDA codec's DMA timers and the
++ * mixer's audio timer. The main loop also runs the VM's GPU (virgl), which
++ * holds it for 50-200 ms when the guest compiles shaders, and it competes
++ * with every vCPU for the Mac's cores. A late main loop is a break in the
++ * sound unless a buffer covers it.
++ *
++ * With PINGOUIN_AUDIO_THREAD=1 those timers become ticks on one thread of
++ * their own, at real-time priority (macOS time-constraint policy, else
++ * user-interactive QoS), that never takes the BQL. Everything the ticks
++ * touch (the mixer, the HDA codec's streams, the HDA controller's stream
++ * registers) is guarded by one recursive lock, audio_rt_lock(), which the
++ * device's MMIO handlers and the audio backend API take too. Lock order:
++ * BQL, then the audio lock, then a backend's own locks (SDL's device lock).
++ * The thread never takes the BQL: the HDA controller does its DMA to guest
++ * RAM directly and raises its interrupt from a bottom half.
++ *
++ * The thread sleeps while no tick is registered or the VM is stopped.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/audio.h"
++#include "qemu/error-report.h"
++#include "qemu/thread.h"
++#include "qemu/rcu.h"
++#include "qemu/timer.h"
++#include "system/runstate.h"
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <mach/mach_time.h>
++#include <mach/thread_policy.h>
++#include <pthread.h>
++#endif
++
++#define AUDIO_RT_MAX_TICKS 16
++
++static QemuRecMutex audio_rt_mutex;
++static QemuSemaphore audio_rt_wake;
++static QemuThread audio_rt_thread;
++static bool audio_rt_started;
++static bool audio_rt_vm_running;
++static int64_t audio_rt_period_ns = 1 * SCALE_MS;
++/* Under the audio lock. */
++static AudioRtTick *audio_rt_ticks[AUDIO_RT_MAX_TICKS];
++static int audio_rt_nticks;
++static bool audio_rt_sleeping;
++
++static void audio_rt_init_once(void)
++{
++    static bool done;
++
++    if (!done) {
++        done = true;
++        qemu_rec_mutex_init(&audio_rt_mutex);
++        qemu_sem_init(&audio_rt_wake, 0);
++    }
++}
++
++bool audio_rt_enabled(void)
++{
++    static int on = -1;
++
++    if (on < 0) {
++        const char *v = g_getenv("PINGOUIN_AUDIO_THREAD");
++        const char *p = g_getenv("PINGOUIN_AUDIO_THREAD_PERIOD_US");
++
++        on = v && !strcmp(v, "1");
++        /* Which way the sound moves (qemu.log, pingouin check "sound timing"). */
++        info_report("Pingouin: sound path: %s", on ? "own audio thread"
++                                                 : "QEMU's main loop");
++        if (p) {
++            int64_t us = g_ascii_strtoll(p, NULL, 10);
++            if (us >= 250 && us <= 10000) {
++                audio_rt_period_ns = us * SCALE_US;
++            }
++        }
++        audio_rt_init_once();
++    }
++    return on;
++}
++
++void audio_rt_lock(void)
++{
++    if (audio_rt_enabled()) {
++        qemu_rec_mutex_lock(&audio_rt_mutex);
++    }
++}
++
++void audio_rt_unlock(void)
++{
++    if (audio_rt_enabled()) {
++        qemu_rec_mutex_unlock(&audio_rt_mutex);
++    }
++}
++
++bool audio_rt_on_thread(void)
++{
++    return audio_rt_started && qemu_thread_is_self(&audio_rt_thread);
++}
++
++#ifdef __APPLE__
++static const char *audio_rt_set_priority(void)
++{
++    mach_timebase_info_data_t tb;
++    struct thread_time_constraint_policy pol;
++    double ns_to_abs;
++
++    mach_timebase_info(&tb);
++    ns_to_abs = (double)tb.denom / tb.numer;
++    /* Every period; done in a quarter of it, at the latest by its end. */
++    pol.period = (uint32_t)(audio_rt_period_ns * ns_to_abs);
++    pol.computation = (uint32_t)(audio_rt_period_ns / 4 * ns_to_abs);
++    pol.constraint = (uint32_t)(audio_rt_period_ns * ns_to_abs);
++    pol.preemptible = 1;
++    if (thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY,
++                          (thread_policy_t)&pol,
++                          THREAD_TIME_CONSTRAINT_POLICY_COUNT) == KERN_SUCCESS) {
++        return "time-constraint";
++    }
++    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0) {
++        return "user-interactive QoS";
++    }
++    return "default priority";
++}
++
++static void audio_rt_sleep_until(int64_t deadline_ns)
++{
++    static mach_timebase_info_data_t tb;
++
++    if (!tb.denom) {
++        mach_timebase_info(&tb);
++    }
++    int64_t now = get_clock();
++    if (deadline_ns > now) {
++        mach_wait_until(mach_absolute_time() +
++                        (uint64_t)((deadline_ns - now) * tb.denom / tb.numer));
++    }
++}
++#else
++static const char *audio_rt_set_priority(void)
++{
++    return "default priority";
++}
++
++static void audio_rt_sleep_until(int64_t deadline_ns)
++{
++    int64_t now = get_clock();
++    if (deadline_ns > now) {
++        g_usleep((deadline_ns - now) / SCALE_US);
++    }
++}
++#endif
++
++static void *audio_rt_run(void *opaque)
++{
++    AudioRtTick *now_ticks[AUDIO_RT_MAX_TICKS];
++    int64_t next = get_clock();
++
++    rcu_register_thread();
++    info_report("Pingouin: sound: own audio thread, %s, every %" PRId64 " us",
++                audio_rt_set_priority(), audio_rt_period_ns / SCALE_US);
++    for (;;) {
++        int n, i;
++
++        qemu_rec_mutex_lock(&audio_rt_mutex);
++        if (!audio_rt_nticks || !audio_rt_vm_running) {
++            audio_rt_sleeping = true;
++            qemu_rec_mutex_unlock(&audio_rt_mutex);
++            qemu_sem_wait(&audio_rt_wake);
++            next = get_clock();
++            continue;
++        }
++        /* A tick may add or remove ticks: run the ones registered now. */
++        n = audio_rt_nticks;
++        memcpy(now_ticks, audio_rt_ticks, n * sizeof(now_ticks[0]));
++        for (i = 0; i < n; i++) {
++            if (now_ticks[i]->registered) {
++                now_ticks[i]->fn(now_ticks[i]->opaque);
++            }
++        }
++        qemu_rec_mutex_unlock(&audio_rt_mutex);
++
++        next += audio_rt_period_ns;
++        int64_t t = get_clock();
++        if (next < t - 20 * SCALE_MS) {
++            /* Late by far more than a period (the Mac slept): start over. */
++            next = t;
++        }
++        audio_rt_sleep_until(next);
++    }
++    return NULL;
++}
++
++/* Under the audio lock. */
++static void audio_rt_kick(void)
++{
++    if (audio_rt_sleeping && audio_rt_nticks && audio_rt_vm_running) {
++        audio_rt_sleeping = false;
++        qemu_sem_post(&audio_rt_wake);
++    }
++}
++
++static void audio_rt_vm_state(void *opaque, bool running, RunState state)
++{
++    qemu_rec_mutex_lock(&audio_rt_mutex);
++    audio_rt_vm_running = running;
++    audio_rt_kick();
++    qemu_rec_mutex_unlock(&audio_rt_mutex);
++}
++
++void audio_rt_tick_add(AudioRtTick *t, void (*fn)(void *), void *opaque)
++{
++    assert(audio_rt_enabled());
++    qemu_rec_mutex_lock(&audio_rt_mutex);
++    if (!audio_rt_started) {
++        audio_rt_started = true;
++        audio_rt_vm_running = runstate_is_running();
++        audio_rt_sleeping = true;
++        qemu_add_vm_change_state_handler(audio_rt_vm_state, NULL);
++        qemu_thread_create(&audio_rt_thread, "pingouin-audio", audio_rt_run,
++                           NULL, QEMU_THREAD_DETACHED);
++    }
++    t->fn = fn;
++    t->opaque = opaque;
++    if (!t->registered) {
++        if (audio_rt_nticks == AUDIO_RT_MAX_TICKS) {
++            error_report("Pingouin: sound: too many audio ticks");
++            abort();
++        }
++        t->registered = true;
++        audio_rt_ticks[audio_rt_nticks++] = t;
++    }
++    audio_rt_kick();
++    qemu_rec_mutex_unlock(&audio_rt_mutex);
++}
++
++void audio_rt_tick_del(AudioRtTick *t)
++{
++    int i;
++
++    if (!audio_rt_enabled()) {
++        return;
++    }
++    qemu_rec_mutex_lock(&audio_rt_mutex);
++    if (t->registered) {
++        t->registered = false;
++        for (i = 0; i < audio_rt_nticks; i++) {
++            if (audio_rt_ticks[i] == t) {
++                audio_rt_ticks[i] = audio_rt_ticks[--audio_rt_nticks];
++                break;
++            }
++        }
++    }
++    qemu_rec_mutex_unlock(&audio_rt_mutex);
++}
++
++int64_t audio_rt_period(void)
++{
++    return audio_rt_period_ns;
++}

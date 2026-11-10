@@ -1,0 +1,125 @@
+virglrenderer: big texture uploads through a pixel unpack buffer
+
+What: vrend_renderer_transfer_write_iov gathers the guest's pages for a plain 2D
+or rectangle texture upload of 64 KiB or more straight into a pixel unpack
+buffer (orphaned each time, mapped for writing) and uploads from it, instead of
+into a malloc'd copy that glTexSubImage2D reads from client memory. Only where
+the old path needed no CPU conversion: core profile, not GLES, not compressed,
+not flipped (y_0_top), not Z24X8, one layer. The guest's row stride is packed
+as in the temporary copy. A failed map or unmap takes the old path; the unpack
+binding is put back. PINGOUIN_VIRGL_UPLOAD_PBO=0 turns it off.
+Why: from client memory Apple's GL copies the data once more and lays it out
+for the GPU on the CPU. Omarchy's frozen screen for screenshots (hyprpicker)
+uploads a whole display per frame: 21.6 MB at 2940x1840, 47-51 % of QEMU's main
+loop on a MacBook Air M2 in transfer_write_iov (memmove 28 %, the gather 16 %,
+glTexSubImage2D). Through the buffer the upload takes about half the main
+loop's time (M4 Max: 1.13 -> 0.55 ms for 2940x1840 in 331 pieces); on the Air
+the frozen screen with a moving pointer went from 36-39 % to 31 % of the main
+loop, its late timers from 556 to 202. Every app drawing on the CPU (shm
+buffers) gains.
+Upstream: could go upstream (Apple-specific gain); not sent.
+Tests: Tests/virgl/test-upload-pbo.c: whole textures and boxes, strides wider
+than the box, 1 and 4 bytes a pixel, odd widths, guest memory in one piece and
+in many of odd sizes, an offset, a small upload, a rectangle texture, the same
+texture again: read back and compared with the guest's bytes, with the buffer
+and with PINGOUIN_VIRGL_UPLOAD_PBO=0. index-range-writes.py: the buffer is
+vrend's own.
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -12132,7 +12132,47 @@
+    }
+    return false;
+ }
++
++/* Pingouin: big texture uploads go through a pixel unpack buffer. The guest's
++ * pages are gathered straight into it (one CPU copy), and the GPU puts the
++ * pixels into the texture's layout. From client memory, Apple's GL copies the
++ * data once more and lays it out on the CPU: a 2940x1840 window (21.6 MB, what
++ * a frozen screen in screenshot mode uploads on every pointer move) took about
++ * twice the main thread's time. Plain 2D uploads only (no flip, no CPU
++ * conversion); PINGOUIN_VIRGL_UPLOAD_PBO=0 turns it off. */
++#define VREND_UPLOAD_PBO_MIN (64 * 1024)
++static GLuint vrend_upload_pbo;
+ 
++static bool vrend_upload_pbo_wanted(void)
++{
++   static int wanted = -1;
++   if (wanted < 0) {
++      const char *env = getenv("PINGOUIN_VIRGL_UPLOAD_PBO");
++      wanted = !(env && !strcmp(env, "0"));
++   }
++   return wanted;
++}
++
++/* A write-only mapping of SIZE bytes of the upload buffer, bound to
++ * GL_PIXEL_UNPACK_BUFFER (NULL: none; nothing is left bound then). */
++static void *vrend_upload_pbo_map(uint64_t size)
++{
++   void *map;
++
++   if (!vrend_upload_pbo)
++      glGenBuffers(1, &vrend_upload_pbo);
++   if (!vrend_upload_pbo)
++      return NULL;
++   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, vrend_upload_pbo);
++   /* new storage each time: the GPU may still read the last upload */
++   glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)size, NULL, GL_STREAM_DRAW);
++   map = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)size,
++                          GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
++   if (!map)
++      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++   return map;
++}
++
+ static int vrend_renderer_transfer_write_iov(struct vrend_context *ctx,
+                                              struct vrend_resource *res,
+                                              const struct iovec *iov, int num_iovs,
+@@ -12228,7 +12268,36 @@
+       else if (need_temp && info->box->depth != 1)
+          return EINVAL;
+ 
+-      if (need_temp) {
++      /* Pingouin: see vrend_upload_pbo_map. The guest's rows are packed into
++       * the buffer (as into the temporary copy), so any stride works. */
++      bool from_pbo = false;
++      GLint old_unpack = 0;
++      if (vrend_state.use_core_profile && !vrend_state.use_gles && !compressed && !invert &&
++          res->base.format != VIRGL_FORMAT_Z24X8_UNORM && info->box->depth == 1 &&
++          (res->target == GL_TEXTURE_2D || res->target == GL_TEXTURE_RECTANGLE) &&
++          send_size >= VREND_UPLOAD_PBO_MIN && send_size <= UINT_MAX &&
++          (need_temp || send_size <= iov[0].iov_len - info->offset) &&
++          vrend_upload_pbo_wanted()) {
++         glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &old_unpack);
++         data = vrend_upload_pbo_map(send_size);
++         if (data) {
++            read_transfer_data(iov, num_iovs, data, res->base.format, info->offset,
++                               stride, layer_stride, info->box, false);
++            if (glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)) {
++               from_pbo = true;
++               need_temp = true;   /* packed rows: no row length below */
++               data = NULL;        /* offset 0 in the unpack buffer */
++            } else {
++               glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++            }
++         }
++         if (!from_pbo && old_unpack)
++            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, old_unpack);
++      }
++
++      if (from_pbo) {
++         /* filled above */
++      } else if (need_temp) {
+          /* functions like glCompressedTexSubImage3D only support
+           * a buffer size of GLsizei = uint32_t, anything larger
+           * is bogous */
+@@ -12447,7 +12516,9 @@
+ 
+       glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+ 
+-      if (need_temp)
++      if (from_pbo)
++         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, old_unpack);
++      else if (need_temp)
+          free(data);
+    }
+    return 0;

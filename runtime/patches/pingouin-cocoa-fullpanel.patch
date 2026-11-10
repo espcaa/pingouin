@@ -1,0 +1,1562 @@
+From: OmacVM
+Subject: [PATCH] ui: FullPanel, full screen over the strip beside the notch (experimental)
+
+What: with PINGOUIN_FULLPANEL=1 (OmacVM.app sets it for one start, for a VM
+whose notch setting is FullPanel), a full-screen window on a display with a
+camera housing covers the whole display, the strip beside the notch
+included, and stays a real macOS full-screen window in a Space of its own.
+AppKit itself lays the window out over the whole display: its full-screen
+content controller asks whether the window keeps the menu bar's band free
+(-[_NSFullScreenContentController reservesSpaceForMenuBarInFullScreen]),
+and for a VM window (QemuWindow, PingouinHeadWindow) in such a full screen
+the answer is no. Every other window, and every call off the main thread,
+gets AppKit's own answer. No window class or frame setter is overridden
+and no full-screen size forced; QEMU's own full-screen resize leaves a
+FullPanel window as AppKit laid it out (a guest mode that does not fill
+it, the firmware's 1920x1080, is scaled onto it, not the window fitted to
+it, which moved it off the strip). The full screen counts once the
+window covers the display; a window that does not at didEnterFullScreen
+(Split View) keeps AppKit's layout for that full screen. The full-screen
+Space's menu bar backdrop is made transparent (SkyLight, that Space only).
+With "Keep the Dock away" (QEMU's immersive=on, the app's default) the
+menu bar never comes down, as in normal full screen with that setting.
+Without it, it comes down from the display's top row as usual: the reveal
+is seen through AppKit's full-screen titlebar window (its alpha, observed
+with KVO), and while no reveal is on screen that window lets clicks in the
+strip through to the VM. After Mission Control, a Space switch, the Dock
+or Command-Tab, the backdrop and the options are applied again once
+WindowServer has the window back in place (at most 2 s; never a frame).
+SLSTransactionCommit returns nothing (macOS 27: w0 is left over), so it is
+not read as a status. The guest's size, the full-screen area and the
+display arrangement sent to the guest then start at the display's top
+edge, and the guest is the whole panel: no rows cut for Omarchy's scale
+presets (pingouin-cocoa-clean-size.patch does that below a notch; over the
+strip the cut rows were a black band at the bottom, 2940x1900 on a
+2940x1912 MacBook Air). Rules in ui/pingouin-fullpanel.h
+(pingouin-cocoa-fullpanel-logic.patch). qemu.log: "omacvm: full panel:
+strip covered: ..." per full screen that has it (omacvm check reads it),
+"strip lost" when AppKit moved the window off the whole display after all
+(not for a new display mode: CoreGraphics has it before NSScreen does),
+"... normal full screen" when a full screen falls back.
+
+Why: OmacVM.app's own full screen can draw beside the camera itself, so on
+that route the guest's bar can sit in the strip without Omanotch's stream
+(Omanotch stays the default and the only way on UTM, VMware Fusion and
+Parallels, which keep their windows below the notch). Issue #339. This
+version (#480) replaces the previous FullPanel code (a hook on AppKit's
+private full-screen frame, guards on five frame setters, a forced
+full-screen content size and hooks on AppKit's menu bar companion's reveal
+setters; docs/adr/0044-fullpanel.md, "Replacement").
+
+Fallbacks: without PINGOUIN_FULLPANEL=1 nothing of it runs. External
+displays (no camera housing), macOS's "Always show the menu bar in full
+screen" without Keep the Dock away, a reservation method that is missing,
+changed, inherited or replaced by other code, any SkyLight function that is
+missing, no menu bar transaction from SkyLight, and presentation options
+AppKit refuses give normal full screen (logged). A full screen that loses
+the strip is not forced back; a full-screen Space moved to a display
+without a housing is normal full screen there until it is back.
+
+Credit: @brianmerchant's FullPanel branch (#339) and this rewrite (#480).
+Answering AppKit's full-screen menu bar reservation question to get the
+layout was inspired by Try Omarchy's pull request #361 (themartiano, MIT;
+no code from it). FullPanel in OmacVM 3.0.16-3.1.26 contained code adapted
+from UTM (Apache-2.0; Copyright © 2026 Turing Software, LLC,
+VMDisplayWindow.swift, UTM pull requests #7885 and #7910). Since #480
+FullPanel is rewritten and has no code from UTM. It still follows UTM's
+approach: the menu bar's backdrop made transparent with SkyLight, the menu
+bar held back with the app's presentation options. Written by people who
+had read the earlier code (not a clean-room rewrite).
+
+Upstream: not applicable (private AppKit/SkyLight interfaces, OmacVM's notch).
+Test: app/runtime/Tests/display/test-fullpanel.sh (the rules, every
+notched MacBook's size, external displays, moves between them; with the
+patched ui/cocoa.m also the wiring, and that none of the earlier version's
+hooks is left); the runtime build compiles it; the strip itself only on a
+notched Mac (docs/features.md, FullPanel).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -49,6 +49,7 @@
+ #include "ui/pingouin-clean-size.h"
+ #include "ui/pingouin-notch-park.h"
+ #include "ui/pingouin-ime.h"
++#include "ui/pingouin-fullpanel.h"
+ #include "hw/core/boards.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+@@ -68,6 +69,7 @@
+ #include "trace.h"
+ #include <Carbon/Carbon.h>
+ #include <dlfcn.h>
++#include <objc/runtime.h>
+ #include <AppKit/NSOpenGL.h>
+ #ifdef CONFIG_OPENGL
+ #import <IOSurface/IOSurface.h>
+@@ -1578,9 +1580,16 @@ - (NSSize)fixAspectRatio:(NSSize)max
+  */
+ static CGFloat pingouin_main_full_top = -1;
+ 
++/* Pingouin FullPanel (pingouin-cocoa-fullpanel.patch), defined below. */
++static bool pingouin_fullpanel_window_usable(NSWindow *window);
++
+ - (NSSize) screenSafeAreaSize
+ {
+     NSSize size = [[[self window] screen] frame].size;
++    /* FullPanel: the whole display, the strip beside the notch included. */
++    if (pingouin_fullpanel_window_usable([self window])) {
++        return size;
++    }
+     NSEdgeInsets insets = [[[self window] screen] safeAreaInsets];
+     size.width -= insets.left + insets.right;
+     size.height -= insets.top + insets.bottom;
+@@ -1712,6 +1721,20 @@ - (void) resizeWindow
+         return;
+     }
+ 
++    /*
++     * Pingouin FullPanel: the window keeps the whole display AppKit laid it
++     * out on, also while the guest's mode does not fill it (the firmware's
++     * 1920x1080); the picture is scaled onto it. Fitted to the guest's
++     * aspect ratio it left the strip (1800x1013 on a 1800x1169 display).
++     * It sizes nothing, so it may come before the check for a display that
++     * does not count (#428), which pingouin-cocoa-display-settle.patch puts
++     * after it.
++     */
++    if (pingouin_fullpanel_window_usable([self window])) {
++        [self pingouinGuestAtTop:false];
++        return;
++    }
++
+     [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
+ 
+     /*
+@@ -1775,9 +1798,11 @@ - (void) updateUIInfoLocked
+         /*
+          * Rows are cut only below a notch, and only where the guest can be
+          * drawn at the top of a window that fills the area (Omanotch).
++         * FullPanel: the guest is the whole panel, nothing cut.
+          */
+-        full = isFullscreen && pingouin_present_layer() &&
+-               [[[self window] screen] safeAreaInsets].top > 0;
++        full = pingouin_fp_cut_rows(isFullscreen, pingouin_present_layer(),
++                                  [[[self window] screen] safeAreaInsets].top,
++                                  pingouin_fullpanel_window_usable([self window]));
+ 
+         if (!CVDisplayLinkCreateWithCGDisplay(display, &displayLink)) {
+             CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(displayLink);
+@@ -2974,6 +2999,1395 @@ - (BOOL)canBecomeKeyWindow { return YES; }
+ - (BOOL)canBecomeMainWindow { return YES; }
+ @end
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * Pingouin FullPanel (experimental): the full-screen window over the whole
++ * notched display, the strip beside the camera housing included.
++ * ---------------------------------------------------------------------------
++ *
++ * Only with PINGOUIN_FULLPANEL=1 (Pingouin.app sets it for one start, for a VM
++ * whose notch setting is FullPanel; Omanotch is off for that start). The
++ * window stays a real macOS full-screen window in a Space of its own. What
++ * FullPanel changes, per window and only on a display with a camera housing:
++ *
++ *   - AppKit's full-screen content controller asks whether the window keeps
++ *     the menu bar's band free (-reservesSpaceForMenuBarInFullScreen). For
++ *     a VM window in a FullPanel full screen the answer is no, and AppKit
++ *     lays the window out over the whole display itself. Every other window
++ *     gets AppKit's answer. No window class, frame or frame setter of
++ *     QEMU's is changed. The full screen counts once the window covers the
++ *     display; at didEnterFullScreen a window that does not (Split View) is
++ *     left to AppKit for that full screen;
++ *   - the menu bar's backdrop over that one full-screen Space is transparent
++ *     (SkyLight); with "Keep the Dock away" (immersive=on, the app's
++ *     default) the menu bar never comes down, as in normal full screen with
++ *     that setting; without it it comes down as usual from the display's
++ *     top row, seen through AppKit's titlebar window (its alpha, observed);
++ *   - clicks in the strip go past AppKit's titlebar window to the VM.
++ *
++ * One place applies it (-apply:): the facts go through pingouin_fp_intent
++ * (ui/pingouin-fullpanel.h), the backdrop, the app's presentation options and
++ * the titlebar window follow. After Mission Control or a Space switch it is
++ * applied again once WindowServer has the window back (never a new frame).
++ *
++ * Every private class, selector, function and type encoding is looked up at
++ * run time; anything missing or changed, an external display, or macOS's
++ * "Always show the menu bar in full screen" without Keep the Dock away gives
++ * normal full screen (logged). A full screen that loses the strip is not
++ * forced back.
++ *
++ * Answering AppKit's full-screen menu bar reservation question to get the
++ * layout was inspired by Pingouin's pull request #361 (themartiano,
++ * MIT); no code of the pull request is here.
++ *
++ * FullPanel in Pingouin 3.0.16-3.1.26 contained code adapted from UTM
++ * (Apache-2.0). Since #480 FullPanel is rewritten and has no code from UTM;
++ * it still follows UTM's approach (the menu bar's backdrop made transparent
++ * with SkyLight, the menu bar held back with the app's presentation
++ * options). docs/adr/0044-fullpanel.md says where each part comes from.
++ *
++ * Main thread (AppKit), as all of cocoa.m's window code.
++ */
++
++static bool pingouin_fullpanel_requested(void)
++{
++    return pingouin_fp_requested(getenv("PINGOUIN_FULLPANEL"));
++}
++
++static PingouinFPRect pingouin_fullpanel_rect(NSRect r)
++{
++    return (PingouinFPRect){ r.origin.x, r.origin.y, r.size.width, r.size.height };
++}
++
++static bool pingouin_fullpanel_in_full_screen(NSWindow *w)
++{
++    return w && ([w styleMask] & NSWindowStyleMaskFullScreen);
++}
++
++static bool pingouin_fullpanel_covers(NSWindow *w)
++{
++    NSScreen *s = [w screen];
++    return s && pingouin_fp_rect_equal(pingouin_fullpanel_rect([w frame]),
++                                     pingouin_fullpanel_rect([s frame]));
++}
++
++/* The window's display has a camera housing; without a display, neither this nor ... */
++static bool pingouin_fullpanel_notch(NSWindow *w)
++{
++    NSScreen *s = [w screen];
++    return s && [s safeAreaInsets].top > 0;
++}
++
++/* ... this: during a display change a window may briefly have none. */
++static bool pingouin_fullpanel_no_notch(NSWindow *w)
++{
++    NSScreen *s = [w screen];
++    return s && [s safeAreaInsets].top <= 0;
++}
++
++/*
++ * The window is on another display than the Mac's built-in one, and the
++ * built-in one is on (a MacBook with its lid open and an external display).
++ */
++static bool pingouin_fullpanel_beside_builtin(NSWindow *w)
++{
++    NSNumber *mine = [[[w screen] deviceDescription] objectForKey:@"NSScreenNumber"];
++    bool builtin = false;
++
++    for (NSScreen *s in [NSScreen screens]) {
++        NSNumber *n = [[s deviceDescription] objectForKey:@"NSScreenNumber"];
++
++        if (n && CGDisplayIsBuiltin([n unsignedIntValue])) {
++            if (mine && [n isEqual:mine]) {
++                return false;
++            }
++            builtin = true;
++        }
++    }
++    return builtin;
++}
++
++/*
++ * The display is the one the full screen was accepted on: NSScreen says so,
++ * and so does CoreGraphics, which has a new display mode at once (NSScreen
++ * follows later; AppKit lays the window out on the new mode before it).
++ */
++static bool pingouin_fullpanel_same_display(NSScreen *s, NSRect accepted)
++{
++    NSNumber *n = [[s deviceDescription] objectForKey:@"NSScreenNumber"];
++    CGRect now = n ? CGDisplayBounds([n unsignedIntValue]) : NSRectToCGRect([s frame]);
++
++    return pingouin_fp_rect_equal(pingouin_fullpanel_rect([s frame]), pingouin_fullpanel_rect(accepted)) &&
++           fabs(now.size.width - accepted.size.width) < 0.5 &&
++           fabs(now.size.height - accepted.size.height) < 0.5;
++}
++
++/*
++ * What FullPanel asks of SkyLight, WindowServer's private client library:
++ * that one full-screen Space draws no menu bar backdrop (alpha 0, set in a
++ * transaction), and which Space holds the window. Resolved by name on first
++ * use; without any one of these functions FullPanel is normal full screen,
++ * logged with dlopen's or dlsym's reason.
++ */
++#define PINGOUIN_SKYLIGHT_PATH "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight"
++
++typedef CFTypeRef (*PingouinSLSNewTransaction)(int32_t cid);
++typedef void (*PingouinSLSMenuBarAlpha)(CFTypeRef transaction, uint64_t space, float alpha);
++/*
++ * Its second argument means synchronous. It returns nothing: on macOS 27 w0
++ * is left over from its last call (every commit "failed" with a different
++ * large number when it was read as a CGError), so nothing is checked after it.
++ */
++typedef void (*PingouinSLSCommit)(CFTypeRef transaction, int32_t synchronous);
++typedef int32_t (*PingouinSLSConnection)(void);
++typedef CFArrayRef (*PingouinSLSWindowSpaces)(int32_t cid, int32_t mask, CFArrayRef window_ids);
++typedef int32_t (*PingouinSLSSpaceType)(int32_t cid, uint64_t space);
++
++static PingouinSLSNewTransaction pingouin_sls_new_transaction;
++static PingouinSLSMenuBarAlpha pingouin_sls_menu_bar_alpha;
++static PingouinSLSCommit pingouin_sls_commit;
++static PingouinSLSConnection pingouin_sls_connection;
++static PingouinSLSWindowSpaces pingouin_sls_window_spaces;
++static PingouinSLSSpaceType pingouin_sls_space_type;
++
++/*
++ * Set once SkyLight gave no transaction for the menu bar: from then on the
++ * menu bar is left as macOS has it (normal full screen), logged once.
++ */
++static bool pingouin_fullpanel_menu_failed;
++
++/* One function of SkyLight's; *all turns false (logged) when it is missing. */
++static void *pingouin_fullpanel_sls(void *lib, const char *symbol, bool *all)
++{
++    void *fn = dlsym(lib, symbol);
++
++    if (!fn && *all) {
++        const char *why = dlerror();
++        fprintf(stderr, "pingouin: full panel: dlsym %s: %s: normal full screen\n",
++                symbol, why ? why : "not found");
++    }
++    *all = *all && fn;
++    return fn;
++}
++
++/* Every SkyLight function FullPanel calls is there (looked up once). */
++static bool pingouin_fullpanel_skylight(void)
++{
++    static int found;   /* 0 not yet, 1 all of them, -1 not */
++    bool all = true;
++    void *lib;
++
++    if (found) {
++        return found > 0;
++    }
++    found = -1;
++    lib = dlopen(PINGOUIN_SKYLIGHT_PATH, RTLD_LAZY | RTLD_LOCAL);
++    if (!lib) {
++        const char *why = dlerror();
++        fprintf(stderr, "pingouin: full panel: dlopen SkyLight: %s: normal full screen\n",
++                why ? why : "failed");
++        return false;
++    }
++    pingouin_sls_new_transaction = (PingouinSLSNewTransaction)
++        pingouin_fullpanel_sls(lib, "SLSTransactionCreate", &all);
++    pingouin_sls_menu_bar_alpha = (PingouinSLSMenuBarAlpha)
++        pingouin_fullpanel_sls(lib, "SLSTransactionSetMenuBarSystemOverrideAlpha", &all);
++    pingouin_sls_commit = (PingouinSLSCommit)
++        pingouin_fullpanel_sls(lib, "SLSTransactionCommit", &all);
++    pingouin_sls_connection = (PingouinSLSConnection)
++        pingouin_fullpanel_sls(lib, "SLSMainConnectionID", &all);
++    pingouin_sls_window_spaces = (PingouinSLSWindowSpaces)
++        pingouin_fullpanel_sls(lib, "SLSCopySpacesForWindows", &all);
++    pingouin_sls_space_type = (PingouinSLSSpaceType)
++        pingouin_fullpanel_sls(lib, "SLSSpaceGetType", &all);
++    if (all) {
++        found = 1;
++    }
++    return all;
++}
++
++/*
++ * The full-screen Space that holds the window, or 0. SkyLight lists every
++ * Space the window is on (PINGOUIN_FP_SPACES_ANY); only a single one of the
++ * full-screen type counts.
++ */
++static uint64_t pingouin_fullpanel_space(NSWindow *w)
++{
++    int64_t number = w ? (int64_t)[w windowNumber] : 0;
++    uint64_t space = 0;
++    CFNumberRef wid;
++    CFArrayRef ids, spaces;
++    int32_t cid;
++
++    if (number <= 0 || !pingouin_fullpanel_skylight()) {
++        return 0;
++    }
++    cid = pingouin_sls_connection();
++    wid = CFNumberCreate(NULL, kCFNumberSInt64Type, &number);
++    ids = CFArrayCreate(NULL, (const void **)&wid, 1, &kCFTypeArrayCallBacks);
++    CFRelease(wid);
++    spaces = ids ? pingouin_sls_window_spaces(cid, PINGOUIN_FP_SPACES_ANY, ids) : NULL;
++    if (ids) {
++        CFRelease(ids);
++    }
++    if (!spaces) {
++        return 0;
++    }
++    if (CFArrayGetCount(spaces) == 1) {
++        CFTypeRef only = CFArrayGetValueAtIndex(spaces, 0);
++
++        if (only && CFGetTypeID(only) == CFNumberGetTypeID() &&
++            !CFNumberGetValue((CFNumberRef)only, kCFNumberSInt64Type, &space)) {
++            space = 0;
++        }
++    }
++    CFRelease(spaces);
++    if (space && pingouin_sls_space_type(cid, space) != PINGOUIN_FP_SPACE_FULL_SCREEN) {
++        space = 0;
++    }
++    return space;
++}
++
++/* The menu bar's backdrop over full-screen Space `space`: macOS's own (opaque) or none. */
++static bool pingouin_fullpanel_backdrop(uint64_t space, bool opaque)
++{
++    CFTypeRef transaction;
++    int32_t cid;
++
++    if (!space || pingouin_fullpanel_menu_failed || !pingouin_fullpanel_skylight()) {
++        return false;
++    }
++    cid = pingouin_sls_connection();
++    transaction = pingouin_sls_new_transaction(cid);
++    if (!transaction) {
++        pingouin_fullpanel_menu_failed = true;
++        fprintf(stderr, "pingouin: full panel: SkyLight gave no menu bar transaction (connection %d); the menu bar stays as macOS has it, normal full screen\n",
++                (int)cid);
++        return false;
++    }
++    pingouin_sls_menu_bar_alpha(transaction, space, opaque ? 1.0f : 0.0f);
++    pingouin_sls_commit(transaction, 1);
++    CFRelease(transaction);
++    return true;
++}
++
++/*
++ * 1: WindowServer has the window at AppKit's frame, 0: still moving
++ * (Mission Control animates the real window while AppKit's frame stays),
++ * -1: not known. Only ever used to wait, never to force a frame.
++ */
++static int pingouin_fullpanel_compositor(NSWindow *w)
++{
++    NSScreen *primary = [[NSScreen screens] firstObject];
++    CFArrayRef info;
++    int state = -1;
++
++    if (!w || !primary || ![w screen] || [w windowNumber] <= 0) {
++        return -1;
++    }
++    info = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow,
++                                      (CGWindowID)[w windowNumber]);
++    if (!info) {
++        return -1;
++    }
++    for (NSDictionary *entry in (NSArray *)info) {
++        CFDictionaryRef value;
++        CGRect bounds;
++
++        if ([[entry objectForKey:(id)kCGWindowNumber] integerValue] != [w windowNumber]) {
++            continue;
++        }
++        value = (CFDictionaryRef)[entry objectForKey:(id)kCGWindowBounds];
++        if (value && CGRectMakeWithDictionaryRepresentation(value, &bounds)) {
++            state = pingouin_fp_compositor_matches(pingouin_fullpanel_rect(NSRectFromCGRect(bounds)),
++                                                 pingouin_fullpanel_rect([w frame]),
++                                                 NSMaxY([primary frame])) ? 1 : 0;
++        }
++        break;
++    }
++    CFRelease(info);
++    return state;
++}
++
++@interface PingouinFullPanelState : NSObject
++{
++    NSWindow *window;          /* not retained: the window holds this state */
++    /* This full screen (willEnterFullScreen to willExitFullScreen). */
++    bool inside;               /* from willEnterFullScreen to willExitFullScreen */
++    bool armed;                /* every part there, a display with a camera housing */
++    bool entered;              /* didEnterFullScreen came */
++    bool accepted;             /* the window covered its display */
++    bool rejected;             /* it did not at didEnterFullScreen: AppKit's layout */
++    bool lost;                 /* it stopped covering later: AppKit's layout */
++    bool released;             /* its Space is on a display without a camera housing */
++    bool reveal;               /* the menu bar may come down (not with Keep the Dock away) */
++    NSRect accepted_display;
++    /* Applied (-apply:, -releaseSystemState). */
++    uint64_t space;            /* the Space whose menu bar backdrop is changed, or 0 */
++    bool opaque;               /* that backdrop as last set */
++    bool tracking;
++    bool asked;                /* pingouin_fp_asked_after_move */
++    bool shown;                /* AppKit's menu bar reveal on screen (titlebar window) */
++    bool releasing;            /* a return's one-turn release */
++    bool holding;              /* PINGOUIN_FP_HELD_BACK set */
++    uint64_t before;           /* the app's options before they were held back */
++    bool before_known;
++    uint64_t own;              /* the full screen's own options */
++    bool own_known;
++    NSWindow *titlebar;        /* AppKit's titlebar window, retained while observed */
++    bool titlebar_ignored;     /* its ignoresMouseEvents before */
++    bool titlebar_changed;
++    bool pass_through;
++    id child_observer;
++    id pointer_monitor;
++    bool options_observing;
++    /* Returns (Mission Control, Spaces, the Dock, Command-Tab). */
++    bool away;
++    bool return_pending;
++    bool return_from_away;
++    bool return_again_done;
++    bool reassert_scheduled;
++    unsigned return_checks;
++    /* Logged once per full screen. */
++    bool covered_logged;
++    bool reveal_logged;
++    bool fallback_logged;
++    bool options_logged;
++}
++- (id)initWithWindow:(NSWindow *)w;
++- (bool)claimsStrip;
++- (void)willEnterFullScreen;
++- (void)releaseSystemState;
++@end
++
++static char pingouin_fullpanel_state_key;
++static char pingouin_fullpanel_titlebar_context;
++static char pingouin_fullpanel_options_context;
++
++static PingouinFullPanelState *pingouin_fullpanel_state(NSWindow *window)
++{
++    return window ? objc_getAssociatedObject(window, &pingouin_fullpanel_state_key) : nil;
++}
++
++/* The guest's size, the full-screen area and the display box use the whole display. */
++static bool pingouin_fullpanel_window_usable(NSWindow *window)
++{
++    PingouinFullPanelState *state = pingouin_fullpanel_state(window);
++    return state && [state claimsStrip];
++}
++
++/*
++ * The reservation answer. AppKit's class, so it is the same method for
++ * every full-screen window of the process: AppKit is asked first, and only
++ * its yes for a window whose state claims the strip becomes no; any other
++ * window, and any call off the main thread, gets AppKit's answer. Installed
++ * once, before the first full screen, only when AppKit's method is AppKit's
++ * own; never put back (that could undo another library's later change).
++ * When other code changes it after us, the next full screens are normal.
++ */
++typedef BOOL (*PingouinFullPanelBoolFn)(id, SEL);
++typedef id (*PingouinFullPanelObjectFn)(id, SEL);
++
++static IMP pingouin_fullpanel_reservation;        /* ours, once installed */
++static bool pingouin_fullpanel_reservation_refused;
++
++/* What differs from macOS 27's controller, if anything (logged with the fallback). */
++static char pingouin_fullpanel_differs[192];
++
++/*
++ * The instance method `name` of `cls` with the type encoding `want`, else
++ * NULL and what differs in pingouin_fullpanel_differs (other types are
++ * another method).
++ */
++static Method pingouin_fullpanel_method(Class cls, const char *name, const char *want)
++{
++    Method m = class_getInstanceMethod(cls, sel_registerName(name));
++    const char *has = m ? method_getTypeEncoding(m) : NULL;
++
++    if (has && !strcmp(has, want)) {
++        return m;
++    }
++    if (pingouin_fullpanel_differs[0]) {
++        return NULL;
++    }
++    if (m) {
++        snprintf(pingouin_fullpanel_differs, sizeof(pingouin_fullpanel_differs),
++                 "%s -%s has the types %s, not %s", class_getName(cls), name,
++                 has ? has : "(none)", want);
++    } else {
++        snprintf(pingouin_fullpanel_differs, sizeof(pingouin_fullpanel_differs),
++                 "%s has no -%s", class_getName(cls), name);
++    }
++    return NULL;
++}
++
++/* The controller's class and methods as on macOS 27, looked up once. */
++static bool pingouin_fullpanel_controller(Class *cls, Method *reserves, Method *window_of,
++                                        bool *own)
++{
++    static bool looked, found, implements;
++    static Class c;
++    static Method r, w;
++
++    if (!looked) {
++        Class parent;
++
++        looked = true;
++        c = objc_getClass("_NSFullScreenContentController");
++        if (!c) {
++            snprintf(pingouin_fullpanel_differs, sizeof(pingouin_fullpanel_differs),
++                     "no class _NSFullScreenContentController");
++        }
++        r = c ? pingouin_fullpanel_method(c, "reservesSpaceForMenuBarInFullScreen", "B16@0:8") : NULL;
++        w = c ? pingouin_fullpanel_method(c, "window", "@16@0:8") : NULL;
++        found = r && w;
++        parent = c ? class_getSuperclass(c) : Nil;
++        implements = found &&
++            !(parent && class_getInstanceMethod(parent, method_getName(r)) == r);
++    }
++    if (cls) {
++        *cls = c;
++    }
++    if (reserves) {
++        *reserves = r;
++    }
++    if (window_of) {
++        *window_of = w;
++    }
++    if (own) {
++        *own = implements;
++    }
++    return found;
++}
++
++/* The implementation lies in the image that defines the class (AppKit). */
++static bool pingouin_fullpanel_in_image(IMP imp, Class cls)
++{
++    const char *image = class_getImageName(cls);
++    Dl_info info;
++
++    return imp && image && dladdr((const void *)imp, &info) && info.dli_fname &&
++           !strcmp(info.dli_fname, image);
++}
++
++static PingouinFPHook pingouin_fullpanel_hook_state(void)
++{
++    Class cls;
++    Method reserves;
++    bool own;
++    IMP now;
++
++    if (!pingouin_fullpanel_controller(&cls, &reserves, NULL, &own)) {
++        return pingouin_fp_hook(false, false, false, false, false);
++    }
++    if (pingouin_fullpanel_reservation_refused) {
++        return pingouin_fp_hook(true, own, false, false, false);
++    }
++    now = method_getImplementation(reserves);
++    return pingouin_fp_hook(true, own,
++                          !pingouin_fullpanel_reservation && pingouin_fullpanel_in_image(now, cls),
++                          pingouin_fullpanel_reservation != NULL,
++                          pingouin_fullpanel_reservation && now == pingouin_fullpanel_reservation);
++}
++
++/* Why the reservation is not answered, with what differs when it is known. */
++static void pingouin_fullpanel_hook_log(PingouinFPHook hook)
++{
++    const char *differs = pingouin_fullpanel_differs;
++
++    fprintf(stderr, "pingouin: full panel: %s%s%s%s; using normal full screen\n",
++            pingouin_fp_hook_text(hook), differs[0] ? " (" : "", differs, differs[0] ? ")" : "");
++}
++
++static bool pingouin_fullpanel_install_reservation(void)
++{
++    static bool tried;
++    PingouinFPHook hook;
++
++    if (!tried) {
++        Method reserves, window_of;
++        SEL reserves_sel, window_sel;
++        PingouinFullPanelBoolFn appkit;
++        PingouinFullPanelObjectFn window_get;
++
++        tried = true;
++        hook = pingouin_fullpanel_hook_state();
++        if (hook != PINGOUIN_FP_HOOK_USABLE) {
++            pingouin_fullpanel_reservation_refused = hook == PINGOUIN_FP_HOOK_INTERCEPTED;
++            pingouin_fullpanel_hook_log(hook);
++            return false;
++        }
++        pingouin_fullpanel_controller(NULL, &reserves, &window_of, NULL);
++        reserves_sel = method_getName(reserves);
++        window_sel = method_getName(window_of);
++        appkit = (PingouinFullPanelBoolFn)method_getImplementation(reserves);
++        window_get = (PingouinFullPanelObjectFn)method_getImplementation(window_of);
++        pingouin_fullpanel_reservation = imp_implementationWithBlock(^BOOL(id controller) {
++            BOOL keeps = appkit(controller, reserves_sel);
++            PingouinFullPanelState *state;
++            id w;
++
++            if (!keeps || ![NSThread isMainThread]) {
++                return keeps;
++            }
++            w = window_get(controller, window_sel);
++            state = [w isKindOfClass:[NSWindow class]] ? pingouin_fullpanel_state(w) : nil;
++            return state && [state claimsStrip] ? NO : keeps;
++        });
++        method_setImplementation(reserves, pingouin_fullpanel_reservation);
++        return true;
++    }
++    hook = pingouin_fullpanel_hook_state();
++    if (hook != PINGOUIN_FP_HOOK_USABLE) {
++        static bool logged;
++        if (!logged) {
++            logged = true;
++            pingouin_fullpanel_hook_log(hook);
++        }
++        return false;
++    }
++    return true;
++}
++
++/* The rules' bits are AppKit's (ui/pingouin-fullpanel.h). */
++QEMU_BUILD_BUG_ON(NSApplicationPresentationAutoHideDock != PINGOUIN_FP_AUTO_HIDE_DOCK);
++QEMU_BUILD_BUG_ON(NSApplicationPresentationHideDock != PINGOUIN_FP_HIDE_DOCK);
++QEMU_BUILD_BUG_ON(NSApplicationPresentationAutoHideMenuBar != PINGOUIN_FP_AUTO_HIDE_MENU_BAR);
++QEMU_BUILD_BUG_ON(NSApplicationPresentationHideMenuBar != PINGOUIN_FP_HIDE_MENU_BAR);
++QEMU_BUILD_BUG_ON(NSApplicationPresentationFullScreen != PINGOUIN_FP_FULL_SCREEN);
++
++@implementation PingouinFullPanelState
++
++- (id)initWithWindow:(NSWindow *)w
++{
++    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
++
++    self = [super init];
++    if (!self) {
++        return nil;
++    }
++    window = w;
++    opaque = true;
++
++    [center addObserver:self selector:@selector(didEnterFullScreen:)
++                   name:NSWindowDidEnterFullScreenNotification object:w];
++    [center addObserver:self selector:@selector(willExitFullScreen:)
++                   name:NSWindowWillExitFullScreenNotification object:w];
++    [center addObserver:self selector:@selector(windowWillClose:)
++                   name:NSWindowWillCloseNotification object:w];
++    [center addObserver:self selector:@selector(frameChanged:)
++                   name:NSWindowDidResizeNotification object:w];
++    [center addObserver:self selector:@selector(frameChanged:)
++                   name:NSWindowDidMoveNotification object:w];
++    [center addObserver:self selector:@selector(screenChanged:)
++                   name:NSWindowDidChangeScreenNotification object:w];
++    [center addObserver:self selector:@selector(screenChanged:)
++                   name:NSApplicationDidChangeScreenParametersNotification object:nil];
++    [center addObserver:self selector:@selector(cameBack:)
++                   name:NSWindowDidBecomeKeyNotification object:w];
++    [center addObserver:self selector:@selector(cameBack:)
++                   name:NSApplicationDidBecomeActiveNotification object:nil];
++    [center addObserver:self selector:@selector(wentAway:)
++                   name:NSWindowDidResignKeyNotification object:w];
++    [center addObserver:self selector:@selector(wentAway:)
++                   name:NSApplicationDidResignActiveNotification object:nil];
++    [center addObserver:self selector:@selector(visibilityChanged:)
++                   name:NSWindowDidChangeOcclusionStateNotification object:w];
++    [[[NSWorkspace sharedWorkspace] notificationCenter]
++        addObserver:self selector:@selector(visibilityChanged:)
++        name:NSWorkspaceActiveSpaceDidChangeNotification object:nil];
++    return self;
++}
++
++- (void)dealloc
++{
++    [self releaseSystemState];
++    [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
++    [[NSNotificationCenter defaultCenter] removeObserver:self];
++    [super dealloc];
++}
++
++/* The reservation answer's question: does this window's full screen take the strip? */
++- (bool)claimsStrip
++{
++    return window && inside && armed && !rejected && !lost && !released &&
++           !pingouin_fullpanel_menu_failed && pingouin_fullpanel_notch(window);
++}
++
++/*
++ * Before AppKit lays the window out for full screen (every way in posts
++ * it first, before the reservation question): this full screen's parts.
++ */
++- (void)willEnterFullScreen
++{
++    NSScreen *screen = [window screen];
++    double notch = screen ? [screen safeAreaInsets].top : 0;
++    bool always = [[NSUserDefaults standardUserDefaults] boolForKey:@"AppleMenuBarVisibleInFullscreen"];
++    PingouinFPFallback fallback;
++
++    [self releaseSystemState];
++    [self endFullScreen];
++    inside = true;
++    fallback = pingouin_fp_fallback(notch, pingouin_fp_menu_bar_in_the_way(always, immersive_mode_enabled),
++                                  notch > 0 && pingouin_fullpanel_install_reservation(),
++                                  pingouin_fullpanel_skylight() && !pingouin_fullpanel_menu_failed);
++    if (fallback != PINGOUIN_FP_OK) {
++        if (!fallback_logged) {
++            fallback_logged = true;
++            if (pingouin_fp_fallback_checked(fallback, pingouin_fullpanel_beside_builtin(window))) {
++                fprintf(stderr, "pingouin: full panel: %s: normal full screen\n",
++                        pingouin_fp_fallback_text(fallback));
++            } else {
++                fprintf(stderr, "pingouin: full panel: a window on another display than the built-in one: macOS's own full screen there\n");
++            }
++        }
++        return;
++    }
++    armed = true;
++    reveal = !immersive_mode_enabled;
++}
++
++/* Everything of the last full screen forgotten (the logs may come again). */
++- (void)endFullScreen
++{
++    inside = armed = entered = accepted = rejected = lost = released = reveal = false;
++    own_known = false;
++    covered_logged = reveal_logged = fallback_logged = options_logged = false;
++}
++
++/* Whether AppKit gave this full screen the whole display (definitive: didEnterFullScreen). */
++- (void)verify:(bool)definitive
++{
++    PingouinFPVerdict verdict;
++    NSRect frame, display;
++
++    if (!armed || rejected || (accepted && !definitive)) {
++        return;
++    }
++    verdict = pingouin_fp_verdict([self claimsStrip], pingouin_fullpanel_in_full_screen(window),
++                                pingouin_fullpanel_covers(window),
++                                pingouin_fullpanel_notch(window), definitive);
++    if (verdict == PINGOUIN_FP_PENDING || (verdict == PINGOUIN_FP_ACCEPTED && accepted)) {
++        return;
++    }
++    if (verdict == PINGOUIN_FP_ACCEPTED) {
++        accepted = true;
++        accepted_display = [[window screen] frame];
++        return;
++    }
++    accepted = false;
++    rejected = true;
++    [self releaseSystemState];
++    frame = [window frame];
++    display = [[window screen] frame];
++    fprintf(stderr, "pingouin: full panel: AppKit kept its own layout (%.0f %.0f %.0fx%.0f) on display (%.0f %.0f %.0fx%.0f), Split View or below the notch: normal full screen for this one\n",
++            frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
++            display.origin.x, display.origin.y, display.size.width, display.size.height);
++    [self relayout];
++}
++
++- (void)didEnterFullScreen:(NSNotification *)notification
++{
++    [self verify:true];
++    if (!armed || !accepted) {
++        return;
++    }
++    entered = true;
++    /* The way in is no return from away. */
++    away = false;
++    return_from_away = false;
++    [self engage];
++}
++
++- (void)willExitFullScreen:(NSNotification *)notification
++{
++    [self releaseSystemState];
++    [self endFullScreen];
++}
++
++/* Closed (also in full screen): nothing of FullPanel's stays behind it. */
++- (void)windowWillClose:(NSNotification *)notification
++{
++    [self releaseSystemState];
++    inside = armed = false;
++}
++
++/*
++ * This full screen stopped claiming the strip (rejected, lost, on a display
++ * without a housing) or claims it again. QEMU's own handlers may have sized
++ * the guest and the display arrangement on the same notification, before
++ * the claim changed: they run once more on the next turn (the window's
++ * delegate as after a resize, the arrangement after its settle time).
++ */
++- (void)relayout
++{
++    dispatch_async(dispatch_get_main_queue(), ^{
++        id<NSWindowDelegate> delegate = window ? [window delegate] : nil;
++
++        if ([delegate respondsToSelector:@selector(windowDidResize:)]) {
++            [delegate windowDidResize:[NSNotification
++                notificationWithName:NSWindowDidResizeNotification object:window]];
++        }
++        pingouin_displays_update();
++    });
++}
++
++/* The window covers the strip of its own Space, which is the active one. */
++- (bool)eligible
++{
++    return armed && accepted && inside && !lost && !released && !rejected &&
++           pingouin_fullpanel_in_full_screen(window) && [window isOnActiveSpace] &&
++           pingouin_fullpanel_covers(window) && !pingouin_fullpanel_no_notch(window);
++}
++
++/*
++ * The backdrop for the window's full-screen Space (again after a return:
++ * WindowServer may have put it back), and the reveal followed from then on.
++ * true when it was set; setting it is no proof that it shows.
++ */
++- (bool)engage
++{
++    NSScreen *screen = [window screen];
++    uint64_t s;
++
++    if (![self eligible]) {
++        return false;
++    }
++    s = pingouin_fullpanel_space(window);
++    if (!s) {
++        return false;
++    }
++    if (space && space != s) {
++        pingouin_fullpanel_backdrop(space, true);
++    }
++    space = s;
++    [self startTracking];
++    if (![self apply:true]) {
++        /* No transaction (logged): macOS's menu bar, AppKit's layout. */
++        [self releaseSystemState];
++        return false;
++    }
++    if (!covered_logged) {
++        covered_logged = true;
++        /* pingouin check reads this line: the strip beside the notch shows the VM. */
++        fprintf(stderr, "pingouin: full panel: strip covered: full-screen Space %llu, display %.0fx%.0f, notch %.0f, %s\n",
++                (unsigned long long)s, [screen frame].size.width, [screen frame].size.height,
++                [screen safeAreaInsets].top, immersive_mode_enabled ?
++                "menu bar hidden (Keep the Dock away)" : "menu bar at the top edge");
++    }
++    return true;
++}
++
++- (PingouinFPFacts)facts
++{
++    return (PingouinFPFacts){
++        .covering = tracking && space,
++        .key = [window isKeyWindow],
++        .on_space = [window isOnActiveSpace],
++        .reveal = reveal,
++        .asked = asked,
++        .shown = shown,
++        .releasing = releasing,
++        .holding = holding,
++    };
++}
++
++/*
++ * The one place FullPanel's intent is applied: the backdrop (set when it
++ * changes, or always with `submit`), the app's options, the titlebar.
++ * false only when a backdrop to set could not be.
++ */
++- (bool)apply:(bool)submit
++{
++    PingouinFPFacts facts = [self facts];
++    PingouinFPIntent intent = pingouin_fp_intent(facts);
++    bool ok = true;
++
++    if (facts.covering && (submit || intent.menu_bar_opaque != opaque)) {
++        ok = pingouin_fullpanel_backdrop(space, intent.menu_bar_opaque);
++        if (ok) {
++            opaque = intent.menu_bar_opaque;
++        }
++    }
++    [self options:intent.options];
++    [self setPassThrough:facts.covering && intent.pass_through];
++    if (facts.covering && intent.menu_bar_opaque && !reveal_logged) {
++        reveal_logged = true;
++        fprintf(stderr, "pingouin: full panel: menu bar came down at the top edge\n");
++    }
++    return ok;
++}
++
++- (void)reconcile
++{
++    (void)[self apply:false];
++}
++
++- (void)setOptions:(uint64_t)options
++{
++    if ((uint64_t)[NSApp presentationOptions] == options) {
++        return;
++    }
++    @try {
++        [NSApp setPresentationOptions:(NSApplicationPresentationOptions)options];
++    } @catch (NSException *exception) {
++        /* AppKit refuses a combination: its own stay (normal full screen's). */
++        if (options == PINGOUIN_FP_HELD_BACK) {
++            holding = false;
++        }
++        if (!options_logged) {
++            options_logged = true;
++            fprintf(stderr, "pingouin: full panel: AppKit refused presentation options 0x%llx: %s; normal full screen menu bar\n",
++                    (unsigned long long)options, [[exception reason] UTF8String]);
++        }
++    }
++}
++
++- (void)options:(PingouinFPOptions)options
++{
++    uint64_t current = (uint64_t)[NSApp presentationOptions];
++
++    if (options == PINGOUIN_FP_OPTIONS_HOLD) {
++        if (!holding && !before_known) {
++            before = current;
++            before_known = true;
++        }
++        if (pingouin_fp_own_options(pingouin_fullpanel_in_full_screen(window), current)) {
++            own = current;
++            own_known = true;
++        }
++        holding = true;
++        [self setOptions:PINGOUIN_FP_HELD_BACK];
++    } else if (options == PINGOUIN_FP_OPTIONS_RELAX && holding) {
++        holding = false;
++        [self setOptions:pingouin_fp_relax_target(own_known, own, before, reveal)];
++    }
++}
++
++/* FullPanel lets go of the app's options: the full screen's own, or the ones from before. */
++- (void)restoreOptions
++{
++    uint64_t target;
++
++    if (holding) {
++        holding = false;
++        if (pingouin_fp_restore(pingouin_fullpanel_in_full_screen(window), own_known, own,
++                              before_known ? before : (uint64_t)[NSApp presentationOptions],
++                              &target)) {
++            [self setOptions:target];
++        }
++    }
++    before_known = false;
++}
++
++/*
++ * AppKit's titlebar window for the full screen (a child window of it,
++ * NSToolbarFullScreenWindow): AppKit fades it in with the menu bar's reveal
++ * and out again, so its alpha (observed) says when a reveal is on screen;
++ * a reveal starts only while AppKit means to show the menu bar. Without
++ * one, AppKit's intent alone. It lies over the strip: while no reveal is
++ * on screen it lets clicks through to the VM.
++ */
++- (void)followTitlebar
++{
++    NSWindow *found = nil;
++
++    if (!tracking) {
++        return;
++    }
++    for (NSWindow *child in [window childWindows]) {
++        if ([NSStringFromClass([child class]) isEqualToString:@"NSToolbarFullScreenWindow"]) {
++            found = child;
++            break;
++        }
++    }
++    if (found != titlebar) {
++        [self letGoOfTitlebar];
++        if (found) {
++            titlebar = [found retain];
++            [titlebar addObserver:self forKeyPath:@"alphaValue" options:0
++                          context:&pingouin_fullpanel_titlebar_context];
++        }
++    }
++    [self applyPassThrough];
++    [self readReveal];
++}
++
++- (void)letGoOfTitlebar
++{
++    if (!titlebar) {
++        return;
++    }
++    [titlebar removeObserver:self forKeyPath:@"alphaValue"
++                     context:&pingouin_fullpanel_titlebar_context];
++    if (titlebar_changed) {
++        [titlebar setIgnoresMouseEvents:titlebar_ignored];
++    }
++    [titlebar release];
++    titlebar = nil;
++    titlebar_changed = false;
++}
++
++- (void)setPassThrough:(bool)on
++{
++    pass_through = on;
++    [self applyPassThrough];
++}
++
++- (void)applyPassThrough
++{
++    if (!titlebar) {
++        return;
++    }
++    if (pass_through) {
++        if (!titlebar_changed) {
++            titlebar_ignored = [titlebar ignoresMouseEvents];
++            titlebar_changed = true;
++        }
++        if (![titlebar ignoresMouseEvents]) {
++            [titlebar setIgnoresMouseEvents:YES];
++        }
++    } else if (titlebar_changed) {
++        [titlebar setIgnoresMouseEvents:titlebar_ignored];
++        titlebar_changed = false;
++    }
++}
++
++- (void)readReveal
++{
++    NSScreen *screen = [window screen];
++    bool on;
++
++    if (!tracking) {
++        return;
++    }
++    if (titlebar) {
++        /* It starts with AppKit's intent and ends with the fade-out. */
++        on = [titlebar alphaValue] > 0.01 && (shown || [NSMenu menuBarVisible]);
++    } else {
++        on = [NSMenu menuBarVisible];
++    }
++    if (on == shown) {
++        return;
++    }
++    shown = on;
++    if (!on && screen) {
++        /* The reveal went: still asked only while the pointer is in the strip. */
++        asked = pingouin_fp_asked_after_move(asked,
++                    pingouin_fp_zone([NSEvent mouseLocation].y, NSMaxY([screen frame]),
++                                   [screen safeAreaInsets].top), false);
++    }
++    [self reconcile];
++}
++
++- (void)pointerMoved
++{
++    NSScreen *screen = [window screen];
++    bool now;
++
++    if (!tracking || ![window isKeyWindow] || !screen) {
++        return;
++    }
++    now = pingouin_fp_asked_after_move(asked,
++              pingouin_fp_zone([NSEvent mouseLocation].y, NSMaxY([screen frame]),
++                             [screen safeAreaInsets].top), shown);
++    if (now != asked) {
++        asked = now;
++        [self reconcile];
++    }
++}
++
++- (void)startTracking
++{
++    __block PingouinFullPanelState *me = self;   /* not retained: removed before it goes */
++
++    if (tracking || !window) {
++        return;
++    }
++    tracking = true;
++    asked = false;
++    shown = false;
++    /* AppKit may order in a new titlebar window (around Mission Control). */
++    child_observer = [[[NSNotificationCenter defaultCenter]
++        addObserverForName:NSWindowDidChangeOcclusionStateNotification object:nil queue:nil
++                usingBlock:^(NSNotification *note) {
++        NSWindow *other = [note object];
++        if ([other isKindOfClass:[NSWindow class]] && me->window &&
++            [other parentWindow] == me->window && other != me->titlebar) {
++            [me followTitlebar];
++        }
++    }] retain];
++    [self followTitlebar];
++    /* Only without "Keep the Dock away": with it the menu bar never comes down. */
++    if (reveal) {
++        pointer_monitor = [[NSEvent addLocalMonitorForEventsMatchingMask:
++            (NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged |
++             NSEventMaskRightMouseDragged | NSEventMaskOtherMouseDragged)
++            handler:^NSEvent *(NSEvent *event) {
++                [me pointerMoved];
++                return event;
++            }] retain];
++    }
++    [NSApp addObserver:self forKeyPath:@"currentSystemPresentationOptions" options:0
++               context:&pingouin_fullpanel_options_context];
++    options_observing = true;
++}
++
++- (void)stopTracking
++{
++    if (pointer_monitor) {
++        [NSEvent removeMonitor:pointer_monitor];
++        [pointer_monitor release];
++        pointer_monitor = nil;
++    }
++    if (options_observing) {
++        @try {
++            [NSApp removeObserver:self forKeyPath:@"currentSystemPresentationOptions"
++                          context:&pingouin_fullpanel_options_context];
++        } @catch (NSException *exception) {
++            (void)exception;
++        }
++        options_observing = false;
++    }
++    if (child_observer) {
++        [[NSNotificationCenter defaultCenter] removeObserver:child_observer];
++        [child_observer release];
++        child_observer = nil;
++    }
++    pass_through = false;
++    [self letGoOfTitlebar];
++    tracking = false;
++    asked = false;
++    shown = false;
++}
++
++/*
++ * Everything FullPanel changed outside the window back as it was: the
++ * backdrop, the app's options, the titlebar, the monitor, the observers,
++ * pending returns. The full screen itself stays as it is.
++ */
++- (void)releaseSystemState
++{
++    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(checkReturn)
++                                               object:nil];
++    return_pending = false;
++    return_from_away = false;
++    reassert_scheduled = false;
++    releasing = false;
++    away = false;
++    [self stopTracking];
++    if (space) {
++        pingouin_fullpanel_backdrop(space, true);
++        space = 0;
++    }
++    opaque = true;
++    [self restoreOptions];
++}
++
++/* AppKit moved or resized the window: its full screen counts, or was lost. */
++- (void)frameChanged:(NSNotification *)notification
++{
++    NSScreen *screen = [window screen];
++    bool covers;
++
++    if (!armed || !inside || !pingouin_fullpanel_in_full_screen(window)) {
++        return;
++    }
++    if (!accepted) {
++        [self verify:false];
++    } else if (entered && !lost && !released && screen) {
++        covers = pingouin_fullpanel_covers(window);
++        if (covers) {
++            accepted_display = [screen frame];
++        } else if (pingouin_fp_lost(accepted, true, covers,
++                                  pingouin_fullpanel_same_display(screen, accepted_display))) {
++            NSRect actual = [window frame], physical = [screen frame];
++
++            lost = true;
++            [self releaseSystemState];
++            fprintf(stderr, "pingouin: full panel: strip lost: frame (%.0f %.0f %.0fx%.0f) on display (%.0f %.0f %.0fx%.0f); normal full screen until the next one\n",
++                    actual.origin.x, actual.origin.y, actual.size.width, actual.size.height,
++                    physical.origin.x, physical.origin.y, physical.size.width, physical.size.height);
++            [self relayout];
++            return;
++        }
++    }
++    [self comeBack];
++}
++
++/*
++ * A full-screen Space on (or moved to) a display without a camera housing
++ * is normal full screen there; back beside one, the strip again.
++ */
++- (void)screenChanged:(NSNotification *)notification
++{
++    bool full = pingouin_fullpanel_in_full_screen(window);
++
++    if (pingouin_fp_screen_releases(armed && inside, full, !pingouin_fullpanel_no_notch(window),
++                                  released)) {
++        released = true;
++        [self releaseSystemState];
++        fprintf(stderr, "pingouin: full panel: the full screen is on a display without a camera housing: normal full screen there\n");
++        [self relayout];
++    } else if (pingouin_fp_screen_resumes(released, full, pingouin_fullpanel_notch(window))) {
++        released = false;
++        covered_logged = false;
++        [self relayout];
++        [self comeBack];
++    } else if (full) {
++        [self comeBack];
++    }
++}
++
++/*
++ * A sign of coming and going (keyness, activation, visibility, the active
++ * Space): while followed, the titlebar is looked for again (AppKit may
++ * have made a new one) and the intent applied; the backdrop is set again
++ * when the window's visibility or Space changed, also while the Space is
++ * shown in Mission Control (set only after the return, the strip stayed
++ * black for longer). Never a frame or a Space.
++ */
++- (void)noteEvent:(bool)resubmit
++{
++    bool key = [window isKeyWindow];
++    bool on_space = [window isOnActiveSpace];
++    bool visible = ([window occlusionState] & NSWindowOcclusionStateVisible) != 0;
++
++    if (tracking) {
++        [self followTitlebar];
++        (void)[self apply:resubmit];
++    }
++    if (!armed || !accepted || !inside || lost || !space ||
++        !pingouin_fullpanel_in_full_screen(window)) {
++        return;
++    }
++    if (!away && (!key || ![NSApp isActive] || !on_space || !visible)) {
++        away = true;
++    }
++}
++
++- (void)cameBack:(NSNotification *)notification
++{
++    [self noteEvent:false];
++    [self comeBack];
++}
++
++- (void)wentAway:(NSNotification *)notification
++{
++    [self noteEvent:false];
++}
++
++- (void)visibilityChanged:(NSNotification *)notification
++{
++    [self noteEvent:true];
++    if ([[notification name] isEqualToString:NSWorkspaceActiveSpaceDidChangeNotification] ||
++        ([window occlusionState] & NSWindowOcclusionStateVisible)) {
++        [self comeBack];
++    }
++}
++
++/*
++ * The backdrop once per return, before WindowServer has the window in
++ * place; the compositor-checked engage after it still decides.
++ */
++- (void)earlyApply
++{
++    uint64_t s;
++
++    if (!away || !armed || !accepted || !inside || lost || !space || shown ||
++        !pingouin_fullpanel_in_full_screen(window) || !pingouin_fullpanel_covers(window) ||
++        !([window occlusionState] & NSWindowOcclusionStateVisible) ||
++        ![window isOnActiveSpace] || ![window isKeyWindow]) {
++        return;
++    }
++    s = pingouin_fullpanel_space(window);
++    if (s != space) {
++        return;
++    }
++    away = false;   /* once per return */
++    if (pingouin_fullpanel_backdrop(s, false)) {
++        opaque = false;
++    }
++}
++
++/*
++ * Back in the Space (Mission Control, a Space switch, the Dock, Command-Tab)
++ * or the window changed: engage again once WindowServer has the window at
++ * its frame (checked at 1/60 s, at most 2 s). One check at a time; one
++ * started while Mission Control was still open starts again once at the
++ * real return.
++ */
++- (void)comeBack
++{
++    bool was_away = away;
++
++    if (!armed || !inside || rejected || lost || released ||
++        !pingouin_fullpanel_in_full_screen(window)) {
++        return;
++    }
++    if (!accepted) {
++        [self verify:false];
++    }
++    [self earlyApply];
++    if (return_pending) {
++        if (pingouin_fp_return_again(true, was_away, [window isKeyWindow], [window isOnActiveSpace],
++                                   ([window occlusionState] & NSWindowOcclusionStateVisible) != 0,
++                                   return_again_done)) {
++            return_again_done = true;
++            return_from_away = true;
++            return_checks = PINGOUIN_FP_RETURN_CHECKS;
++        }
++        return;
++    }
++    return_pending = true;
++    return_again_done = false;
++    return_from_away = was_away;
++    return_checks = PINGOUIN_FP_RETURN_CHECKS;
++    [self performSelector:@selector(checkReturn) withObject:nil afterDelay:0.016
++                  inModes:[NSArray arrayWithObject:NSRunLoopCommonModes]];
++}
++
++- (void)checkReturn
++{
++    int compositor;
++
++    if (!return_pending) {
++        return;
++    }
++    if (!armed || !inside || rejected || lost || released ||
++        !pingouin_fullpanel_in_full_screen(window)) {
++        return_pending = false;
++        return;
++    }
++    compositor = pingouin_fullpanel_compositor(window);
++    if (pingouin_fp_return_ready(pingouin_fullpanel_covers(window), [window isOnActiveSpace],
++                               [window isKeyWindow], compositor, return_checks)) {
++        bool done = [self engage];
++        if (done) {
++            away = false;
++        }
++        if (done && pingouin_fp_return_reassert(return_from_away, tracking && reveal, holding,
++                                              shown, reassert_scheduled)) {
++            [self reassert];
++        }
++        return_from_away = false;
++        return_pending = false;
++        return;
++    }
++    if (return_checks-- == 0) {
++        return_pending = false;
++        if ([window isOnActiveSpace] && [window isKeyWindow]) {
++            fprintf(stderr, "pingouin: full panel: return not settled in 2 s (WindowServer %d); nothing forced\n",
++                    compositor);
++        }
++        return;
++    }
++    [self performSelector:@selector(checkReturn) withObject:nil afterDelay:1.0 / 60
++                  inModes:[NSArray arrayWithObject:NSRunLoopCommonModes]];
++}
++
++/*
++ * Once per return from away with the menu bar held back: release the
++ * options for one main-queue turn, hold them again on the next, then the
++ * backdrop on the one after, the order a top-edge reveal ends with.
++ */
++- (void)reassert
++{
++    reassert_scheduled = true;
++    releasing = true;
++    [self reconcile];
++    dispatch_async(dispatch_get_main_queue(), ^{
++        releasing = false;
++        if (!reassert_scheduled || !tracking || !space) {
++            reassert_scheduled = false;
++            return;
++        }
++        [self reconcile];
++        dispatch_async(dispatch_get_main_queue(), ^{
++            bool live = reassert_scheduled && tracking && space;
++            reassert_scheduled = false;
++            if (live) {
++                (void)[self apply:true];
++            }
++        });
++    });
++}
++
++- (void)observeValueForKeyPath:(NSString *)keyPath
++                      ofObject:(id)object
++                        change:(NSDictionary *)change
++                       context:(void *)context
++{
++    if (context == &pingouin_fullpanel_titlebar_context) {
++        if (object != titlebar) {
++            return;
++        }
++        if ([NSThread isMainThread]) {
++            [self readReveal];
++        } else {
++            dispatch_async(dispatch_get_main_queue(), ^{
++                [self readReveal];
++            });
++        }
++        return;
++    }
++    if (context == &pingouin_fullpanel_options_context) {
++        /* Once the change has reached everyone. */
++        dispatch_async(dispatch_get_main_queue(), ^{
++            [self reconcile];
++        });
++        return;
++    }
++    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
++}
++
++@end
++
++/* A VM window's FullPanel state, made before its first full screen. */
++static void pingouin_fullpanel_prepare_window(NSWindow *window)
++{
++    PingouinFullPanelState *state;
++
++    if (!window || pingouin_fullpanel_state(window)) {
++        return;
++    }
++    state = [[PingouinFullPanelState alloc] initWithWindow:window];
++    objc_setAssociatedObject(window, &pingouin_fullpanel_state_key, state,
++                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++    [state release];
++}
++
++/* The VM's windows: the main one and the other displays' (external displays on). */
++static bool pingouin_fullpanel_vm_window(id w)
++{
++    return [w isKindOfClass:[QemuWindow class]] ||
++           [w isKindOfClass:objc_getClass("PingouinHeadWindow")];
++}
++
++/*
++ * At the start, before any window goes full screen: the reservation answer
++ * (AppKit asks during the way in) and, on every way into full screen of a
++ * VM window, its state and that full screen's parts.
++ */
++static void pingouin_fullpanel_init(void)
++{
++    if (!pingouin_fullpanel_requested()) {
++        return;
++    }
++    fprintf(stderr, "pingouin: full panel: asked for (PINGOUIN_FULLPANEL=1)\n");
++    (void)pingouin_fullpanel_install_reservation();
++    (void)pingouin_fullpanel_skylight();
++    [[NSNotificationCenter defaultCenter]
++        addObserverForName:NSWindowWillEnterFullScreenNotification object:nil queue:nil
++                usingBlock:^(NSNotification *note) {
++        NSWindow *w = [note object];
++        if (pingouin_fullpanel_vm_window(w)) {
++            pingouin_fullpanel_prepare_window(w);
++            [pingouin_fullpanel_state(w) willEnterFullScreen];
++        }
++    }];
++}
++
+ static BOOL notchFull;
+ static NSRect notchSavedFrame;
+ 
+@@ -7450,7 +8864,7 @@ static PingouinBox pingouin_display_box(NSScreen *s, bool below_notch)
+     CGRect r = CGDisplayBounds(pingouin_screen_id(s));
+     PingouinBox b = { r.origin.x, r.origin.y, r.size.width, r.size.height };
+ 
+-    if (below_notch) {
++    if (below_notch && !pingouin_fullpanel_window_usable([cocoaView window])) {
+         NSEdgeInsets in = [s safeAreaInsets];
+         b.x += in.left;
+         b.y += in.top;
+@@ -9683,6 +11097,8 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
+                         opts->u.cocoa.full_grab;
+     immersive_mode_enabled = !opts->u.cocoa.has_immersive ||
+                              opts->u.cocoa.immersive;
++    /* FullPanel (PINGOUIN_FULLPANEL=1): ready before the window goes full screen. */
++    pingouin_fullpanel_init();
+ 
+     /* if fullscreen mode is to be used */
+     if (opts->has_full_screen && opts->full_screen) {

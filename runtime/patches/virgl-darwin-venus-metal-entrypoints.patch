@@ -1,0 +1,44 @@
+From: OmacVM
+Subject: [PATCH] venus: no Metal export or import without the entry points
+
+What: check vkGetMemoryMetalHandleEXT and
+vkGetMemoryMetalHandlePropertiesEXT before calling them; without them the
+export or import fails with a log line instead of calling NULL.
+Why: they are looked up with vkGetDeviceProcAddr after device creation. A
+driver built without VK_USE_PLATFORM_METAL_EXT (KosmicKrisp without Mesa's
+macos platform) lists VK_EXT_external_memory_metal but returns NULL, and
+the first blob a guest asked for crashed QEMU (SIGSEGV at 0 in
+vkr_device_memory_export_blob): a guest-triggered host crash.
+Upstream: upstreamable with the Venus-on-Metal patches (startergo's
+homebrew-virglrenderer), not sent. Applies after
+virgl-darwin-venus-heap-check.patch.
+Test: KosmicKrisp built with -Dplatforms= (no macos) on the Mac mini:
+vkmark in the guest fails with vk::Device::mapMemory ErrorMemoryMapFailed,
+QEMU logs "metal export failed: the driver has no vkGetMemoryMetalHandleEXT"
+and keeps running.
+
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -510,6 +510,11 @@
+          .pNext = NULL,
+          .memoryTypeBits = 0,
+       };
++      if (!vk->GetMemoryMetalHandlePropertiesEXT) {
++         vkr_log("metal import failed: the driver has no vkGetMemoryMetalHandlePropertiesEXT");
++         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++         return;
++      }
+       args->ret =
+          vk->GetMemoryMetalHandlePropertiesEXT(args->device, handle_type, res->u.metal_heap, &mem_metal_props);
+       if (args->ret != VK_SUCCESS)
+@@ -657,6 +662,10 @@
+          .memory = mem->base.handle.device_memory,
+          .handleType = handle_type,
+       };
++      if (!vk->GetMemoryMetalHandleEXT) {
++         vkr_log("metal export failed: the driver has no vkGetMemoryMetalHandleEXT");
++         return false;
++      }
+       VkResult ret = vk->GetMemoryMetalHandleEXT(mem->device->base.handle.device, &metal_info, &metal_heap);
+       if (ret != VK_SUCCESS || !metal_heap) {
+          /* MoltenVK has a heap only with MVK_CONFIG_USE_MTLHEAP=1 */

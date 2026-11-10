@@ -1,0 +1,37 @@
+From: OmacVM
+Subject: [PATCH] virtio-gpu-virgl: no MAP_FIXED blob mappings under HVF
+
+QEMU maps a blob into hostmem with mmap(MAP_FIXED) over the region the
+guest already has. KVM follows the new host pages; HVF keeps the pages it
+was given by hv_vm_map, so the guest never sees the blob (Venus: the ring
+stays empty and every Vulkan call hangs). Under HVF use the subregion
+mapping, which HVF maps on its own.
+
+Upstream: not sent (an HVF-only bug).
+Test: Venus vkmark and vkcube in an app VM.
+
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -19,6 +19,7 @@
+ #include "hw/virtio/virtio-gpu.h"
+ #include "hw/virtio/virtio-gpu-bswap.h"
+ #include "hw/virtio/virtio-gpu-pixman.h"
++#include "system/hvf.h"
+ 
+ #include "ui/egl-helpers.h"
+ 
+@@ -185,7 +186,13 @@
+         return -EBUSY;
+     }
+ 
+-    ret = virgl_renderer_resource_map_fixed(res->base.resource_id,
++    /*
++     * Under HVF the guest sees the pages hostmem had when it was mapped
++     * (hv_vm_map): replacing them with mmap(MAP_FIXED) is never seen by the
++     * guest, unlike KVM, which follows the host mapping. Map a subregion.
++     */
++    ret = hvf_enabled() ? -EOPNOTSUPP :
++          virgl_renderer_resource_map_fixed(res->base.resource_id,
+                                             gl->hostmem_mmap + offset);
+     switch (ret) {
+     case 0:

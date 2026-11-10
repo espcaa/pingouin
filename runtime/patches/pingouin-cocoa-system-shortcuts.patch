@@ -1,0 +1,255 @@
+From: OmacVM
+Subject: [PATCH] cocoa: macOS's own shortcuts go to the VM while it has the keyboard
+
+Applies after all other Cocoa patches and pingouin-cocoa-shortcuts-logic.patch
+(the header with the logic; last in build-qemu-gpu-runtime.sh).
+
+What: while the VM window has the keyboard (full grab on, our app in front,
+our window key), macOS's global shortcuts are switched off with
+CGSSetGlobalHotKeyOperatingMode (as VirtualBox and UTM do), and on again the
+moment it has not. Screenshots (Cmd+Shift+3/4/5 and the Ctrl variants),
+Mission Control, App Expose, Show Desktop, Launchpad, Ctrl+arrows,
+Spotlight, input sources, Cmd+Tab, Cmd+`, Quick Note, Force Quit's chord and
+the rest of macOS's list then reach the VM like any other key. Apple's own
+top-row key codes (Mission Control, Spotlight, Dictation, Do Not Disturb,
+Launchpad, Dashboard) reach the VM as the F-key they sit on.
+
+Why: the HID event tap from full grab sees most chords, but not all of them
+(macOS handles some before any tap, and the tap needs Accessibility), so
+Cmd+Shift+4 or Cmd+F11 could still go to macOS.
+
+Safety: the switch belongs to this process's window-server connection. When
+QEMU exits or crashes, macOS turns the shortcuts back on by itself (checked:
+a process that switched them off and was killed leaves them on); another
+process cannot keep them off. A watchdog thread turns them on when the
+window's thread has not answered for 2 s, so a hung VM window never keeps
+them. PINGOUIN_MAC_SHORTCUTS=1 leaves them with macOS. The escape combo
+(Ctrl+Option+Esc; the old Ctrl+Option+Cmd+Esc through 3.0.x) is OmacVM
+Gestures'; when Gestures is not running the
+VM sees it, and in full screen it then hands the keyboard back to macOS
+(shortcuts on, app hidden). Media keys are not shortcuts: the Bridge routes
+them as before.
+
+Upstream: not proposed (QEMU's Cocoa UI has no keyboard-grab policy of this
+kind; it would need an option there).
+Test: app/runtime/Tests/keys/test-shortcuts.sh (the logic in
+ui/pingouin-shortcuts.h against macOS's whole shortcut list) and
+src/tests/vm-shortcuts.sh (each chord reaches a real QEMU's input layer).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 3995639..d76c36a 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -41,6 +41,7 @@
+ #include "ui/cocoa-scroll.h"
+ #include "ui/kbd-state.h"
+ #include "ui/pingouin-pointer-guard.h"
++#include "ui/pingouin-shortcuts.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+ #include "system/runstate-action.h"
+@@ -57,6 +58,7 @@
+ #include "qemu/error-report.h"
+ #include "trace.h"
+ #include <Carbon/Carbon.h>
++#include <dlfcn.h>
+ #include <AppKit/NSOpenGL.h>
+ #ifdef CONFIG_OPENGL
+ #import <IOSurface/IOSurface.h>
+@@ -339,7 +341,12 @@ static bool cocoa_host_keyboard_is_iso(void)
+ static int cocoa_keycode_to_linux(int keycode)
+ {
+     int linux_keycode;
++    /* Pingouin: Apple's own top-row keys reach the VM as their F-key. */
++    int special = pingouin_special_key(keycode);
+ 
++    if (special >= 0) {
++        return special;
++    }
+     if (qemu_input_map_osx_to_linux_len <= keycode) {
+         error_report("(cocoa) warning unknown keycode 0x%x", keycode);
+         return 0;
+@@ -469,6 +476,147 @@ - (void) pingouinUngrabAfterDrag;
+ @end
+ 
+ QemuCocoaView *cocoaView;
++
++/*
++ * Pingouin: macOS's own shortcuts go to the VM while it has the keyboard:
++ * screenshots, Mission Control, Spotlight, Cmd+Tab, input sources, Show
++ * Desktop and the rest of macOS's list. The HID event tap alone does not get
++ * them all (macOS handles some before any tap, and the tap needs
++ * Accessibility), so while our window has the keyboard macOS's global
++ * shortcuts are switched off (CGSSetGlobalHotKeyOperatingMode, as VirtualBox
++ * and UTM do), and on again the moment it has not. The switch belongs to this
++ * process's window-server connection: when QEMU exits or crashes, macOS turns
++ * the shortcuts back on by itself, and no other process can keep them off.
++ * A watchdog thread turns them on if the window's thread stops answering, so
++ * a hung VM window never keeps them. PINGOUIN_MAC_SHORTCUTS=1 leaves them with
++ * macOS. Threads: the main thread decides; the watchdog only turns them on;
++ * pingouin_shortcuts_lock orders the two.
++ */
++typedef int (*PingouinConnectionFn)(void);
++typedef int32_t (*PingouinHotKeyModeFn)(int, int);
++static PingouinHotKeyModeFn pingouin_hotkey_mode;
++static int pingouin_hotkey_connection;
++static bool pingouin_mac_keeps_shortcuts;
++static pthread_mutex_t pingouin_shortcuts_lock = PTHREAD_MUTEX_INITIALIZER;
++static bool pingouin_shortcuts_off;      /* written under the lock; the watchdog reads it */
++static int pingouin_shortcuts_said;      /* under the lock: log lines so far */
++static int64_t pingouin_ui_heartbeat;    /* ms; qatomic */
++static bool pingouin_ui_stalled;         /* qatomic */
++#define PINGOUIN_UI_STALL_MS 2000
++
++static int64_t pingouin_now_ms(void)
++{
++    return (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000);
++}
++
++static void pingouin_shortcuts_set(bool off, const char *why)
++{
++    pthread_mutex_lock(&pingouin_shortcuts_lock);
++    if (pingouin_hotkey_mode && pingouin_shortcuts_off != off) {
++        int32_t err = pingouin_hotkey_mode(pingouin_hotkey_connection,
++                                         off ? PINGOUIN_HOTKEYS_OFF
++                                             : PINGOUIN_HOTKEYS_ON);
++        if (err == 0) {
++            qatomic_set(&pingouin_shortcuts_off, off);
++        }
++        /* The first changes, each failure and each special reason. */
++        if (err != 0 || why || pingouin_shortcuts_said < 2) {
++            pingouin_shortcuts_said++;
++            fprintf(stderr, "pingouin: macOS shortcuts %s%s",
++                    off ? "off: they go to the VM (it has the keyboard)"
++                        : "on again: macOS has them",
++                    why ? why : "");
++            if (err != 0) {
++                fprintf(stderr, ": FAILED, error %d", (int)err);
++            }
++            fprintf(stderr, "\n");
++        }
++    }
++    pthread_mutex_unlock(&pingouin_shortcuts_lock);
++}
++
++/* Main thread: decide again (activation, key window, every 0.5 s). */
++static void pingouin_shortcuts_update(void)
++{
++    qatomic_set(&pingouin_ui_heartbeat, pingouin_now_ms());
++    if (qatomic_read(&pingouin_ui_stalled)) {
++        qatomic_set(&pingouin_ui_stalled, false);
++        fprintf(stderr, "pingouin: the VM window answers again\n");
++    }
++    bool off = pingouin_shortcuts_to_vm(full_grab_enabled, [NSApp isActive],
++                                      cocoaView && [cocoaView isKeyboardCaptured],
++                                      pingouin_mac_keeps_shortcuts, false);
++    pingouin_shortcuts_set(off, NULL);
++}
++
++static void *pingouin_shortcuts_watchdog(void *opaque)
++{
++    for (;;) {
++        g_usleep(500 * 1000);
++        int64_t quiet = pingouin_now_ms() - qatomic_read(&pingouin_ui_heartbeat);
++        if (quiet > PINGOUIN_UI_STALL_MS && !qatomic_read(&pingouin_ui_stalled) &&
++            qatomic_read(&pingouin_shortcuts_off)) {
++            qatomic_set(&pingouin_ui_stalled, true);
++            pingouin_shortcuts_set(false, " (the VM window stopped answering)");
++        }
++    }
++    return NULL;
++}
++
++/* Full screen, macOS's kind or the notch kind (a borderless window over the display). */
++static bool pingouin_window_full_screen(NSWindow *w)
++{
++    return w && (([w styleMask] & NSWindowStyleMaskFullScreen) ||
++                 ([w screen] && NSEqualRects([w frame], [[w screen] frame])));
++}
++
++static void pingouin_shortcuts_init(void)
++{
++    if (!full_grab_enabled) {
++        return;
++    }
++    const char *keep = getenv("PINGOUIN_MAC_SHORTCUTS");
++    pingouin_mac_keeps_shortcuts = keep && !strcmp(keep, "1");
++    PingouinConnectionFn connection = (PingouinConnectionFn)dlsym(RTLD_DEFAULT, "SLSMainConnectionID");
++    PingouinHotKeyModeFn mode = (PingouinHotKeyModeFn)dlsym(RTLD_DEFAULT, "SLSSetGlobalHotKeyOperatingMode");
++    if (!connection || !mode) {
++        connection = (PingouinConnectionFn)dlsym(RTLD_DEFAULT, "CGSMainConnectionID");
++        mode = (PingouinHotKeyModeFn)dlsym(RTLD_DEFAULT, "CGSSetGlobalHotKeyOperatingMode");
++    }
++    if (pingouin_mac_keeps_shortcuts) {
++        fprintf(stderr, "pingouin: macOS shortcuts stay with macOS (PINGOUIN_MAC_SHORTCUTS=1)\n");
++        return;
++    }
++    if (!connection || !mode) {
++        fprintf(stderr, "pingouin: macOS shortcuts: macOS's switch for them was not found: "
++                "only the event tap takes them (some stay with macOS)\n");
++        return;
++    }
++    pingouin_hotkey_connection = connection();
++    pingouin_hotkey_mode = mode;
++    qatomic_set(&pingouin_ui_heartbeat, pingouin_now_ms());
++
++    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++    for (NSNotificationName name in @[NSApplicationDidBecomeActiveNotification,
++                                      NSApplicationDidResignActiveNotification,
++                                      NSWindowDidBecomeKeyNotification,
++                                      NSWindowDidResignKeyNotification]) {
++        [nc addObserverForName:name object:nil queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification *note) { pingouin_shortcuts_update(); }];
++    }
++    [nc addObserverForName:NSApplicationWillTerminateNotification object:nil
++                     queue:[NSOperationQueue mainQueue]
++                usingBlock:^(NSNotification *note) { pingouin_shortcuts_set(false, NULL); }];
++    NSTimer *beat = [NSTimer timerWithTimeInterval:0.5 repeats:YES
++                                             block:^(NSTimer *t) { pingouin_shortcuts_update(); }];
++    [beat setTolerance:0.1];
++    [[NSRunLoop mainRunLoop] addTimer:beat forMode:NSRunLoopCommonModes];
++    pthread_t watchdog;
++    if (pthread_create(&watchdog, NULL, pingouin_shortcuts_watchdog, NULL) == 0) {
++        pthread_detach(watchdog);
++    }
++    pingouin_shortcuts_update();
++}
+ static VMChangeStateEntry *pinch_vm_change;
+ 
+ /* Pingouin: one window per Mac display (the code is further down). */
+@@ -1470,6 +1618,27 @@ - (bool) handleEventLocked:(NSEvent *)event
+             }
+             return true;
+         case NSEventTypeKeyDown:
++            /*
++             * Pingouin: the escape combo reaches us only when Pingouin Gestures
++             * did not take it (not running). In full screen it then hands
++             * the keyboard back to macOS: shortcuts on, the app hidden (its
++             * Dock icon brings it back). In a window it goes to the VM.
++             */
++            if (pingouin_is_escape_combo([event keyCode],
++                                       modifiers & NSEventModifierFlagControl,
++                                       modifiers & NSEventModifierFlagOption,
++                                       modifiers & NSEventModifierFlagCommand,
++                                       modifiers & NSEventModifierFlagShift) &&
++                [self isKeyboardCaptured] &&
++                pingouin_window_full_screen([self window])) {
++                if (![event isARepeat]) {
++                    dispatch_async(dispatch_get_main_queue(), ^{
++                        pingouin_shortcuts_set(false, " (escape combo without Pingouin Gestures: the VM app is hidden)");
++                        [NSApp hide:nil];
++                    });
++                }
++                return true;
++            }
+             keycode = cocoa_keycode_to_linux([event keyCode]);
+ 
+             // Keep Command chords with the host unless the focused guest
+@@ -5847,6 +6015,7 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
+     if (full_grab_enabled) {
+         [controller setFullGrab: nil];
+     }
++    pingouin_shortcuts_init();
+ 
+     if (opts->has_show_cursor && opts->show_cursor) {
+         cursor_hide = 0;

@@ -1,0 +1,253 @@
+From: OmacVM
+Subject: [PATCH] cocoa: the guest's modifier keys follow each event's flags (#412)
+
+QEMU pressed a modifier only on a flagsChanged event, by flipping the key's
+state, and released both keys of a pair on any input event without its flag.
+Typing on another Mac's keyboard through Universal Control, the guest got
+Shift down and up in the same millisecond, then the key: Shift+2 typed 2
+(issue #412, reported by @ylorn). A flagsChanged that comes twice flips Shift
+back up; an event without the flag right after releases it, and nothing
+pressed it again for the key.
+
+Now every input event sets each modifier from its flags
+(ui/pingouin-modifiers.h): down when the flag is set and the key is up, up when
+it is clear, left or right from the NX_DEVICE* bits (events without them: the
+key the flagsChanged names). Only a key going down or a modifier changing
+presses a key, so a pointer event never does; the same event twice changes
+nothing. Command still goes to the guest only while it has the keyboard (and
+not the left one with left-command-key=off); Caps Lock as before.
+
+Upstream: upstreamable (upstream's ui/cocoa.m has the same toggle).
+Test: app/runtime/Tests/keys/test-modifier-state.sh (the rules, and with the
+patched ui/cocoa.m the wiring); src/tests/e2e/modifier-keys.sh (key events
+into a real VM, the guest's keyboard read back; 3.1.8 failed 5 of its 15).
+Applies after pingouin-cocoa-present-unseen.patch, before App Nap's.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -53,6 +53,7 @@
+ #include "ui/pingouin-ime-shift.h"
+ #include "ui/pingouin-fullpanel.h"
+ #include "ui/pingouin-close.h"
++#include "ui/pingouin-modifiers.h"
+ #include "hw/core/boards.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+@@ -2067,8 +2068,59 @@
+     }];
+ }
+ 
+-- (void) toggleKey: (unsigned int)keycode {
+-    qkbd_state_key_event(kbd, keycode, !qkbd_state_key_get(kbd, keycode));
++/*
++ * Pingouin (#412): the guest's modifier keys follow the event's flags
++ * (ui/pingouin-modifiers.h). QEMU flipped a key on each flagsChanged and let
++ * any event without the flag release it: with another Mac's keyboard through
++ * Universal Control, Shift went up the moment it went down (Shift+2 typed 2).
++ */
++- (void) pingouinSyncModifiers:(NSEvent *)event
++{
++    unsigned int keys[PINGOUIN_MOD_PAIRS][2] = {
++        [PINGOUIN_MOD_SHIFT]   = { KEY_LEFTSHIFT, KEY_RIGHTSHIFT },
++        [PINGOUIN_MOD_CONTROL] = { KEY_LEFTCTRL, KEY_RIGHTCTRL },
++        [PINGOUIN_MOD_OPTION]  = { KEY_LEFTALT, KEY_RIGHTALT },
++        [PINGOUIN_MOD_COMMAND] = { KEY_LEFTMETA, KEY_RIGHTMETA },
++    };
++    PingouinModKeys now[PINGOUIN_MOD_PAIRS], next[PINGOUIN_MOD_PAIRS];
++    NSEventType type = [event type];
++    PingouinModEvent kind = type == NSEventTypeKeyDown || type == NSEventTypeFlagsChanged ?
++        PINGOUIN_MOD_EV_KEY : PINGOUIN_MOD_EV_INPUT;
++    int code = type == NSEventTypeFlagsChanged ? [event keyCode] : -1;
++    /* Command goes to the guest only while it has the keyboard. */
++    bool captured = [self isKeyboardCaptured];
++
++    if (swap_opt_cmd) {
++        keys[PINGOUIN_MOD_OPTION][0] = KEY_LEFTMETA;
++        keys[PINGOUIN_MOD_OPTION][1] = KEY_RIGHTMETA;
++        keys[PINGOUIN_MOD_COMMAND][0] = KEY_LEFTALT;
++        keys[PINGOUIN_MOD_COMMAND][1] = KEY_RIGHTALT;
++    }
++    for (int p = 0; p < PINGOUIN_MOD_PAIRS; p++) {
++        bool command = p == PINGOUIN_MOD_COMMAND;
++        now[p].left = qkbd_state_key_get(kbd, keys[p][0]);
++        now[p].right = qkbd_state_key_get(kbd, keys[p][1]);
++        next[p] = pingouin_mod_next(p, now[p], kind, [event modifierFlags], code,
++                                  !command || (captured && left_command_key_enabled),
++                                  !command || captured);
++    }
++    /* Releases first: a key that moved from one side to the other. */
++    for (int p = 0; p < PINGOUIN_MOD_PAIRS; p++) {
++        if (now[p].left && !next[p].left) {
++            qkbd_state_key_event(kbd, keys[p][0], false);
++        }
++        if (now[p].right && !next[p].right) {
++            qkbd_state_key_event(kbd, keys[p][1], false);
++        }
++    }
++    for (int p = 0; p < PINGOUIN_MOD_PAIRS; p++) {
++        if (!now[p].left && next[p].left) {
++            qkbd_state_key_event(kbd, keys[p][0], true);
++        }
++        if (!now[p].right && next[p].right) {
++            qkbd_state_key_event(kbd, keys[p][1], true);
++        }
++    }
+ }
+ 
+ // Does the work of sending input to the monitor
+@@ -2324,74 +2376,16 @@
+     }
+ 
+     /*
+-     * Check -[NSEvent modifierFlags] here.
+-     *
+-     * There is a NSEventType for an event notifying the change of
+-     * -[NSEvent modifierFlags], NSEventTypeFlagsChanged but these operations
+-     * are performed for any events because a modifier state may change while
+-     * the application is inactive (i.e. no events fire) and we don't want to
+-     * wait for another modifier state change to detect such a change.
+-     *
+-     * NSEventModifierFlagCapsLock requires a special treatment. The other flags
+-     * are handled in similar manners.
+-     *
+-     * NSEventModifierFlagCapsLock
+-     * ---------------------------
+-     *
+-     * If CapsLock state is changed, "up" and "down" events will be fired in
+-     * sequence, effectively updates CapsLock state on the guest.
+-     *
+-     * The other flags
+-     * ---------------
+-     *
+-     * If a flag is not set, fire "up" events for all keys which correspond to
+-     * the flag. Note that "down" events are not fired here because the flags
+-     * checked here do not tell what exact keys are down.
+-     *
+-     * If one of the keys corresponding to a flag is down, we rely on
+-     * -[NSEvent keyCode] of an event whose -[NSEvent type] is
+-     * NSEventTypeFlagsChanged to know the exact key which is down, which has
+-     * the following two downsides:
+-     * - It does not work when the application is inactive as described above.
+-     * - It malfactions *after* the modifier state is changed while the
+-     *   application is inactive. It is because -[NSEvent keyCode] does not tell
+-     *   if the key is up or down, and requires to infer the current state from
+-     *   the previous state. It is still possible to fix such a malfanction by
+-     *   completely leaving your hands from the keyboard, which hopefully makes
+-     *   this implementation usable enough.
++     * Caps Lock: a change of its flag is a press and a release. The other
++     * modifiers follow the flags (pingouinSyncModifiers), on every input event:
++     * a change while QEMU was not in front is put right with the next one.
+      */
+     if (!!(modifiers & NSEventModifierFlagCapsLock) !=
+         qkbd_state_modifier_get(kbd, QKBD_MOD_CAPSLOCK)) {
+         qkbd_state_key_event(kbd, KEY_CAPSLOCK, true);
+         qkbd_state_key_event(kbd, KEY_CAPSLOCK, false);
+     }
+-
+-    if (!(modifiers & NSEventModifierFlagShift)) {
+-        qkbd_state_key_event(kbd, KEY_LEFTSHIFT, false);
+-        qkbd_state_key_event(kbd, KEY_RIGHTSHIFT, false);
+-    }
+-    if (!(modifiers & NSEventModifierFlagControl)) {
+-        qkbd_state_key_event(kbd, KEY_LEFTCTRL, false);
+-        qkbd_state_key_event(kbd, KEY_RIGHTCTRL, false);
+-    }
+-    if (!(modifiers & NSEventModifierFlagOption)) {
+-        if (swap_opt_cmd) {
+-            qkbd_state_key_event(kbd, KEY_LEFTMETA, false);
+-            qkbd_state_key_event(kbd, KEY_RIGHTMETA, false);
+-        } else {
+-            qkbd_state_key_event(kbd, KEY_LEFTALT, false);
+-            qkbd_state_key_event(kbd, KEY_RIGHTALT, false);
+-        }
+-    }
+-    if (!(modifiers & NSEventModifierFlagCommand)) {
+-        if (swap_opt_cmd) {
+-            qkbd_state_key_event(kbd, KEY_LEFTALT, false);
+-            qkbd_state_key_event(kbd, KEY_RIGHTALT, false);
+-        } else {
+-            qkbd_state_key_event(kbd, KEY_LEFTMETA, false);
+-            qkbd_state_key_event(kbd, KEY_RIGHTMETA, false);
+-        }
+-    }
++    [self pingouinSyncModifiers:event];
+ 
+     if (qemu_console_is_graphic(dcl.con) && [self handleInjectedText:event]) {
+         return true;
+@@ -2403,75 +2397,7 @@
+ 
+     switch ([event type]) {
+         case NSEventTypeFlagsChanged:
+-            switch ([event keyCode]) {
+-                case kVK_Shift:
+-                    if (!!(modifiers & NSEventModifierFlagShift)) {
+-                        [self toggleKey:KEY_LEFTSHIFT];
+-                    }
+-                    break;
+-
+-                case kVK_RightShift:
+-                    if (!!(modifiers & NSEventModifierFlagShift)) {
+-                        [self toggleKey:KEY_RIGHTSHIFT];
+-                    }
+-                    break;
+-
+-                case kVK_Control:
+-                    if (!!(modifiers & NSEventModifierFlagControl)) {
+-                        [self toggleKey:KEY_LEFTCTRL];
+-                    }
+-                    break;
+-
+-                case kVK_RightControl:
+-                    if (!!(modifiers & NSEventModifierFlagControl)) {
+-                        [self toggleKey:KEY_RIGHTCTRL];
+-                    }
+-                    break;
+-
+-                case kVK_Option:
+-                    if (!!(modifiers & NSEventModifierFlagOption)) {
+-                        if (swap_opt_cmd) {
+-                            [self toggleKey:KEY_LEFTMETA];
+-                        } else {
+-                            [self toggleKey:KEY_LEFTALT];
+-                        }
+-                    }
+-                    break;
+-
+-                case kVK_RightOption:
+-                    if (!!(modifiers & NSEventModifierFlagOption)) {
+-                        if (swap_opt_cmd) {
+-                            [self toggleKey:KEY_RIGHTMETA];
+-                        } else {
+-                            [self toggleKey:KEY_RIGHTALT];
+-                        }
+-                    }
+-                    break;
+-
+-                /* Don't pass command key changes to guest unless we captured the keyboard */
+-                case kVK_Command:
+-                    if ([self isKeyboardCaptured] &&
+-                        !!(modifiers & NSEventModifierFlagCommand) &&
+-                        left_command_key_enabled) {
+-                        if (swap_opt_cmd) {
+-                            [self toggleKey:KEY_LEFTALT];
+-                        } else {
+-                            [self toggleKey:KEY_LEFTMETA];
+-                        }
+-                    }
+-                    break;
+-
+-                case kVK_RightCommand:
+-                    if ([self isKeyboardCaptured] &&
+-                        !!(modifiers & NSEventModifierFlagCommand)) {
+-                        if (swap_opt_cmd) {
+-                            [self toggleKey:KEY_RIGHTALT];
+-                        } else {
+-                            [self toggleKey:KEY_RIGHTMETA];
+-                        }
+-                    }
+-                    break;
+-            }
++            /* The modifiers were set above, from the flags. */
+             return true;
+         case NSEventTypeKeyDown:
+             /*

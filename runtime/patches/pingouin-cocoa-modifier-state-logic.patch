@@ -1,0 +1,115 @@
+From: OmacVM
+Subject: [PATCH] ui: the guest's modifier keys from each event's flags, tested without AppKit
+
+What: a header with no AppKit in it: which of a pair's keys (Shift, Control,
+Option, Command; left and right) the guest holds after an event, from the
+event's flags and the NX_DEVICE* bits that tell left from right. A key goes
+down when its flag is set and it is up, and up when the flag is clear; the
+same event twice changes nothing. Used by pingouin-cocoa-modifier-state.patch
+(which explains the why).
+
+Why its own file: so the rules are tested without QEMU or a window
+(app/runtime/Tests/keys/test-modifier-state.sh applies this patch to an empty
+folder; at build time and in CI).
+
+Upstream: upstreamable together with pingouin-cocoa-modifier-state.patch.
+Test: app/runtime/Tests/keys/test-modifier-state.c.
+
+diff --git a/ui/pingouin-modifiers.h b/ui/pingouin-modifiers.h
+new file mode 100644
+--- /dev/null
++++ b/ui/pingouin-modifiers.h
+@@ -0,0 +1,93 @@
++/*
++ * Pingouin: the guest's modifier keys follow each event's flags (#412).
++ *
++ * No AppKit in here, so it is tested on its own
++ * (app/runtime/Tests/keys/test-modifier-state.c); ui/cocoa.m feeds it.
++ *
++ * Every key, pointer, scroll and pinch event carries macOS's modifier flags:
++ * one per pair (Shift, Control, Option, Command) and, from a real keyboard,
++ * one per key (the NX_DEVICE* bits of IOLLEvent.h). A key goes down when its
++ * flag is set and it is up, and up when the flag is clear. The same event
++ * twice changes nothing. Only a key going down or a modifier changing presses
++ * a key: the pointer's flags come from the Mac's own keyboard, which does not
++ * know the keys of another Mac's keyboard (Universal Control).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef PINGOUIN_MODIFIERS_H
++#define PINGOUIN_MODIFIERS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++typedef enum {
++    PINGOUIN_MOD_SHIFT,
++    PINGOUIN_MOD_CONTROL,
++    PINGOUIN_MOD_OPTION,
++    PINGOUIN_MOD_COMMAND,
++    PINGOUIN_MOD_PAIRS
++} PingouinModPair;
++
++/* A pair's flag, its keys' NX_DEVICE* bits and their key codes (kVK_*). */
++typedef struct {
++    uint64_t flag, left_bit, right_bit;
++    int left_code, right_code;
++} PingouinModBits;
++
++static const PingouinModBits pingouin_mod_bits[PINGOUIN_MOD_PAIRS] = {
++    [PINGOUIN_MOD_SHIFT]   = { 1u << 17, 0x0002, 0x0004, 0x38, 0x3C },
++    [PINGOUIN_MOD_CONTROL] = { 1u << 18, 0x0001, 0x2000, 0x3B, 0x3E },
++    [PINGOUIN_MOD_OPTION]  = { 1u << 19, 0x0020, 0x0040, 0x3A, 0x3D },
++    [PINGOUIN_MOD_COMMAND] = { 1u << 20, 0x0008, 0x0010, 0x37, 0x36 },
++};
++
++typedef enum {
++    PINGOUIN_MOD_EV_INPUT,    /* a key going up, the pointer, scroll, pinch: only releases */
++    PINGOUIN_MOD_EV_KEY,      /* a key going down or a modifier changing: also presses */
++} PingouinModEvent;
++
++typedef struct {
++    bool left, right;
++} PingouinModKeys;
++
++/*
++ * A pair's keys in the guest after one event. code: the key code of a
++ * flagsChanged event, else -1. may_left, may_right: whether that key may go
++ * down now (Command only while the VM has the keyboard).
++ */
++static inline PingouinModKeys pingouin_mod_next(PingouinModPair pair, PingouinModKeys now,
++                                            PingouinModEvent kind, uint64_t flags,
++                                            int code, bool may_left, bool may_right)
++{
++    const PingouinModBits *b = &pingouin_mod_bits[pair];
++    bool lbit = flags & b->left_bit, rbit = flags & b->right_bit;
++    PingouinModKeys next = now;
++
++    if (!(flags & b->flag)) {
++        next.left = next.right = false;
++        return next;
++    }
++    if (lbit || rbit) {
++        next.left = lbit && (now.left || (kind == PINGOUIN_MOD_EV_KEY && may_left));
++        next.right = rbit && (now.right || (kind == PINGOUIN_MOD_EV_KEY && may_right));
++        return next;
++    }
++    /*
++     * No key bits (some apps post events without them): the key the
++     * flagsChanged names goes down, or up if both were down; a key going down
++     * presses the left one if neither is.
++     */
++    if (kind != PINGOUIN_MOD_EV_KEY) {
++        return next;
++    }
++    if (code == b->left_code) {
++        next.left = now.left ? !now.right : may_left;
++    } else if (code == b->right_code) {
++        next.right = now.right ? !now.left : may_right;
++    } else if (!now.left && !now.right) {
++        next.left = may_left;
++    }
++    return next;
++}
++
++#endif

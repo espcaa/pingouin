@@ -1,0 +1,39 @@
+From: OmacVM
+Subject: [PATCH] cocoa: the present BH runs on the main loop thread only
+
+What: the IOSurface present's bottom half (cocoa_gl_present_bh, which draws
+the newest frame after a display-link tick) is created on the iohandler
+AioContext instead of qemu_bh_new's main context.
+
+Why: qemu_bh_new's context is also run by a vCPU thread that waits in
+AIO_WAIT_WHILE (a block drain from the guest's NVMe reset, say). That BH
+blits with GL and reads virglrenderer's scanout texture, so it could run
+GL and virgl on a vCPU thread. With every virgl user holding the BQL that
+was harmless; with virgl running without the BQL
+(qemu-virtio-gpu-virgl-unlocked.patch) it would race. Upstream moved
+virtio-gpu's own BHs to the iohandler context for the same reason
+(235f9b36, "virtio-gpu: Ensure BHs are invoked only from main-loop thread").
+
+Upstream: OmacVM only (the present code is ours).
+Test: build-qemu-gpu-runtime.sh checks the call; src/tests/gpu-unlocked.sh.
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 9f4df1e..1756313 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -7077,7 +7077,14 @@ static bool cocoa_gl_present_init(void)
+     present_input_first = present_vsync && in && !strcmp(in, "1");
+     present_nsurf = present_vsync ? PRESENT_SURFACES : 3;
+     if (present_vsync) {
+-        present_bh = qemu_bh_new(cocoa_gl_present_bh, NULL);
++        /*
++         * Pingouin: on the iohandler context, which only the main loop thread
++         * runs. qemu_bh_new's context is also run by a vCPU waiting in
++         * AIO_WAIT_WHILE (a block drain), and this BH draws with GL and reads
++         * virgl's textures: one thread for virgl, as virtio-gpu's own BHs.
++         */
++        present_bh = aio_bh_new(iohandler_get_aio_context(),
++                                cocoa_gl_present_bh, NULL);
+     }
+     info_report("cocoa: frames shown %s",
+                 !present_vsync ? "when drawn" :

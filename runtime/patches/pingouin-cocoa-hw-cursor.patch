@@ -1,0 +1,352 @@
+From: OmacVM
+Subject: [PATCH] cocoa: the guest's pointer as the Mac's cursor (experimental)
+
+What: with PINGOUIN_HW_CURSOR=1 (OmacVM.app: the hidden macPointer
+setting, off by default) the image the guest puts on virtio-gpu's cursor plane
+becomes the Mac's own cursor over the VM's windows (an NSCursor in the
+image's size in points, hot spot from the guest). The Mac's cursor is not
+hidden then; an empty cursor stands in while the guest hides its pointer
+on every output; the arrow comes back when the VM lets go of the pointer.
+The extra outputs' windows (one per display) report their cursor plane
+too. QEMU's own pointer layer (the image drawn where the guest says) stays
+off while the Mac's cursor carries it. Rules: ui/pingouin-hw-cursor.h.
+
+Why: Omarchy draws its pointer into the picture (software cursor), so a
+move waits for a whole guest frame and its present, and where the VM's
+window meets the notch strip, Omanotch or another display one pointer
+hides while the other is still a frame behind (the pointer flickers).
+The guest asks for its hardware cursor only with the app's setting
+(SMBIOS omacvm.hwcursor=1 -> /run/omacvm/host.env -> pingouin_app.lua).
+
+Until the guest's first image after a reset, and with a relative pointer
+(games), nothing changes: the hello of Omarchy's display agent and
+show-cursor decide as before. The full-screen pointer guard sees a shown
+Mac cursor and follows the guest's pointer (as with show-cursor=on).
+Image updates are coalesced: only the newest queued one makes a cursor.
+Known limits: a guest that warps its pointer (Hyprland's warps are off in
+Omarchy) is back under the Mac's cursor at the next motion. Hyprland 0.56.2
+in Omarchy does not use the cursor plane on virtio-gpu yet (no cursor
+command reaches QEMU: Linux hides a virtual GPU's cursor plane from atomic
+clients without DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, which aquamarine does
+not set), so with it this changes nothing today.
+
+Upstream: not sent (OmacVM's pointer policy; upstream draws the image in
+a layer at the guest's place).
+Test: Tests/display/test-hw-cursor.sh (the rules, build time and CI);
+src/tests/input-latency-vm.sh --hw-cursor (a VM: the image arrives, the
+Mac's cursor carries it, pointer latency). Applies after
+pingouin-cocoa-boot-splash.patch.
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 26d2d12..2c7084e 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -42,6 +42,7 @@
+ #include "ui/kbd-state.h"
+ #include "ui/pingouin-pointer-guard.h"
+ #include "ui/pingouin-pointer-start.h"
++#include "ui/pingouin-hw-cursor.h"
+ #include "ui/pingouin-shortcuts.h"
+ #include "ui/pingouin-gpu-memory.h"
+ #include "hw/core/boards.h"
+@@ -650,6 +651,20 @@ static bool pingouin_map_pointer(int output, double u, double v,
+ static bool pingouin_mac_cursor_hidden;    /* by us, once ([NSCursor hide] counts) */
+ static bool pingouin_test_pointer;         /* PINGOUIN_TEST_POINTER (test mode only) */
+ static bool pingouin_pointer_debug;        /* PINGOUIN_POINTER_DEBUG=1 or the test */
++/*
++ * The guest's pointer as the Mac's cursor (ui/pingouin-hw-cursor.h; main
++ * thread): the guest's last image as a Mac cursor, an empty one for while
++ * the guest hides its pointer, and whether one of them is set now (the
++ * arrow comes back when that ends). pingouin_hwc_seq: only the newest queued
++ * image update makes a cursor (atomic; QEMU's thread counts).
++ */
++static PingouinHwCursor pingouin_hwc;
++static NSCursor *pingouin_hwc_cursor;
++static NSCursor *pingouin_hwc_empty;
++static bool pingouin_hwc_ours;
++static unsigned pingouin_hwc_seq;
++static void pingouin_hwc_apply(bool active);
++static bool pingouin_hwc_on_ours(void);
+ static bool pingouin_guard_place;          /* this event's place is the guard's */
+ /* The displays and our windows the guard last saw (main thread). */
+ static PingouinGuardScreens pingouin_guard_scr;
+@@ -875,9 +890,12 @@ - (void) selectConsoleLocked:(unsigned int)index
+  */
+ - (void) pingouinUpdateMacCursor
+ {
+-    bool hide = pingouin_pointer_hide_mac(&pingouin_ptr, cursor_hide, isMouseGrabbed,
+-                                        isAbsoluteEnabled);
++    /* Pingouin: while the Mac's cursor carries the guest's pointer it is never hidden. */
++    bool hw = isMouseGrabbed && pingouin_hwc_active(&pingouin_hwc, isAbsoluteEnabled);
++    bool hide = !hw && pingouin_pointer_hide_mac(&pingouin_ptr, cursor_hide, isMouseGrabbed,
++                                               isAbsoluteEnabled);
+ 
++    pingouin_hwc_apply(hw);
+     if (hide == pingouin_mac_cursor_hidden) {
+         return;
+     }
+@@ -987,7 +1005,8 @@ - (void)updateCursorLayout
+         [cursorLayer setPosition:position];
+     }
+ 
+-    [cursorLayer setHidden:!mouseOn];
++    [cursorLayer setHidden:!mouseOn ||
++                           pingouin_hwc_layer_hidden(&pingouin_hwc, isAbsoluteEnabled)];
+     [CATransaction commit];
+ }
+ 
+@@ -1917,6 +1936,9 @@ - (void) handleMouseEvent:(NSEvent *)event
+     if (isAbsoluteEnabled && !pingouin_test_pointer) {
+         pingouin_guard_corners(event);
+     }
++    if (pingouin_hwc_ours) {
++        pingouin_hwc_apply(true);
++    }
+ 
+     with_bql(^{
+         if (isAbsoluteEnabled &&
+@@ -2083,6 +2105,9 @@ - (void) notifyMouseModeChange {
+     }
+ 
+     isAbsoluteEnabled = tIsAbsoluteEnabled;
++    if (pingouin_hwc.on) {
++        [self updateCursorLayout];
++    }
+ 
+     if (isMouseGrabbed) {
+         if (isAbsoluteEnabled) {
+@@ -2203,6 +2228,9 @@ - (void) pingouinHeadEvent:(NSEvent *)event view:(NSView *)view output:(int)output
+     if (isAbsoluteEnabled) {
+         pingouin_guard_corners(event);
+     }
++    if (pingouin_hwc_ours) {
++        pingouin_hwc_apply(true);
++    }
+     with_bql(^{
+         if (button >= 0) {
+             qemu_input_queue_btn(dcl.con, button, down);
+@@ -3334,14 +3362,123 @@ static void cocoa_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on)
+ {
+     dispatch_async(dispatch_get_main_queue(), ^{
+         [cocoaView setMouseX:x y:y on:on];
++        if (pingouin_hwc.on) {
++            pingouin_hwc_show(&pingouin_hwc, 0, on);
++            [cocoaView pingouinUpdateMacCursor];
++        }
+     });
+ }
+ 
++/*
++ * Pingouin: the guest's new pointer image on output o as the Mac's cursor
++ * (main thread, BQL). width: the output's width in guest pixels, view: the
++ * window that shows it (their ratio is the image's size in points). The
++ * image is copied: QEMU frees or reuses the guest's.
++ */
++static void pingouin_hwc_take(int o, QEMUCursor *c, NSView *view, int width)
++{
++    static bool warned;
++    double points = width > 0 && view ? [view bounds].size.width / width : 0;
++    PingouinHwcImage im;
++    CFDataRef data;
++    CGDataProviderRef provider;
++    CGColorSpaceRef space;
++    CGImageRef cg;
++    NSImage *image;
++    NSCursor *cursor;
++
++    if (!c) {
++        return;
++    }
++    im = pingouin_hwc_image(c->width, c->height, c->hot_x, c->hot_y, points);
++    if (!im.ok) {
++        if (!warned) {
++            warned = true;
++            warn_report("cocoa: the guest's pointer image (%dx%d at %.2f points a pixel) "
++                        "is not used for the Mac's cursor", c->width, c->height, points);
++        }
++        return;
++    }
++    data = CFDataCreate(NULL, (const UInt8 *)c->data, (CFIndex)c->width * c->height * 4);
++    provider = CGDataProviderCreateWithCFData(data);
++    space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++    /* virtio-gpu's cursor is premultiplied BGRA (Xcursor themes are premultiplied). */
++    cg = CGImageCreate(c->width, c->height, 8, 32, c->width * 4, space,
++                       kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
++                       provider, NULL, false, kCGRenderingIntentDefault);
++    CGColorSpaceRelease(space);
++    CGDataProviderRelease(provider);
++    CFRelease(data);
++    if (!cg) {
++        return;
++    }
++    image = [[NSImage alloc] initWithCGImage:cg size:NSMakeSize(im.w, im.h)];
++    CGImageRelease(cg);
++    cursor = [[NSCursor alloc] initWithImage:image hotSpot:NSMakePoint(im.hot_x, im.hot_y)];
++    [image release];
++    [pingouin_hwc_cursor release];
++    pingouin_hwc_cursor = cursor;
++    if (!pingouin_hwc.shape) {
++        info_report("cocoa: the guest's pointer is the Mac's cursor now (%dx%d, output %d)",
++                    c->width, c->height, o);
++    }
++    pingouin_hwc_define(&pingouin_hwc, o);
++    [cocoaView pingouinUpdateMacCursor];
++    [cocoaView updateCursorLayout];     /* QEMU's layer hides now */
++}
++
++/*
++ * The Mac's cursor while it carries the guest's pointer: the guest's image,
++ * or an empty one while the guest hides its pointer; the arrow again when
++ * that ends (main thread). Set again on each motion: AppKit puts its own
++ * cursor back at a window's edge. Test mode never sets the real cursor.
++ */
++static void pingouin_hwc_apply(bool active)
++{
++    static NSCursor *logged;
++    NSCursor *want = nil;
++
++    if (active) {
++        if (!pingouin_hwc_empty) {
++            NSImage *none = [[NSImage alloc] initWithSize:NSMakeSize(1, 1)];
++            pingouin_hwc_empty = [[NSCursor alloc] initWithImage:none hotSpot:NSZeroPoint];
++            [none release];
++        }
++        want = pingouin_hwc_visible(&pingouin_hwc) && pingouin_hwc_cursor ?
++               pingouin_hwc_cursor : pingouin_hwc_empty;
++    }
++    if (!want && !pingouin_hwc_ours) {
++        return;
++    }
++    if (pingouin_pointer_debug && want != logged) {
++        info_report("pingouin-pointer: Mac cursor is %s", !want ? "the arrow again" :
++                    want == pingouin_hwc_empty ? "empty (the guest hides its pointer)" :
++                    "the guest's pointer");
++        logged = want;
++    }
++    pingouin_hwc_ours = want != nil;
++    if (pingouin_test_pointer) {
++        return;     /* test: never the real cursor (the user works meanwhile) */
++    }
++    if (!want) {
++        [[NSCursor arrowCursor] set];
++    } else if ([NSCursor currentCursor] != want && pingouin_hwc_on_ours()) {
++        /* Not over another app's window (Omanotch's strip sets its own). */
++        [want set];
++    }
++}
++
+ static void cocoa_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
+ {
++    unsigned seq = pingouin_hwc.on ? qatomic_fetch_inc(&pingouin_hwc_seq) + 1 : 0;
++
+     dispatch_async(dispatch_get_main_queue(), ^{
+         BQL_LOCK_GUARD();
+         [cocoaView setCursor:qemu_console_get_cursor(dcl->con)];
++        if (seq && qatomic_read(&pingouin_hwc_seq) == seq) {
++            pingouin_hwc_take(0, qemu_console_get_cursor(dcl->con), cocoaView,
++                            qemu_console_get_width(dcl->con, 0));
++        }
+     });
+ }
+ 
+@@ -5911,6 +6048,23 @@ static bool pingouin_pointer_over_ours(void)
+     return false;
+ }
+ 
++/* The pointer is on one of our windows with nothing above it (any app's). */
++static bool pingouin_hwc_on_ours(void)
++{
++    NSInteger n = [NSWindow windowNumberAtPoint:[NSEvent mouseLocation]
++                    belowWindowWithWindowNumber:0];
++
++    if (n == [[cocoaView window] windowNumber]) {
++        return true;
++    }
++    for (int i = 1; i < pingouin_outputs; i++) {
++        if (pingouin_heads[i].window && n == [pingouin_heads[i].window windowNumber]) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static bool pingouin_main_full_screen(void)
+ {
+     return notchFull ||
+@@ -6281,8 +6435,43 @@ static void pingouin_head_scanout_flush(DisplayChangeListener *dcl,
+     cocoa_refresh_activity();
+ }
+ 
++/* The guest's pointer on this output (hardware cursor only, see pingouin_hwc_take). */
++static void pingouin_head_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on)
++{
++    int output = ((PingouinHead *)dcl)->output;
++
++    if (!pingouin_hwc.on) {
++        return;
++    }
++    dispatch_async(dispatch_get_main_queue(), ^{
++        pingouin_hwc_show(&pingouin_hwc, output, on);
++        [cocoaView pingouinUpdateMacCursor];
++    });
++}
++
++static void pingouin_head_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
++{
++    int output = ((PingouinHead *)dcl)->output;
++    QemuConsole *con = dcl->con;
++    unsigned seq;
++
++    if (!pingouin_hwc.on) {
++        return;
++    }
++    seq = qatomic_fetch_inc(&pingouin_hwc_seq) + 1;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        BQL_LOCK_GUARD();
++        if (qatomic_read(&pingouin_hwc_seq) == seq) {
++            pingouin_hwc_take(output, qemu_console_get_cursor(con),
++                            pingouin_heads[output].view, qemu_console_get_width(con, 0));
++        }
++    });
++}
++
+ static const DisplayChangeListenerOps pingouin_head_gl_ops = {
+     .dpy_name               = "cocoa-gl-head",
++    .dpy_mouse_set          = pingouin_head_mouse_set,
++    .dpy_cursor_define      = pingouin_head_cursor_define,
+     .dpy_gfx_update         = pingouin_head_gfx_update,
+     .dpy_gfx_switch         = pingouin_head_gfx_switch,
+     .dpy_gfx_check_format   = console_gl_check_format,
+@@ -7092,6 +7281,10 @@ static void pingouin_pointer_reset(void *opaque)
+ {
+     dispatch_async(dispatch_get_main_queue(), ^{
+         pingouin_pointer_guest_reset(&pingouin_ptr);
++        pingouin_hwc_reset(&pingouin_hwc);
++        if (pingouin_hwc.on) {
++            [cocoaView updateCursorLayout];
++        }
+         [cocoaView pingouinUpdateMacCursor];
+     });
+ }
+@@ -7138,8 +7331,10 @@ static void pingouin_pointer_init(void)
+ {
+     const char *v = getenv("PINGOUIN_POINTER_START");
+     const char *test = getenv("PINGOUIN_TEST_POINTER");
++    const char *hw = getenv("PINGOUIN_HW_CURSOR");
+ 
+     pingouin_ptr.off = v && !strcmp(v, "0");
++    pingouin_hwc.on = hw && !strcmp(hw, "1");
+     pingouin_test_pointer = test && atoi(test) > 0 && pingouin_test_mode();
+     pingouin_pointer_debug = pingouin_test_pointer ||
+                            (getenv("PINGOUIN_POINTER_DEBUG") &&
+@@ -7148,6 +7343,10 @@ static void pingouin_pointer_init(void)
+     info_report("cocoa: pointer: %s", pingouin_ptr.off ?
+                 "taken on enter or click (PINGOUIN_POINTER_START=0)" :
+                 "taken without a click when it is on the VM");
++    if (pingouin_hwc.on) {
++        info_report("cocoa: pointer: the Mac's cursor carries the guest's pointer once the "
++                    "guest puts it on the cursor plane (PINGOUIN_HW_CURSOR=1, experimental)");
++    }
+     if (pingouin_test_pointer) {
+         int ticks = atoi(test) * 4;
+         dispatch_async(dispatch_get_main_queue(), ^{ pingouin_test_motion(0, ticks); });

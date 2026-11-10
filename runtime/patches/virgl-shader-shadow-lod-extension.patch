@@ -1,0 +1,43 @@
+virglrenderer: ask for EXT_texture_shadow_lod only where it is needed
+
+What: the extension was required whenever a shadow 2D array, cube or cube array
+lookup had anything in its bias slot. That slot also holds the gradients of TXD,
+the bias of TXB/TXB2 and the compare value of TEX2 and TG4. The extension is now
+required only for what it adds: an explicit lod (TXL/TXL2) on these three
+targets and a bias (TXB/TXB2) on 2D array and cube array shadow samplers.
+texture(samplerCubeShadow, P, bias), textureGrad() and textureGather() with a
+compare value are core GLSL (1.30/4.00) and ESSL 3.00/3.10.
+Why: the Mac has no EXT_texture_shadow_lod and refused these shaders, which
+stopped the guest's whole context (dEQP-GLES3 shaders.texture_functions:
+texturegradoffset.*, texture.samplercubeshadow_bias_fragment; in one dEQP
+process every later case failed).
+Upstreamable; not sent.
+Tests: Tests/virgl/test-core-glsl-shaders.c "textureGradOffset on a shadow array
+sampler", "textureGrad on a shadow cube sampler", "texture() with a bias on a
+shadow cube sampler", "textureGather on a shadow cube sampler" (fail without).
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -3426,11 +3426,19 @@
+ 
+    bool has_bias = strbuf_get_len (&bias_buf) != 0;
+    bool has_offset = strbuf_get_len (&offset_buf) != 0;
+-   // EXT_texture_shadow_lod defines a few more functions handling bias
++   // EXT_texture_shadow_lod adds an explicit lod for 2D array, cube and cube
++   // array shadow samplers, and a bias for 2D array and cube array ones. The
++   // other uses of bias_buf are core GLSL and ESSL 3.00: a bias on a cube
++   // shadow sampler, gradients (TXD), the compare value of TEX2 and TG4.
++   // Hosts without the extension (macOS) refuse a shader that asks for it.
++   bool is_lod = inst->Instruction.Opcode == TGSI_OPCODE_TXL ||
++                 inst->Instruction.Opcode == TGSI_OPCODE_TXL2;
++   bool is_bias = inst->Instruction.Opcode == TGSI_OPCODE_TXB ||
++                  inst->Instruction.Opcode == TGSI_OPCODE_TXB2;
+    if (has_bias &&
+-       (inst->Texture.Texture == TGSI_TEXTURE_SHADOW2D_ARRAY ||
+-        inst->Texture.Texture == TGSI_TEXTURE_SHADOWCUBE ||
+-        inst->Texture.Texture == TGSI_TEXTURE_SHADOWCUBE_ARRAY))
++       (((is_lod || is_bias) && (inst->Texture.Texture == TGSI_TEXTURE_SHADOW2D_ARRAY ||
++                                 inst->Texture.Texture == TGSI_TEXTURE_SHADOWCUBE_ARRAY)) ||
++        (is_lod && inst->Texture.Texture == TGSI_TEXTURE_SHADOWCUBE)))
+       ctx->shader_req_bits |= SHADER_REQ_TEXTURE_SHADOW_LOD;
+ 
+    // EXT_texture_shadow_lod also adds the missing textureOffset for 2DArrayShadow in GLES

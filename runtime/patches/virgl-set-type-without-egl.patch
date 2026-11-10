@@ -1,0 +1,384 @@
+virglrenderer: show Vulkan windows on macOS OpenGL instead of ending the compositor's context
+
+What: when a compositor imports a dma-buf (PIPE_RESOURCE_SET_TYPE) and there is
+no EGL (OmacVM: native OpenGL through CGL), the resource gets a plain GL texture
+instead of failing. When the memory is a Metal heap (a Venus image: a Vulkan
+app's window), the texture is filled from the heap each time a draw samples
+it, at most once per command buffer: a Metal blit into a shared buffer when the
+heap is private, then glTexSubImage2D. Any other memory leaves the texture
+blank. Both cases log once. The GL state the copy touches (texture binding,
+unpack buffer, unpack row length/alignment/skips) is put back.
+Why: the old non-EGL path needs GL_EXT_memory_object_fd, which macOS OpenGL
+does not have, so it returned EINVAL. A decode error ends the whole context:
+a Vulkan app (vkcube, vkmark) drawing in a window on Omarchy took Hyprland's
+GPU context with it, black desktop until the session restarted. Any Wayland
+client could do this with a dma-buf. 3.0.0 hid it with MESA_VK_WSI_DEBUG=sw
+in the guest (software WSI), which apps can clear.
+Checks (the guest is untrusted): the heap must be a placement heap; the plane's
+offset + stride * (height - 1) + width * bytes per pixel must lie inside the
+heap; one plane only; the stride must be at least the row and a whole number
+of pixels; only uncompressed 2D formats. The texture itself goes through the
+normal resource checks and the GPU memory budget, and so does the shared copy
+buffer of a private heap (else the window stays blank).
+Limits: a copy per compositor frame that samples the window (vkmark full
+screen on an M4 Max, median of 3: 678 against 65 with the software WSI). The copy reads
+what Venus finished; the guest's present wait orders it, the host does not
+add a fence.
+Upstream: not sent (upstream's Metal path needs EGL on ANGLE).
+Test: Tests/virgl/test-set-type-no-egl.c (build time); VM: vkcube and vkmark
+windowed and full screen with Mesa's normal WSI (gpu-robust.md, "Black desktop
+root cause").
+
+diff --git a/src/vrend/vrend_metal.h b/src/vrend/vrend_metal.h
+index 245fe39..dce20c6 100644
+--- a/src/vrend/vrend_metal.h
++++ b/src/vrend/vrend_metal.h
+@@ -36,4 +36,19 @@ bool virgl_metal_create_texture_from_heap(MTLHeap_id heap,
+ 
+ void virgl_metal_release_texture(MTLTexture_id tex);
+ 
++/* Pingouin: reads part of a Metal heap from the CPU (a Venus image that macOS
++ * OpenGL cannot import). A private heap is copied into a shared buffer by the
++ * GPU first. */
++struct virgl_metal_heap_reader;
++
++struct virgl_metal_heap_reader *
++virgl_metal_heap_reader_create(MTLHeap_id heap, uint64_t offset, uint64_t length,
++                               const char **why);
++
++const void *virgl_metal_heap_reader_read(struct virgl_metal_heap_reader *reader);
++
++bool virgl_metal_heap_reader_copies(const struct virgl_metal_heap_reader *reader);
++
++void virgl_metal_heap_reader_destroy(struct virgl_metal_heap_reader *reader);
++
+ #endif
+diff --git a/src/vrend/vrend_metal.m b/src/vrend/vrend_metal.m
+index 7b66be0..a95693f 100644
+--- a/src/vrend/vrend_metal.m
++++ b/src/vrend/vrend_metal.m
+@@ -10,6 +10,7 @@
+ #include "pipe/p_state.h"
+ #include "util/u_math.h"
+ #include <Metal/Metal.h>
++#include <stdlib.h>
+ 
+ struct metal_format_conversion {
+    uint32_t virgl_format;
+@@ -200,3 +201,107 @@ void virgl_metal_release_texture(MTLTexture_id tex)
+ 
+    [mtl_texture release];
+ }
++
++struct virgl_metal_heap_reader {
++   id<MTLBuffer> buffer;        /* aliases the heap from an aligned offset */
++   id<MTLBuffer> staging;       /* shared copy, only for a private heap */
++   id<MTLCommandQueue> queue;
++   NSUInteger delta;            /* asked offset - aligned offset */
++   NSUInteger length;
++};
++
++struct virgl_metal_heap_reader *
++virgl_metal_heap_reader_create(MTLHeap_id heap, uint64_t offset, uint64_t length,
++                               const char **why)
++{
++   id<MTLHeap> mtl_heap = (id<MTLHeap>)heap;
++   id<MTLDevice> mtl_device = mtl_heap.device;
++
++   if (!length) {
++      *why = "nothing to read";
++      return NULL;
++   }
++   if (mtl_heap.type != MTLHeapTypePlacement) {
++      *why = "the Metal heap is not a placement heap";
++      return NULL;
++   }
++
++   MTLSizeAndAlign sa = [mtl_device heapBufferSizeAndAlignWithLength:length
++                                                             options:mtl_heap.resourceOptions];
++   NSUInteger align = sa.align ? sa.align : 1;
++   NSUInteger aligned = (NSUInteger)offset - (NSUInteger)offset % align;
++   NSUInteger delta = (NSUInteger)offset - aligned;
++   NSUInteger heap_size = mtl_heap.size;
++
++   /* the guest gives offset and length: never past the heap */
++   if (offset > heap_size || length > heap_size - offset) {
++      *why = "the image lies past the end of its memory";
++      return NULL;
++   }
++
++   struct virgl_metal_heap_reader *reader = calloc(1, sizeof(*reader));
++   if (!reader) {
++      *why = "out of memory";
++      return NULL;
++   }
++   reader->delta = delta;
++   reader->length = length;
++   reader->buffer = [mtl_heap newBufferWithLength:delta + length
++                                          options:mtl_heap.resourceOptions
++                                           offset:aligned];
++   if (!reader->buffer) {
++      free(reader);
++      *why = "Metal made no buffer over the heap";
++      return NULL;
++   }
++
++   if (mtl_heap.storageMode == MTLStorageModePrivate || !reader->buffer.contents) {
++      reader->staging = [mtl_device newBufferWithLength:length
++                                                options:MTLResourceStorageModeShared |
++                                                        MTLResourceCPUCacheModeDefaultCache];
++      reader->queue = [mtl_device newCommandQueue];
++      if (!reader->staging || !reader->queue) {
++         virgl_metal_heap_reader_destroy(reader);
++         *why = "Metal made no copy buffer";
++         return NULL;
++      }
++   }
++   return reader;
++}
++
++bool virgl_metal_heap_reader_copies(const struct virgl_metal_heap_reader *reader)
++{
++   return reader->staging != nil;
++}
++
++const void *virgl_metal_heap_reader_read(struct virgl_metal_heap_reader *reader)
++{
++   if (!reader->staging)
++      return (const char *)reader->buffer.contents + reader->delta;
++
++   @autoreleasepool {
++      id<MTLCommandBuffer> cmd = [reader->queue commandBuffer];
++      id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
++      [blit copyFromBuffer:reader->buffer
++              sourceOffset:reader->delta
++                  toBuffer:reader->staging
++         destinationOffset:0
++                      size:reader->length];
++      [blit endEncoding];
++      [cmd commit];
++      [cmd waitUntilCompleted];
++      if (cmd.status != MTLCommandBufferStatusCompleted)
++         return NULL;
++   }
++   return reader->staging.contents;
++}
++
++void virgl_metal_heap_reader_destroy(struct virgl_metal_heap_reader *reader)
++{
++   if (!reader)
++      return;
++   [reader->buffer release];
++   [reader->staging release];
++   [reader->queue release];
++   free(reader);
++}
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index c50615d..39dabb8 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -152,9 +152,13 @@ static struct { uint64_t woken, late, timed_out, stray; } fence_busy_stats;
+ #endif
+ #endif
+ 
++/* Pingouin: counts command buffers; a Venus image shown by copy is read at most once per buffer */
++static uint64_t vrend_submit_serial = 1;
++
+ /* Called by virgl_renderer_submit_cmd(2) around a context's command buffer. */
+ void vrend_renderer_submit_begin(void)
+ {
++   vrend_submit_serial++;
+ #ifdef __APPLE__
+    atomic_fetch_add_explicit(&render_submits, 1, memory_order_relaxed);
+ #endif
+@@ -5859,6 +5863,50 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
+    }
+ }
+ 
++#ifdef ENABLE_METAL
++/*
++ * Pingouin: copy a Venus image (Metal heap) into the GL texture that stands in for
++ * it. Called when a draw samples it; leaves the GL state as it found it.
++ */
++static void vrend_resource_heap_refresh(struct vrend_resource *res)
++{
++   if (res->heap_serial == vrend_submit_serial)
++      return;
++   res->heap_serial = vrend_submit_serial;
++
++   const void *data = virgl_metal_heap_reader_read(res->heap_reader);
++   if (!data)
++      return;
++
++   const enum virgl_formats format = res->base.format;
++   GLint bound = 0, unpack_buffer = 0, row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0;
++   glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++   glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack_buffer);
++   glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
++   glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
++   glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
++   glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
++
++   if (unpack_buffer)
++      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++   glPixelStorei(GL_UNPACK_ROW_LENGTH, res->heap_stride / util_format_get_blocksize(format));
++   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++   glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++   glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++   glBindTexture(GL_TEXTURE_2D, res->gl_id);
++   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, res->base.width0, res->base.height0,
++                   tex_conv_table[format].glformat, tex_conv_table[format].gltype, data);
++   glBindTexture(GL_TEXTURE_2D, bound);
++   glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
++   glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
++   glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
++   glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
++   if (unpack_buffer)
++      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpack_buffer);
++}
++
++#endif
++
+ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+                                               int shader_type,
+                                               GLuint next_sampler_id)
+@@ -5870,6 +5918,14 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+    uint32_t dirty = shader_view->dirty_mask;
+    uint32_t mask = sprog->samplers_used_mask[shader_type];
+ 
++#ifdef ENABLE_METAL
++   for (uint32_t m = mask; m;) {
++      struct vrend_sampler_view *tview = shader_view->views[u_bit_scan(&m)];
++      if (tview && tview->texture && tview->texture->heap_reader)
++         vrend_resource_heap_refresh(tview->texture);
++   }
++#endif
++
+    while (mask) {
+       int i = u_bit_scan(&mask);
+       struct vrend_sampler_view *tview = shader_view->views[i];
+@@ -10564,6 +10620,7 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+ #ifdef ENABLE_METAL
+    if (res->metal_texture)
+       virgl_metal_release_texture(res->metal_texture);
++   virgl_metal_heap_reader_destroy(res->heap_reader);
+ #endif
+    free(res);
+ }
+@@ -15498,6 +15555,88 @@ void vrend_renderer_borrow_texture_for_scanout(struct pipe_resource *pres)
+    }
+ }
+ 
++#ifdef ENABLE_METAL
++/*
++ * Pingouin: macOS OpenGL (CGL, no EGL) cannot import another API's memory, so a
++ * dma-buf the compositor imports (a Vulkan window: Venus memory, a Metal heap)
++ * used to fail here with EINVAL, and that error ended the compositor's whole
++ * context (black desktop for good). Now the resource gets a plain GL texture:
++ * filled from the Metal heap when a draw samples it, or left blank when the
++ * memory cannot be read. Either way the context goes on.
++ */
++static int
++vrend_pipe_resource_set_type_by_copy(struct vrend_context *ctx,
++                                     struct virgl_resource *res,
++                                     struct vrend_resource *gr,
++                                     const struct vrend_renderer_resource_create_args *create_args,
++                                     const struct vrend_renderer_resource_set_type_args *args)
++{
++   static bool told_copy, told_blank;
++   const char *why = "its memory is not a Metal heap";
++   int ret;
++
++   if (!vrend_resource_charge(gr, create_args)) {
++      FREE(gr);
++      return ENOMEM;
++   }
++   ret = vrend_resource_alloc_texture(gr, args->format, NULL);
++   if (ret) {
++      vrend_resource_uncharge(gr);
++      FREE(gr);
++      return ret;
++   }
++
++   if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP && res->metal_heap) {
++      const uint64_t bpp = util_format_get_blocksize(args->format);
++      const uint64_t row = (uint64_t)args->width * bpp;
++      const uint64_t stride = args->plane_strides[0];
++
++      if (args->plane_count != 1)
++         why = "it has more than one plane";
++      else if (gr->target != GL_TEXTURE_2D || util_format_get_blockwidth(args->format) != 1 ||
++               util_format_get_blockheight(args->format) != 1)
++         why = "its format cannot be copied";
++      else if (!bpp || stride < row || stride % bpp)
++         why = "its row stride does not fit its width";
++      else if (!args->height)
++         why = "it has no rows";
++      else {
++         const uint64_t length = stride * (args->height - 1) + row;
++         gr->heap_reader = virgl_metal_heap_reader_create(res->metal_heap, args->plane_offsets[0],
++                                                          length, &why);
++         gr->heap_stride = (uint32_t)stride;
++         /* the copy buffer of a private heap is host memory too: it counts */
++         if (gr->heap_reader && virgl_metal_heap_reader_copies(gr->heap_reader)) {
++            if (virgl_gpu_budget_charge(length, false)) {
++               virgl_metal_heap_reader_destroy(gr->heap_reader);
++               gr->heap_reader = NULL;
++               why = "its copy buffer is past the guest GPU memory budget";
++            } else {
++               gr->budget_bytes += length;
++            }
++         }
++      }
++   }
++
++   if (gr->heap_reader) {
++      if (!told_copy) {
++         told_copy = true;
++         virgl_info("context %d (%s) shows a Vulkan image by %s copy: macOS OpenGL cannot "
++                    "share Venus memory\n", ctx->ctx_id, ctx->debug_name,
++                    virgl_metal_heap_reader_copies(gr->heap_reader) ? "GPU+CPU" : "CPU");
++      }
++   } else if (!told_blank) {
++      told_blank = true;
++      virgl_warn("context %d (%s): resource %u cannot be shown (%s): it stays blank, "
++                 "the context goes on\n", ctx->ctx_id, ctx->debug_name, res->res_id, why);
++   }
++
++   res->pipe_resource = &gr->base;
++   vrend_ctx_resource_insert(ctx->res_hash, res->res_id, gr);
++   return 0;
++}
++#endif
++
+ int
+ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
+                                       uint32_t res_id,
+@@ -15550,6 +15689,11 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
+       if (!gr)
+          return ENOMEM;
+ 
++#ifdef ENABLE_METAL
++      if (!egl)
++         return vrend_pipe_resource_set_type_by_copy(ctx, res, gr, &create_args, args);
++#endif
++
+ #ifdef HAVE_EPOXY_EGL_H
+       if (egl) {
+ #ifdef ENABLE_GBM
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 7b904a9..997e68b 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -124,6 +124,11 @@ struct vrend_resource {
+    /* Pingouin: bytes counted against the guest's memory budget, given back when freed */
+    uint64_t budget_bytes;
+    bool bgra_swizzled;
++   /* Pingouin: a Venus image (Metal heap) that macOS OpenGL cannot import is shown
++    * through this texture, refreshed from the heap when a draw samples it */
++   struct virgl_metal_heap_reader *heap_reader;
++   uint32_t heap_stride;
++   uint64_t heap_serial;
+ };
+ 
+ #define VIRGL_TEXTURE_NEED_SWIZZLE        (1 << 0)

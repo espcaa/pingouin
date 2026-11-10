@@ -1,0 +1,487 @@
+virglrenderer: guest GPU memory follows the Mac's memory (macOS memory pressure)
+
+What: below the budget of virgl-resource-memory-budget.patch (now only a guard
+against a runaway guest) nothing is refused while macOS has memory to give.
+- A dispatch source (DISPATCH_SOURCE_TYPE_MEMORYPRESSURE) follows macOS's memory
+  pressure. Its handler runs on a libdispatch thread and only stores the level;
+  the renderer thread acts on it from virgl_renderer_poll, where it also reads
+  the level itself once a second (macOS tells only some processes about a
+  warning, one at a time: on a Mac mini at "warn" no event came for minutes);
+  it logs each change and, when the pressure rises, lets Apple's GL free the
+  storage it still holds for deleted textures and buffers (glFinish on context 0)
+  and logs what that freed (QEMU's footprint before and after).
+- A new resource of 16 MB or more (not a screen or cursor) is checked against the
+  level macOS has right now (kern.memorystatus_vm_pressure_level): refused at
+  "critical", and at "warn" only when it is bigger than all the free, inactive and
+  purgeable memory macOS has left (host_statistics64): short of that, more swapping
+  beats a black desktop. Before a refusal the renderer finishes its GL work (on the
+  context that is current: this can be in the middle of a guest's commands) and
+  looks again three times over 100 ms; within a second of the last refusal it
+  refuses after one look (each wait holds QEMU's main loop, so the whole VM).
+  Small resources, screens and cursors are never refused for pressure.
+- PINGOUIN_GPU_MEMORY_STATUS names a status file (key=value lines: in_use_mb,
+  peak_mb, budget_mb, pressure, refused, lost, lost_last, lost_recent: the last
+  eight lost contexts, so a reader that looks every 2 s misses none) that
+  OmacVM.app and omacvm check read. Written by rename, at most four times a second from the poll,
+  at once for a refusal or a lost GPU context. lost_last is the lost context's
+  name, which the guest chose: only letters, digits and . _ - are kept.
+- PINGOUIN_GPU_MEMORY_PRESSURE=off|normal|warn|critical[:AVAILABLE_MB] fixes the
+  level (and the available memory) instead of asking macOS; =file:PATH reads the
+  level from PATH at each look, so a test can raise it while the VM runs: tests only.
+- Applied after virgl-venus-memory-budget.patch: the bytes in use (log, status
+  file) are the shared counter, so they include Venus memory, read atomically. A
+  GL resource is checked against the pressure first, then charged to the budget.
+  Venus allocations are not checked against the pressure, only the budget.
+Why: a fixed budget is either too small for real use (2.9.0's quarter of the Mac's
+memory, 4 GB on a 16 GB Mac mini, was reached at 5K with fractional scaling:
+Hyprland's next buffer was refused, its context lost, the VM black) or too big to
+protect an 8 GB Mac, where VM memory plus GPU memory can push macOS into heavy
+swapping. macOS knows how much memory it can give; this asks it.
+Threading: the dispatch handler touches only two atomics; everything else runs on
+the renderer thread (QEMU's main loop), like the budget.
+Upstream: not sent (macOS only; upstream has no host memory limit).
+Tests: Tests/virgl/test-resource-budget.c (build time, Apple's software renderer):
+critical refuses a 64 MB texture after trying again (>= 90 ms), the next one at
+once (< 50 ms), but not an 8 MB texture or a 5K screen; warn with 100 MB left fits 64 MB and refuses 128 MB; the
+status file's in use, peak, pressure, refusals and two lost contexts (a sanitised
+name, the recent list); a level file raised to critical and back. In a VM: tests/graphics/fractional-scale.sh; on the Mac
+mini a fixed-cap A/B, two memory soaks and a desktop restart (PR #91).
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -27,6 +27,16 @@
+ 
+ #include <unistd.h>
+ #include <stdatomic.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <time.h>
++#ifdef __APPLE__
++/* Pingouin: the Mac's memory pressure (virgl-darwin-memory-pressure.patch) */
++#include <dispatch/dispatch.h>
++#include <mach/mach.h>
++#include <sys/sysctl.h>
++#undef LIST_ENTRY /* sys/queue.h's (from sysctl.h); util/list.h has its own */
++#endif
+ #include <stdio.h>
+ #include <string.h>
+ #include <errno.h>
+@@ -520,6 +530,10 @@ struct sysval_uniform_block {
+ static struct global_renderer_state vrend_state;
+ 
+ static void vrend_resource_budget_init(void);
++/* Pingouin: the Mac's memory pressure and the status file (virgl-darwin-memory-pressure.patch) */
++static void vrend_memory_init(void);
++static void vrend_memory_tick(void);
++static void vrend_memory_status_lost(const char *name);
+ 
+ bool vrend_renderer_video_available(void)
+ {
+@@ -1275,6 +1289,7 @@ static void vrend_notify_context_lost(struct vrend_context *ctx)
+                ctx->ctx_id, ctx->debug_name,
+                res ? "the guest driver was told (context reset)"
+                    : "the guest driver cannot be told, the app must be restarted");
++   vrend_memory_status_lost(ctx->debug_name);
+    if (res) {
+       memcpy(res->ptr, &status, sizeof(status));
+       if (res->iov)
+@@ -8452,6 +8467,7 @@ static bool do_wait(struct vrend_fence *fence, bool can_block)
+ static void vrend_renderer_check_queries(void);
+ 
+ void vrend_renderer_poll(void) {
++   vrend_memory_tick();
+    if (vrend_state.use_async_fence_cb) {
+       flush_eventfd(vrend_state.eventfd);
+       mtx_lock(&vrend_state.poll_mutex);
+@@ -10326,6 +10342,362 @@ static void vrend_resource_budget_read(void)
+                  (unsigned long long)(budget >> 20), from);
+    else
+       virgl_info("guest GPU memory budget: none (%s)\n", from);
++   vrend_memory_init();
++}
++
++/*
++ * Pingouin: guest GPU memory follows the Mac's memory (virgl-darwin-memory-pressure.patch).
++ * The budget above is only a guard against a runaway guest. Below it a resource is
++ * refused only when macOS itself is short of memory:
++ * - A dispatch source follows macOS's memory pressure. Its handler runs on a
++ *   libdispatch thread and only stores the level; the renderer thread acts on it
++ *   in vrend_memory_tick (from virgl_renderer_poll), which also reads the level
++ *   itself once a second (macOS notifies only some processes of a warning, one at
++ *   a time): it logs each change and, when
++ *   the pressure rises, lets Apple's GL free what it still holds for deleted
++ *   textures and buffers (glFinish).
++ * - A new big resource (VREND_MEMORY_BIG or more; never a screen or cursor) is
++ *   checked against the pressure macOS has right now: refused at "critical", and
++ *   at "warn" only when it is bigger than all the free, inactive and purgeable
++ *   memory macOS has left (swapping more is better than a black desktop, short
++ *   of that). Before a refusal the renderer finishes its GL work and looks again
++ *   three times over 100 ms. Small resources, screens and cursors are never
++ *   refused for pressure.
++ * - PINGOUIN_GPU_MEMORY_STATUS names a file the app and pingouin check read: memory in
++ *   use, its peak since the VM started, the budget, the pressure, refusals and lost
++ *   GPU contexts. Written at most four times a second (on the renderer thread, by
++ *   rename), at once for a refusal or a lost context.
++ * PINGOUIN_GPU_MEMORY_PRESSURE=off|normal|warn|critical[:AVAILABLE_MB] fixes the
++ * level (and the available memory) instead of asking macOS, and =file:PATH reads
++ * the level from PATH at each look (so a test can raise it while the VM runs):
++ * for tests.
++ */
++#define VREND_MEMORY_BIG            (16ull << 20)
++#define VREND_MEMORY_STATUS_STEP    (8ull << 20)
++#define VREND_MEMORY_STATUS_NS      250000000ull
++#define VREND_MEMORY_CHECK_NS       1000000000ull
++
++enum vrend_pressure { VREND_PRESSURE_NORMAL, VREND_PRESSURE_WARN, VREND_PRESSURE_CRITICAL };
++static const char *const vrend_pressure_names[] = { "normal", "warn", "critical" };
++
++static struct {
++   atomic_int level;            /* the dispatch handler writes these two */
++   atomic_uint events;
++   bool watching;
++   int fixed_level;             /* -1: ask macOS; -2: off; -3: read level_file (PINGOUIN_GPU_MEMORY_PRESSURE) */
++   char *level_file;
++   uint64_t fixed_available;
++   /* the renderer thread only, from here on */
++   unsigned seen_events;
++   uint64_t checked_ns;
++   int handled_level;
++   uint64_t peak;
++   uint64_t refusals;
++   uint64_t lost;
++   char lost_last[64];
++   char lost_recent[8][64];     /* the last eight, oldest first */
++   char *status_path;
++   bool dirty;
++   uint64_t written_bytes, written_peak, written_ns;
++   uint64_t refused_ns;         /* the last refusal for pressure */
++} vrend_memory = { .fixed_level = -1 };
++
++static uint64_t vrend_memory_now_ns(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
++#ifdef __APPLE__
++static void vrend_memory_pressure_event(void *source)
++{
++   unsigned long data = dispatch_source_get_data((dispatch_source_t)source);
++   int level = data & DISPATCH_MEMORYPRESSURE_CRITICAL ? VREND_PRESSURE_CRITICAL :
++               data & DISPATCH_MEMORYPRESSURE_WARN ? VREND_PRESSURE_WARN : VREND_PRESSURE_NORMAL;
++   atomic_store(&vrend_memory.level, level);
++   atomic_fetch_add(&vrend_memory.events, 1);
++}
++#endif
++
++/* macOS's pressure level right now (kern.memorystatus_vm_pressure_level: 1, 2 or 4). */
++static int vrend_memory_pressure_now(void)
++{
++   if (vrend_memory.fixed_level == -3) {
++      /* tests: the level is the file's first word, read at each look */
++      char word[16] = "";
++      FILE *f = fopen(vrend_memory.level_file, "r");
++      if (f) {
++         if (fscanf(f, "%15s", word) != 1)
++            word[0] = '\0';
++         fclose(f);
++      }
++      for (int i = VREND_PRESSURE_CRITICAL; i > VREND_PRESSURE_NORMAL; i--)
++         if (!strcmp(word, vrend_pressure_names[i]))
++            return i;
++      return VREND_PRESSURE_NORMAL;
++   }
++   if (vrend_memory.fixed_level != -1)
++      return MAX2(vrend_memory.fixed_level, VREND_PRESSURE_NORMAL);
++#ifdef __APPLE__
++   int value = 0;
++   size_t len = sizeof(value);
++   if (!sysctlbyname("kern.memorystatus_vm_pressure_level", &value, &len, NULL, 0))
++      return value & 4 ? VREND_PRESSURE_CRITICAL : value & 2 ? VREND_PRESSURE_WARN : VREND_PRESSURE_NORMAL;
++#endif
++   return atomic_load(&vrend_memory.level);
++}
++
++/* Free, inactive and purgeable memory: what macOS can give without swapping much. */
++static uint64_t vrend_memory_available(void)
++{
++   if (vrend_memory.fixed_level != -1 && vrend_memory.fixed_available)
++      return vrend_memory.fixed_available;
++#ifdef __APPLE__
++   static mach_port_t host;
++   vm_statistics64_data_t vm;
++   mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++   if (!host)
++      host = mach_host_self();
++   if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm, &count) == KERN_SUCCESS)
++      return ((uint64_t)vm.free_count + vm.inactive_count + vm.purgeable_count) * vm_kernel_page_size;
++#endif
++   return UINT64_MAX;
++}
++
++static void vrend_memory_init(void)
++{
++   const char *path = getenv("PINGOUIN_GPU_MEMORY_STATUS");
++   const char *fixed = getenv("PINGOUIN_GPU_MEMORY_PRESSURE");
++
++   free(vrend_memory.status_path);
++   vrend_memory.status_path = path && *path ? strdup(path) : NULL;
++   vrend_memory.fixed_level = -1;
++   vrend_memory.fixed_available = 0;
++   free(vrend_memory.level_file);
++   vrend_memory.level_file = NULL;
++   if (fixed && !strncmp(fixed, "file:", 5) && fixed[5]) {
++      vrend_memory.level_file = strdup(fixed + 5);
++      vrend_memory.fixed_level = vrend_memory.level_file ? -3 : -1;
++   } else if (fixed && *fixed) {
++      const char *colon = strchr(fixed, ':');
++      size_t n = colon ? (size_t)(colon - fixed) : strlen(fixed);
++      for (int i = 0; i < 3; i++)
++         if (n == strlen(vrend_pressure_names[i]) && !strncmp(fixed, vrend_pressure_names[i], n))
++            vrend_memory.fixed_level = i;
++      if (n == 3 && !strncmp(fixed, "off", 3))
++         vrend_memory.fixed_level = -2;
++      if (colon)
++         vrend_memory.fixed_available = strtoull(colon + 1, NULL, 10) << 20;
++      if (vrend_memory.fixed_level == -1)
++         virgl_warn("PINGOUIN_GPU_MEMORY_PRESSURE=%s is not off, normal, warn or critical\n", fixed);
++   }
++   /* the peak, refusals and lost contexts count from the VM's start, across renderer resets */
++   vrend_memory.handled_level = vrend_memory_pressure_now();
++   atomic_store(&vrend_memory.level, vrend_memory.handled_level);
++#ifdef __APPLE__
++   if (!vrend_memory.watching && vrend_memory.fixed_level == -1) {
++      dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
++                                                        DISPATCH_MEMORYPRESSURE_NORMAL |
++                                                        DISPATCH_MEMORYPRESSURE_WARN |
++                                                        DISPATCH_MEMORYPRESSURE_CRITICAL,
++                                                        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
++      if (source) {
++         dispatch_set_context(source, source);
++         dispatch_source_set_event_handler_f(source, vrend_memory_pressure_event);
++         dispatch_resume(source);
++         vrend_memory.watching = true;
++      } else {
++         virgl_warn("no macOS memory pressure watcher; big GPU resources are still checked when made\n");
++      }
++   }
++#endif
++   virgl_info("guest GPU memory follows the Mac's memory: pressure %s now%s\n",
++              vrend_memory.fixed_level == -2 ? "not checked" :
++              vrend_pressure_names[vrend_memory.handled_level],
++              vrend_memory.fixed_level != -1 ? " (PINGOUIN_GPU_MEMORY_PRESSURE)" : "");
++   vrend_memory.dirty = true;
++}
++
++/* Apple's GL keeps the storage of deleted textures and buffers until the GPU is done
++ * with them; finishing the queued work lets it go. In the middle of a guest's commands
++ * (a resource made while its context runs) the current context stays current. */
++static void vrend_memory_trim(bool own_context)
++{
++   if (own_context)
++      vrend_renderer_force_ctx_0();
++   glFlush();
++   glFinish();
++}
++
++/* QEMU's own memory as macOS counts it (Activity Monitor's "Memory"), in bytes. */
++static uint64_t vrend_memory_footprint(void)
++{
++#ifdef __APPLE__
++   task_vm_info_data_t info;
++   mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
++   if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
++      return info.phys_footprint;
++#endif
++   return 0;
++}
++
++static void vrend_memory_status_write(bool now)
++{
++   char text[1280], recent[8 * 65] = "", tmp[PATH_MAX];
++   uint64_t t = vrend_memory_now_ns();
++   int fd, len;
++
++   if (!vrend_memory.status_path) {
++      vrend_memory.dirty = false;
++      return;
++   }
++   if (!now && t - vrend_memory.written_ns < VREND_MEMORY_STATUS_NS)
++      return;
++   for (int i = 0; i < 8; i++) {
++      if (!vrend_memory.lost_recent[i][0])
++         continue;
++      if (recent[0])
++         strcat(recent, ",");
++      strcat(recent, vrend_memory.lost_recent[i]);
++   }
++   len = snprintf(text, sizeof(text),
++                  "in_use_mb=%llu\npeak_mb=%llu\nbudget_mb=%llu\npressure=%s\nrefused=%llu\n"
++                  "lost=%llu\nlost_last=%s\nlost_recent=%s\n",
++                  (unsigned long long)(virgl_gpu_budget_in_use() >> 20),
++                  (unsigned long long)(vrend_memory.peak >> 20),
++                  (unsigned long long)(vrend_state.resource_budget >> 20),
++                  vrend_pressure_names[vrend_memory.handled_level],
++                  (unsigned long long)(vrend_memory.refusals + vrend_state.resource_refusals),
++                  (unsigned long long)vrend_memory.lost, vrend_memory.lost_last, recent);
++   if (snprintf(tmp, sizeof(tmp), "%s.tmp", vrend_memory.status_path) >= (int)sizeof(tmp))
++      return;
++   fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++   if (fd < 0)
++      return;
++   bool ok = write(fd, text, len) == len;
++   close(fd);
++   if (!ok || rename(tmp, vrend_memory.status_path))
++      unlink(tmp);
++   vrend_memory.dirty = false;
++   vrend_memory.written_ns = t;
++   vrend_memory.written_bytes = virgl_gpu_budget_in_use();
++   vrend_memory.written_peak = vrend_memory.peak;
++}
++
++static void vrend_memory_changed(void)
++{
++   uint64_t bytes = virgl_gpu_budget_in_use();
++   if (bytes > vrend_memory.peak)
++      vrend_memory.peak = bytes;
++   if (bytes > vrend_memory.written_bytes + VREND_MEMORY_STATUS_STEP ||
++       bytes + VREND_MEMORY_STATUS_STEP < vrend_memory.written_bytes ||
++       vrend_memory.peak > vrend_memory.written_peak + VREND_MEMORY_STATUS_STEP ||
++       (!bytes && vrend_memory.written_bytes))
++      vrend_memory.dirty = true;
++}
++
++static void vrend_memory_tick(void)
++{
++   unsigned events = atomic_load(&vrend_memory.events);
++   int level = vrend_memory.handled_level;
++   uint64_t t = vrend_memory_now_ns();
++
++   if (events != vrend_memory.seen_events) {
++      vrend_memory.seen_events = events;
++      level = atomic_load(&vrend_memory.level);
++   } else if (t - vrend_memory.checked_ns >= VREND_MEMORY_CHECK_NS) {
++      /* macOS tells only some processes about a warning, one at a time (seen on a Mac
++       * mini at warn: no event for minutes), so look for ourselves once a second */
++      vrend_memory.checked_ns = t;
++      level = vrend_memory_pressure_now();
++   }
++   if (level != vrend_memory.handled_level) {
++      virgl_info("macOS memory pressure: %s (guest GPU memory in use: %llu MB)%s\n",
++                 vrend_pressure_names[level],
++                 (unsigned long long)(virgl_gpu_budget_in_use() >> 20),
++                 level > vrend_memory.handled_level ? "; freeing what the GL still holds" : "");
++      if (level > vrend_memory.handled_level) {
++         /* say what it freed: QEMU's footprint before and after */
++         uint64_t before = vrend_memory_footprint();
++         vrend_memory_trim(true);
++         uint64_t after = vrend_memory_footprint();
++         virgl_info("freed %lld MB (QEMU's memory %llu -> %llu MB)\n",
++                    (long long)(((int64_t)before - (int64_t)after) / (1 << 20)),
++                    (unsigned long long)(before >> 20), (unsigned long long)(after >> 20));
++      }
++      vrend_memory.handled_level = level;
++      vrend_memory.dirty = true;
++   }
++   if (vrend_memory.dirty)
++      vrend_memory_status_write(false);
++}
++
++/* Is there room on the Mac for SIZE more bytes? */
++static bool vrend_memory_room(uint64_t size, int *level, uint64_t *available)
++{
++   *level = vrend_memory_pressure_now();
++   *available = *level == VREND_PRESSURE_NORMAL ? UINT64_MAX : vrend_memory_available();
++   if (*level == VREND_PRESSURE_CRITICAL)
++      return false;
++   return *available >= size;
++}
++
++static bool vrend_memory_allows(uint64_t size, const struct vrend_renderer_resource_create_args *args)
++{
++   int level;
++   uint64_t available;
++
++   if (size < VREND_MEMORY_BIG || (args->bind & VREND_RESOURCE_DISPLAY_BINDS) ||
++       vrend_memory.fixed_level == -2 || vrend_memory_room(size, &level, &available))
++      return true;
++   /* Trying again holds the renderer, which is QEMU's main loop (the whole VM), for
++    * 100 ms: within a second of the last refusal, refuse after the one look above. */
++   bool again = vrend_memory_now_ns() - vrend_memory.refused_ns >= VREND_MEMORY_CHECK_NS;
++   for (int i = 0; again && i < 3; i++) {
++      vrend_memory_trim(false);
++      if (i)
++         usleep(50000);
++      if (vrend_memory_room(size, &level, &available)) {
++         virgl_info("macOS memory pressure %s: a %ux%u resource of %llu MB fit after freeing\n",
++                    vrend_pressure_names[level], args->width, args->height,
++                    (unsigned long long)(size >> 20));
++         return true;
++      }
++   }
++   /* logged at the 1st, 2nd, 4th, 8th ... refusal */
++   uint64_t n = ++vrend_memory.refusals;
++   if (!(n & (n - 1)))
++      virgl_warn("macOS is short of memory (pressure %s, %llu MB free or inactive): refused a "
++                 "%ux%ux%u resource of %llu MB with %llu MB in use (%llu refused so far)\n",
++                 vrend_pressure_names[level],
++                 (unsigned long long)(available == UINT64_MAX ? 0 : available >> 20),
++                 args->width, args->height, MAX2(args->depth, args->array_size),
++                 (unsigned long long)(size >> 20),
++                 (unsigned long long)(virgl_gpu_budget_in_use() >> 20), (unsigned long long)n);
++   vrend_memory.refused_ns = vrend_memory_now_ns();
++   vrend_memory.handled_level = MAX2(vrend_memory.handled_level, level);
++   vrend_memory_status_write(true);
++   return false;
++}
++
++/* A GPU context is lost: the app's window says so (the guest-chosen name is
++ * reduced to letters, digits and . _ -). */
++static void vrend_memory_status_lost(const char *name)
++{
++   size_t i = 0;
++   for (; name && name[i] && i < sizeof(vrend_memory.lost_last) - 1; i++) {
++      char c = name[i];
++      vrend_memory.lost_last[i] = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++                                  (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' ? c : '_';
++   }
++   vrend_memory.lost_last[i] = 0;
++   if (!i)
++      snprintf(vrend_memory.lost_last, sizeof(vrend_memory.lost_last), "unnamed");
++   memmove(vrend_memory.lost_recent[0], vrend_memory.lost_recent[1], sizeof(vrend_memory.lost_recent[0]) * 7);
++   memcpy(vrend_memory.lost_recent[7], vrend_memory.lost_last, sizeof(vrend_memory.lost_last));
++   vrend_memory.lost++;
++   vrend_memory_status_write(true);
+ }
+ 
+ static once_flag vrend_resource_budget_once = ONCE_FLAG_INIT;
+@@ -10417,7 +10789,12 @@ static bool vrend_resource_charge(struct vrend_resource *gr,
+                                   const struct vrend_renderer_resource_create_args *args)
+ {
+    uint64_t size = vrend_resource_estimated_size(args);
+-   uint64_t n = virgl_gpu_budget_charge(size, args->bind & VREND_RESOURCE_DISPLAY_BINDS);
++   uint64_t n;
++
++   /* the pressure first: it charges nothing, so its log and status count only what is in use */
++   if (!vrend_memory_allows(size, args))
++      return false;
++   n = virgl_gpu_budget_charge(size, args->bind & VREND_RESOURCE_DISPLAY_BINDS);
+ 
+    if (n) {
+       /* logged at the 1st, 2nd, 4th, 8th ... refusal: a guest in a loop cannot flood the log */
+@@ -10433,6 +10810,7 @@ static bool vrend_resource_charge(struct vrend_resource *gr,
+       return false;
+    }
+    gr->budget_bytes = size;
++   vrend_memory_changed();
+    /* the peak is read here, on the renderer thread, and includes Venus memory */
+    uint64_t in_use = virgl_gpu_budget_in_use();
+    if (in_use >= vrend_state.resource_peak_logged + VREND_RESOURCE_PEAK_STEP) {
+@@ -10448,6 +10826,7 @@ static void vrend_resource_uncharge(struct vrend_resource *gr)
+ {
+    virgl_gpu_budget_uncharge(gr->budget_bytes);
+    gr->budget_bytes = 0;
++   vrend_memory_changed();
+ }
+ 
+ /* Pingouin: did the last vrend_renderer_resource_create fail on the memory budget? */

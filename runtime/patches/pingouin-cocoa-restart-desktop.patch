@@ -1,0 +1,160 @@
+From: OmacVM
+Subject: [PATCH] cocoa: "Restart the Desktop…" in the app menu after Later
+
+What: when the VM's desktop loses its GPU context and OmacVM.app asks ("The
+VM's desktop stopped drawing", Restart the Desktop / Later), Later used to
+leave no way back. Now the app writes logs/desktop-lost (PINGOUIN_DESKTOP_LOST)
+on Later; while that file is there the app menu shows "Restart the Desktop…"
+under "Graphics memory". A click posts a distributed notification under the
+name the app gave (PINGOUIN_DESKTOP_RESTART_REQUEST: its bundle id and process
+id), as "Features…" does; the app shows its window again, so the restart
+still needs a yes. Checked when the menu opens (the memory menu's
+menuNeedsUpdate:), no timer. Without both variables (QEMU not started by
+OmacVM.app) the menu is unchanged.
+Why: after Later the screen stayed black until the VM was shut down (MacBook
+Air M2 stress test, 2026-10-06).
+Safety: nothing is read from the file, only whether it is a plain file
+(lstat). The click sends no data and reads no reply; another process of the
+same user posting the name can only bring up the app's window, and only while
+the desktop is lost.
+Upstream: not applicable (OmacVM.app's launcher).
+Test: app/runtime/Tests/display/test-restart-desktop.sh (the header, build time
+and CI); app/app `swift run desktop-tests` (the app's side).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 42bc596..33991b3 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -44,6 +44,7 @@
+ #include "ui/pingouin-pointer-start.h"
+ #include "ui/pingouin-shortcuts.h"
+ #include "ui/pingouin-gpu-memory.h"
++#include "ui/pingouin-desktop-restart.h"
+ #include "hw/core/boards.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+@@ -2885,6 +2886,62 @@ static bool powerdownPending;
+ }
+ @end
+ 
++/*
++ * Pingouin: "Restart the Desktop…" in the app menu, only after the user picked
++ * Later on Pingouin.app's "desktop stopped drawing" window
++ * (pingouin-cocoa-restart-desktop.patch). Like "Features…", QEMU only passes
++ * the click on (a distributed notification under the name the app gave); the
++ * app shows its window again and restarts the desktop through the VM's agent.
++ */
++@interface PingouinRestartDesktop : NSObject
++{
++@public
++    NSMenuItem *item;
++}
++- (void)restart:(id)sender;
++@end
++
++static PingouinRestartDesktop *pingouin_restart_desktop;
++
++@implementation PingouinRestartDesktop
++- (void)restart:(id)sender
++{
++    const char *name = pingouin_desktop_restart_request();
++    if (!name) {
++        return;
++    }
++    [[NSDistributedNotificationCenter defaultCenter]
++        postNotificationName:[NSString stringWithUTF8String:name]
++                      object:nil
++                    userInfo:nil
++          deliverImmediately:YES];
++}
++@end
++
++/* Shown while the app's desktop-lost file is there; checked when the menu opens. */
++static void pingouin_restart_desktop_update(void)
++{
++    if (pingouin_restart_desktop) {
++        [pingouin_restart_desktop->item setHidden:!pingouin_desktop_lost()];
++    }
++}
++
++static void pingouin_add_restart_desktop_item(NSMenu *menu)
++{
++    if (!pingouin_desktop_restart_request()) {
++        return; /* not started by Pingouin.app: nobody to ask */
++    }
++    pingouin_restart_desktop = [[PingouinRestartDesktop alloc] init];
++    NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:@"Restart the Desktop\u2026"
++                                                   action:@selector(restart:)
++                                            keyEquivalent:@""] autorelease];
++    [item setTarget:pingouin_restart_desktop];
++    [item setToolTip:@"The VM's desktop stopped drawing. Restarting it closes the apps open in the VM."];
++    [item setHidden:YES];
++    [menu addItem:item];
++    pingouin_restart_desktop->item = item;
++}
++
+ /*
+  * Pingouin: "VM memory" and "Graphics memory" in the app menu while the VM runs
+  * (pingouin-cocoa-graphics-memory.patch). The lines are read when the menu
+@@ -2929,6 +2986,7 @@ static NSString *const pingouin_memory_explanation =
+         pingouin_vm_memory_line(current_machine->ram_size, line, sizeof(line));
+         [vmItem setTitle:[NSString stringWithUTF8String:line]];
+     }
++    pingouin_restart_desktop_update();
+ }
+ 
+ - (void)explain:(id)sender
+@@ -3022,6 +3080,7 @@ static void create_initial_menus(void)
+     [menu addItemWithTitle:[NSString stringWithFormat:@"About %@", pingouin_product_name()] action:@selector(do_about_menu_item:) keyEquivalent:@""];
+     pingouin_add_features_item(menu);
+     pingouin_add_memory_items(menu);
++    pingouin_add_restart_desktop_item(menu);
+     [menu addItem:[NSMenuItem separatorItem]]; //Separator
+     menuItem = [menu addItemWithTitle:@"Services" action:nil keyEquivalent:@""];
+     [menuItem setSubmenu:[NSApp servicesMenu]];
+diff --git a/ui/pingouin-desktop-restart.h b/ui/pingouin-desktop-restart.h
+new file mode 100644
+index 0000000..e3000a8
+--- /dev/null
++++ b/ui/pingouin-desktop-restart.h
+@@ -0,0 +1,40 @@
++/*
++ * Pingouin: "Restart the Desktop…" in the app menu (pingouin-cocoa-restart-desktop.patch).
++ *
++ * Pingouin.app writes PINGOUIN_DESKTOP_LOST when the user picks Later on its
++ * "The VM's desktop stopped drawing" window; while that file is there the
++ * menu item shows. A click posts the notification named in
++ * PINGOUIN_DESKTOP_RESTART_REQUEST and the app shows its window again
++ * (DesktopRestart.swift). Only whether the file is there counts: nothing is
++ * read from it. No AppKit here, so it is unit tested
++ * (Tests/display/test-restart-desktop.sh).
++ */
++#ifndef PINGOUIN_DESKTOP_RESTART_H
++#define PINGOUIN_DESKTOP_RESTART_H
++
++#include <stdlib.h>
++#include <sys/stat.h>
++
++static inline const char *pingouin_desktop_env(const char *name)
++{
++    const char *v = getenv(name);
++    return v && *v ? v : NULL;
++}
++
++/* The notification to post, or NULL: not started by Pingouin.app, no menu item. */
++static inline const char *pingouin_desktop_restart_request(void)
++{
++    return pingouin_desktop_env("PINGOUIN_DESKTOP_LOST")
++        ? pingouin_desktop_env("PINGOUIN_DESKTOP_RESTART_REQUEST") : NULL;
++}
++
++/* 1 while the app's desktop-lost file is there (a plain file, not a link). */
++static inline int pingouin_desktop_lost(void)
++{
++    const char *path = pingouin_desktop_env("PINGOUIN_DESKTOP_LOST");
++    struct stat st;
++    return path && pingouin_desktop_restart_request() &&
++           lstat(path, &st) == 0 && S_ISREG(st.st_mode);
++}
++
++#endif

@@ -1,0 +1,300 @@
+From: OmacVM
+Subject: [PATCH] cocoa: the Mac's cursor stays hidden over the VM
+
+What: while QEMU hides the Mac's cursor over the VM (the guest draws its
+own pointer), the cursor's image is an empty one too, and the arrow comes
+back when QEMU shows the cursor again (Ctrl+Option+G, the pointer leaving
+the VM, another app in front, a guest reset), set only over our windows:
+elsewhere macOS puts its arrow back by itself as the pointer leaves them
+(seen on macOS 27), or the app there sets its own (Omanotch's strip beside
+the notch, which QEMU's arrow covered until the next move). Each motion over
+the VM sets the empty image again when AppKit put its own cursor back, or,
+at most every 0.1 s, when the window server says the hidden cursor shows
+after all; while hidden a timer asks that every 0.5 s without a motion too
+(a show while the pointer rests, e.g. while the user types). One [NSCursor
+hide] and one unhide per change, as before: the hide count stays balanced.
+The image rules are in ui/pingouin-pointer-start.h (pingouin_pointer_image,
+pingouin_pointer_image_again); this patch also takes
+over the hardware cursor's image code (pingouin-cocoa-hw-cursor.patch), which
+set the guest's image or an empty one the same way.
+
+Why: whether the cursor is hidden belongs to the window server, and other
+processes and macOS undo it: a background show (OmacVM Gestures hid and
+showed the cursor over full-screen VMs from the background as well), or an
+app or Space switch. QEMU still counted it hidden and never hid it again,
+so the Mac's arrow sat over the guest's pointer until the user switched
+out of the VM and back (user, 2026-10-19: "duplicate mac os cursor", on
+3.1.22 and 3.1.24). Reproduced on a MacBook Air: a background show after
+QEMU's hide brought the arrow back, and it stayed through moves. With an
+empty image, a cursor shown by someone else shows nothing over the VM.
+The window server is asked with CGCursorIsVisible (deprecated, still
+answers on macOS 15 and 27); a show between motions is caught at the next
+motion or by the timer (an empty image set while another process had the
+cursor hidden did not reach the screen: the arrow sat over the VM at rest
+until the first move). The timer runs only while QEMU has the cursor
+hidden, with 0.25 s tolerance, and asks one cheap question a tick.
+
+Upstream: not sent (OmacVM's pointer policy).
+Test: app/runtime/Tests/display/test-pointer-start.sh (the image rules and
+a model of the window server's side, also the 3.1.24 behaviour);
+src/tests/pointer-reveal-vm.sh (a test app and VM: a background show and
+hide around QEMU's hide, at rest and after moves; the cursor shows nothing
+over the VM).
+Applies before pingouin-cocoa-no-app-nap.patch, which stays the last cocoa patch.
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -1040,17 +1040,27 @@
+ static bool pingouin_pointer_debug;        /* PINGOUIN_POINTER_DEBUG=1 or the test */
+ /*
+  * The guest's pointer as the Mac's cursor (ui/pingouin-hw-cursor.h; main
+- * thread): the guest's last image as a Mac cursor, an empty one for while
+- * the guest hides its pointer, and whether one of them is set now (the
+- * arrow comes back when that ends). pingouin_hwc_seq: only the newest queued
+- * image update makes a cursor (atomic; QEMU's thread counts).
++ * thread): the guest's last image as a Mac cursor. pingouin_hwc_seq: only
++ * the newest queued image update makes a cursor (atomic; QEMU's thread
++ * counts).
+  */
+ static PingouinHwCursor pingouin_hwc;
+ static NSCursor *pingouin_hwc_cursor;
+-static NSCursor *pingouin_hwc_empty;
+-static bool pingouin_hwc_ours;
+ static unsigned pingouin_hwc_seq;
+-static void pingouin_hwc_apply(bool active);
++/*
++ * The image QEMU gives the Mac's cursor over the VM (main thread;
++ * ui/pingouin-pointer-start.h): the one it wants now, the cursor it set last
++ * (nil: none of its own, AppKit's), and two empty ones, so one can be set
++ * again over the other (AppKit skips the cursor it has).
++ */
++static PingouinCursorImage pingouin_cur_want;
++static NSCursor *pingouin_cur_set;
++static NSCursor *pingouin_cur_empty[2];
++static int pingouin_cur_flip;
++static unsigned pingouin_cur_hides;       /* how often QEMU hid the cursor */
++static void pingouin_cursor_image(PingouinCursorImage want);
++static void pingouin_cursor_again(void);
++static void pingouin_cursor_watch(bool on);
+ static bool pingouin_hwc_on_ours(void);
+ static bool pingouin_guard_place;          /* this event's place is the guard's */
+ /* The displays and our windows the guard last saw (main thread). */
+@@ -1356,11 +1366,17 @@
+         hide = hold < 0;
+     }
+ 
+-    pingouin_hwc_apply(hw);
++    /*
++     * The image first: while hidden it is an empty one too, so a show by
++     * another process or by macOS shows nothing over the VM.
++     */
++    pingouin_cursor_image(pingouin_pointer_image(hw, pingouin_hwc_visible(&pingouin_hwc), hide));
+     if (hide == pingouin_mac_cursor_hidden) {
+         return;
+     }
+     pingouin_mac_cursor_hidden = hide;
++    pingouin_cur_hides += hide;
++    pingouin_cursor_watch(hide && !pingouin_test_pointer);
+     if (pingouin_pointer_debug) {
+         info_report("pingouin-pointer: Mac cursor %s", hide ? "hidden" : "shown");
+     }
+@@ -2605,9 +2621,7 @@
+     if (isAbsoluteEnabled && !pingouin_test_pointer) {
+         pingouin_guard_corners(event);
+     }
+-    if (pingouin_hwc_ours) {
+-        pingouin_hwc_apply(true);
+-    }
++    pingouin_cursor_again();
+ 
+     with_bql(^{
+         if (isAbsoluteEnabled &&
+@@ -3028,9 +3042,7 @@
+     if (isAbsoluteEnabled) {
+         pingouin_guard_corners(event);
+     }
+-    if (pingouin_hwc_ours) {
+-        pingouin_hwc_apply(true);
+-    }
++    pingouin_cursor_again();
+     with_bql(^{
+         if (button >= 0) {
+             qemu_input_queue_btn(dcl.con, button, down);
+@@ -5654,47 +5666,148 @@
+     [cocoaView updateCursorLayout];     /* QEMU's layer hides now */
+ }
+ 
+-/*
+- * The Mac's cursor while it carries the guest's pointer: the guest's image,
+- * or an empty one while the guest hides its pointer; the arrow again when
+- * that ends (main thread). Set again on each motion: AppKit puts its own
+- * cursor back at a window's edge. Test mode never sets the real cursor.
+- */
+-static void pingouin_hwc_apply(bool active)
++/* An empty cursor: a transparent 16x16 picture (AppKit wants a real one). */
++static NSCursor *pingouin_cursor_empty_new(void)
+ {
+-    static NSCursor *logged;
+-    NSCursor *want = nil;
++    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
++        initWithBitmapDataPlanes:NULL pixelsWide:16 pixelsHigh:16 bitsPerSample:8
++                 samplesPerPixel:4 hasAlpha:YES isPlanar:NO
++                  colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:16 * 4 bitsPerPixel:32];
++    NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(16, 16)];
++    NSCursor *cursor;
+ 
+-    if (active) {
+-        if (!pingouin_hwc_empty) {
+-            NSImage *none = [[NSImage alloc] initWithSize:NSMakeSize(1, 1)];
+-            pingouin_hwc_empty = [[NSCursor alloc] initWithImage:none hotSpot:NSZeroPoint];
+-            [none release];
+-        }
+-        want = pingouin_hwc_visible(&pingouin_hwc) && pingouin_hwc_cursor ?
+-               pingouin_hwc_cursor : pingouin_hwc_empty;
++    memset([rep bitmapData], 0, 16 * 16 * 4);
++    [image addRepresentation:rep];
++    cursor = [[NSCursor alloc] initWithImage:image hotSpot:NSZeroPoint];
++    [image release];
++    [rep release];
++    return cursor;
++}
++
++/* The cursor for an image (nil: AppKit's own). */
++static NSCursor *pingouin_cursor_for(PingouinCursorImage want)
++{
++    if (want == PINGOUIN_CURSOR_APPKIT) {
++        return nil;
+     }
+-    if (!want && !pingouin_hwc_ours) {
+-        return;
++    if (want == PINGOUIN_CURSOR_GUEST && pingouin_hwc_cursor) {
++        return pingouin_hwc_cursor;
+     }
++    if (!pingouin_cur_empty[pingouin_cur_flip]) {
++        pingouin_cur_empty[pingouin_cur_flip] = pingouin_cursor_empty_new();
++    }
++    return pingouin_cur_empty[pingouin_cur_flip];
++}
++
++/*
++ * The Mac's cursor image over the VM (main thread; ui/pingouin-pointer-start.h
++ * says which): the guest's pointer (hardware cursor), an empty one (hidden,
++ * or the guest hides its pointer), or the arrow again once QEMU had set one
++ * of its own. All of them only over our windows: elsewhere macOS puts its
++ * arrow back by itself as the pointer leaves them, or the app there sets
++ * its own (Omanotch's strip). Test mode never sets the real cursor.
++ */
++static void pingouin_cursor_image(PingouinCursorImage want)
++{
++    static PingouinCursorImage logged;
++    NSCursor *c = pingouin_cursor_for(want);
++
+     if (pingouin_pointer_debug && want != logged) {
+-        info_report("pingouin-pointer: Mac cursor is %s", !want ? "the arrow again" :
+-                    want == pingouin_hwc_empty ? "empty (the guest hides its pointer)" :
+-                    "the guest's pointer");
++        info_report("pingouin-pointer: Mac cursor is %s",
++                    want == PINGOUIN_CURSOR_APPKIT ? "the arrow again" :
++                    want == PINGOUIN_CURSOR_GUEST ? "the guest's pointer" : "empty");
+         logged = want;
+     }
+-    pingouin_hwc_ours = want != nil;
++    pingouin_cur_want = want;
+     if (pingouin_test_pointer) {
+         return;     /* test: never the real cursor (the user works meanwhile) */
+     }
+-    if (!want) {
+-        [[NSCursor arrowCursor] set];
+-    } else if ([NSCursor currentCursor] != want && pingouin_hwc_on_ours()) {
+-        /* Not over another app's window (Omanotch's strip sets its own). */
+-        [want set];
++    if (!c) {
++        if (pingouin_cur_set) {
++            pingouin_cur_set = nil;
++            if (pingouin_hwc_on_ours()) {
++                [[NSCursor arrowCursor] set];
++            }
++        }
++    } else if (([NSCursor currentCursor] != c || pingouin_cur_set != c) && pingouin_hwc_on_ours()) {
++        if ([NSCursor currentCursor] == c) {
++            /* AppKit skips the cursor it has; the screen shows another since: the arrow first */
++            [[NSCursor arrowCursor] set];
++        }
++        [c set];
++        pingouin_cur_set = c;
+     }
+ }
+ 
++/*
++ * A motion over the VM, or the watch below (main thread): QEMU's image
++ * again when AppKit put its own back (at a window's edge), or, while QEMU
++ * has the cursor hidden, when the window server shows it after all
++ * (another process's show, or macOS's around a Space or app switch; AppKit
++ * sees neither). The window server is asked at most every
++ * PINGOUIN_POINTER_LOOK_S.
++ */
++static void pingouin_cursor_again(void)
++{
++    static double last;
++    static unsigned logged_hide, logged;
++    bool has, looked = false, shown = false;
++
++    if (pingouin_cur_want == PINGOUIN_CURSOR_APPKIT || pingouin_test_pointer) {
++        return;
++    }
++    has = [NSCursor currentCursor] == pingouin_cursor_for(pingouin_cur_want);
++    if (has && pingouin_mac_cursor_hidden &&
++        pingouin_pointer_look_due(CACurrentMediaTime(), &last)) {
++        looked = true;
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++        shown = CGCursorIsVisible();
++#pragma clang diagnostic pop
++    }
++    if (!pingouin_pointer_image_again(pingouin_cur_want, has, pingouin_mac_cursor_hidden,
++                                    looked, shown)) {
++        return;
++    }
++    if (has) {
++        /* AppKit has the empty one already: the other, so it reaches the window server. */
++        pingouin_cur_flip ^= 1;
++        if (logged_hide != pingouin_cur_hides && logged < 20) {
++            logged_hide = pingouin_cur_hides;
++            logged++;
++            info_report("cocoa: the hidden Mac cursor showed over the VM (another app or "
++                        "macOS showed it): an empty one there now%s",
++                        logged == 20 ? " (not logged again)" : "");
++        }
++    }
++    pingouin_cursor_image(pingouin_cur_want);
++}
++
++/*
++ * While QEMU has the cursor hidden, pingouin_cursor_again also every
++ * PINGOUIN_POINTER_WATCH_S without a motion (main thread): a show while the
++ * pointer rests left the arrow over the VM until the next move. No timer
++ * otherwise; its tolerance lets macOS fold the wake-up into others.
++ */
++static NSTimer *pingouin_cur_watch;
++
++static void pingouin_cursor_watch(bool on)
++{
++    if (on == (pingouin_cur_watch != nil)) {
++        return;
++    }
++    if (!on) {
++        [pingouin_cur_watch invalidate];
++        [pingouin_cur_watch release];
++        pingouin_cur_watch = nil;
++        return;
++    }
++    pingouin_cur_watch = [[NSTimer timerWithTimeInterval:PINGOUIN_POINTER_WATCH_S repeats:YES
++                                                 block:^(NSTimer *t) { pingouin_cursor_again(); }] retain];
++    [pingouin_cur_watch setTolerance:PINGOUIN_POINTER_WATCH_S / 2];
++    [[NSRunLoop mainRunLoop] addTimer:pingouin_cur_watch forMode:NSRunLoopCommonModes];
++}
++
+ static void cocoa_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
+ {
+     unsigned seq = pingouin_hwc.on ? qatomic_fetch_inc(&pingouin_hwc_seq) + 1 : 0;

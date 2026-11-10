@@ -1,0 +1,236 @@
+From: OmacVM
+Subject: [PATCH] cocoa: VM memory and graphics memory in the app menu
+
+What: while OmacVM.app runs the VM, the app menu (the one named after the VM's
+app, beside the Apple menu) shows two lines under "About":
+  VM memory: 16 GB
+  Graphics memory: 1.6 GB (peak 2.6 GB)
+They are filled in when the menu opens (NSMenuDelegate menuNeedsUpdate:) from
+the status file virgl-darwin-memory-pressure.patch writes
+(PINGOUIN_GPU_MEMORY_STATUS) and the machine's RAM size: no timer, so nothing
+runs while the menu is closed. ", the Mac is short of memory" is added while
+macOS's pressure is warn or critical. Both lines have a tooltip, and a click
+shows the same explanation in a window: VM memory is the RAM given to the VM;
+graphics memory is on top, from the Mac's memory as the VM's GPU work needs it.
+Without PINGOUIN_GPU_MEMORY_STATUS (QEMU not started by OmacVM.app) the menu is
+unchanged.
+Why: the launcher window is not shown while the VM runs, so the live numbers were
+only in `omacvm check` (user, 2026-10-05: show "Graphics memory: X GB (peak Y)"
+live, and how it differs from VM memory).
+Safety: only the numbers and the pressure level are read from the file (the
+guest-named context fields are not); at most 4 KB, parsed with bounds.
+Upstream: not applicable (OmacVM's status file).
+Test: app/runtime/Tests/display/test-gpu-memory-menu.sh (the parser and text in
+ui/pingouin-gpu-memory.h, build time and CI); the menu itself in a test app (PR #91).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index d76c36a..3848980 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -42,6 +42,8 @@
+ #include "ui/kbd-state.h"
+ #include "ui/pingouin-pointer-guard.h"
+ #include "ui/pingouin-shortcuts.h"
++#include "ui/pingouin-gpu-memory.h"
++#include "hw/core/boards.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+ #include "system/runstate-action.h"
+@@ -2713,6 +2715,86 @@ - (void)sendEvent:(NSEvent *)event
+ }
+ @end
+ 
++/*
++ * Pingouin: "VM memory" and "Graphics memory" in the app menu while the VM runs
++ * (pingouin-cocoa-graphics-memory.patch). The lines are read when the menu
++ * opens, from the status file Pingouin.app names: no timer, nothing while idle.
++ */
++@interface PingouinMemoryMenu : NSObject <NSMenuDelegate>
++{
++@public
++    NSMenuItem *vmItem;
++    NSMenuItem *gpuItem;
++}
++- (void)explain:(id)sender;
++@end
++
++static PingouinMemoryMenu *pingouin_memory_menu;
++
++static NSString *const pingouin_memory_explanation =
++    @"VM memory is the Mac memory you gave the VM: its RAM.\n\n"
++     "Graphics memory comes on top: the textures and buffers the VM's desktop "
++     "and apps draw with on the Mac's GPU, taken from the Mac's memory as they "
++     "need it (a 5K desktop with a browser: about 2 GB). There is no fixed "
++     "limit; only when macOS itself runs short of memory are new big ones refused.";
++
++@implementation PingouinMemoryMenu
++- (void)menuNeedsUpdate:(NSMenu *)menu
++{
++    char line[160];
++    PingouinGpuMemory m;
++    int have = 0;
++    const char *path = getenv("PINGOUIN_GPU_MEMORY_STATUS");
++    FILE *f = path && *path ? fopen(path, "r") : NULL;
++    if (f) {
++        char text[4096];
++        size_t n = fread(text, 1, sizeof(text) - 1, f);
++        fclose(f);
++        text[n] = '\0';
++        have = pingouin_gpu_memory_parse(text, &m);
++    }
++    pingouin_gpu_memory_line(have ? &m : NULL, line, sizeof(line));
++    [gpuItem setTitle:[NSString stringWithUTF8String:line]];
++    if (current_machine) {
++        pingouin_vm_memory_line(current_machine->ram_size, line, sizeof(line));
++        [vmItem setTitle:[NSString stringWithUTF8String:line]];
++    }
++}
++
++- (void)explain:(id)sender
++{
++    NSAlert *alert = [[NSAlert new] autorelease];
++    [alert setMessageText:[NSString stringWithFormat:@"%@\n%@", [vmItem title], [gpuItem title]]];
++    [alert setInformativeText:pingouin_memory_explanation];
++    [alert addButtonWithTitle:@"OK"];
++    [alert runModal];
++}
++@end
++
++static void pingouin_add_memory_items(NSMenu *menu)
++{
++    const char *path = getenv("PINGOUIN_GPU_MEMORY_STATUS");
++    if (!path || !*path) {
++        return; /* not started by Pingouin.app: no status file */
++    }
++    pingouin_memory_menu = [[PingouinMemoryMenu alloc] init];
++    [menu addItem:[NSMenuItem separatorItem]];
++    NSMenuItem *vm = [[[NSMenuItem alloc] initWithTitle:@"VM memory"
++                                                 action:@selector(explain:)
++                                          keyEquivalent:@""] autorelease];
++    NSMenuItem *gpu = [[[NSMenuItem alloc] initWithTitle:@"Graphics memory: not measured yet"
++                                                  action:@selector(explain:)
++                                           keyEquivalent:@""] autorelease];
++    for (NSMenuItem *item in @[vm, gpu]) {
++        [item setTarget:pingouin_memory_menu];
++        [item setToolTip:pingouin_memory_explanation];
++        [menu addItem:item];
++    }
++    pingouin_memory_menu->vmItem = vm;
++    pingouin_memory_menu->gpuItem = gpu;
++    [menu setDelegate:pingouin_memory_menu];
++}
++
+ static void create_initial_menus(void)
+ {
+     // Add menus
+@@ -2725,6 +2807,7 @@ static void create_initial_menus(void)
+     // Application menu
+     menu = [[NSMenu alloc] initWithTitle:@""];
+     [menu addItemWithTitle:[NSString stringWithFormat:@"About %@", pingouin_product_name()] action:@selector(do_about_menu_item:) keyEquivalent:@""];
++    pingouin_add_memory_items(menu);
+     [menu addItem:[NSMenuItem separatorItem]]; //Separator
+     menuItem = [menu addItemWithTitle:@"Services" action:nil keyEquivalent:@""];
+     [menuItem setSubmenu:[NSApp servicesMenu]];
+diff --git a/ui/pingouin-gpu-memory.h b/ui/pingouin-gpu-memory.h
+new file mode 100644
+index 0000000..5b2e7aa
+--- /dev/null
++++ b/ui/pingouin-gpu-memory.h
+@@ -0,0 +1,97 @@
++/*
++ * Pingouin: the VM menu's memory lines (pingouin-cocoa-graphics-memory.patch).
++ *
++ * Reads the status file virglrenderer writes (virgl-darwin-memory-pressure.patch,
++ * PINGOUIN_GPU_MEMORY_STATUS: key=value lines) and makes the menu's text. Only
++ * numbers and the pressure level are read; the guest-named fields are not.
++ * No AppKit here, so it is unit tested (Tests/display/test-gpu-memory-menu.sh).
++ */
++#ifndef PINGOUIN_GPU_MEMORY_H
++#define PINGOUIN_GPU_MEMORY_H
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++typedef struct PingouinGpuMemory {
++    long in_use_mb;
++    long peak_mb;
++    int short_of_memory; /* macOS's pressure is warn or critical */
++} PingouinGpuMemory;
++
++static inline long pingouin_gpu_memory_number(const char *v)
++{
++    char *end;
++    long n = strtol(v, &end, 10);
++    return end != v && n >= 0 ? n : 0;
++}
++
++/* 1 when the text has in_use_mb (the file is there and written). */
++static inline int pingouin_gpu_memory_parse(const char *text, PingouinGpuMemory *m)
++{
++    int seen = 0;
++    memset(m, 0, sizeof(*m));
++    while (text && *text) {
++        const char *end = strchr(text, '\n');
++        size_t len = end ? (size_t)(end - text) : strlen(text);
++        char line[128];
++        if (len < sizeof(line)) {
++            memcpy(line, text, len);
++            line[len] = '\0';
++            char *eq = strchr(line, '=');
++            if (eq) {
++                *eq = '\0';
++                const char *v = eq + 1;
++                if (!strcmp(line, "in_use_mb")) {
++                    m->in_use_mb = pingouin_gpu_memory_number(v);
++                    seen = 1;
++                } else if (!strcmp(line, "peak_mb")) {
++                    m->peak_mb = pingouin_gpu_memory_number(v);
++                } else if (!strcmp(line, "pressure")) {
++                    m->short_of_memory = !strcmp(v, "warn") || !strcmp(v, "critical");
++                }
++            }
++        }
++        text = end ? end + 1 : text + len;
++    }
++    return seen;
++}
++
++/* "512 MB", "1.6 GB" (as Pingouin.app writes it). */
++static inline void pingouin_gpu_memory_size(long mb, char *out, size_t n)
++{
++    if (mb < 1024) {
++        snprintf(out, n, "%ld MB", mb);
++    } else {
++        snprintf(out, n, "%.1f GB", mb / 1024.0);
++    }
++}
++
++/* "Graphics memory: 1.6 GB (peak 2.6 GB)"; m NULL: nothing measured yet. */
++static inline void pingouin_gpu_memory_line(const PingouinGpuMemory *m, char *out, size_t n)
++{
++    char now[32], peak[32];
++    if (!m) {
++        snprintf(out, n, "Graphics memory: not measured yet");
++        return;
++    }
++    pingouin_gpu_memory_size(m->in_use_mb, now, sizeof(now));
++    pingouin_gpu_memory_size(m->peak_mb, peak, sizeof(peak));
++    snprintf(out, n, "Graphics memory: %s (peak %s)%s", now, peak,
++             m->short_of_memory ? ", the Mac is short of memory" : "");
++}
++
++/* "VM memory: 16 GB" from the VM's RAM in bytes. */
++static inline void pingouin_vm_memory_line(unsigned long long bytes, char *out, size_t n)
++{
++    unsigned long long mb = bytes >> 20;
++    if (mb >= 1024 && mb % 1024 == 0) {
++        snprintf(out, n, "VM memory: %llu GB", mb / 1024);
++    } else {
++        char size[32];
++        pingouin_gpu_memory_size((long)mb, size, sizeof(size));
++        snprintf(out, n, "VM memory: %s", size);
++    }
++}
++
++#endif

@@ -1,0 +1,187 @@
+virglrenderer: a plain 2D view behind a 2D_ARRAY sampler
+
+What: when a shader declares a sampler view 2D_ARRAY and the view bound there
+is a plain 2D texture, that sampler is declared sampler2D in the GLSL and its
+lookups take the 2D form (x and y; layer 0), as gallium reads such a view. A
+key bit per view (sampler_views_2d_for_array_mask, the first 32 views) asks
+for it, set only where the shader declares 2D_ARRAY (shader info
+samplers_2d_array_mask), so other shaders' keys do not change; the view slot's
+key bits (vrend_slot_key_bits) include it, so a 2D view coming or going there
+selects the shaders again (virgl-legacy-vertex-cache.patch). A shader that
+declares no sampler views at all (SAMP only) has the target only in its
+lookups: there a 2D_ARRAY lookup counts as the 2D_ARRAY declaration of that
+sampler. Not for samplers indexed indirectly.
+Why: GL samples a 2D texture only through a sampler2D; a sampler2DArray on
+that unit reads nothing (black). Mesa's VA-API video compositor declares its
+plane samplers 2D_ARRAY while progressive video buffers are 2D textures, so
+every frame VA-API converted to RGB was black (Google Chrome converts each
+decoded frame so; FFmpeg's scale_vaapi gave Y=U=V=0 green with the colour
+matrix fixed). Mesa's motion-adaptive deinterlacer (vl_deint_filter.c)
+declares SAMP[0..3] without views and reads the decoded pictures, plain 2D
+textures, with 2D_ARRAY lookups: every deinterlaced picture was Y=U=V=0,
+green (mpv's vavpp default, FFmpeg's deinterlace_vaapi).
+Upstreamable; not sent.
+Tests: Tests/virgl/test-const-ubo.c case 23 (a 2D view through a 2D_ARRAY
+sampler, alone and with constant buffer 0 as a guest buffer: black without
+the patch), case 25 (the same lookup on a SAMP-only sampler, then a real 2D
+array in that slot reading its layer 1: black without the SAMP-only part),
+test-view-key.c (dirty tracking and the key bit with such a shader bound).
+--- a/src/vrend/vrend_shader.h
++++ b/src/vrend/vrend_shader.h
+@@ -134,6 +134,8 @@
+    int8_t fs_output_layout[12];
+ 
+    uint32_t samplers_used_mask;
++   /* Pingouin: sampler views the shader declares 2D_ARRAY (the first 32) */
++   uint32_t samplers_2d_array_mask;
+    uint32_t images_used_mask;
+    uint32_t image_binding_offset;
+    int32_t image_last_binding;
+@@ -225,6 +227,9 @@
+ 
+    uint64_t sampler_views_lower_swizzle_mask[VREND_SHADER_SAMPLER_VIEWS_MASK_LENGTH];
+    uint64_t sampler_views_emulated_rect_mask[VREND_SHADER_SAMPLER_VIEWS_MASK_LENGTH];
++   /* Pingouin: samplers the shader declares 2D_ARRAY whose bound view is a plain 2D texture
++    * (the first 32 views): they are sampled as 2D, layer 0 */
++   uint32_t sampler_views_2d_for_array_mask;
+    uint16_t tex_swizzle[PIPE_MAX_SHADER_SAMPLER_VIEWS];
+ 
+    uint8_t ssbo_binding_offset;
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -235,6 +235,7 @@
+ 
+    struct vrend_shader_sampler samplers[32];
+    uint32_t samplers_used;
++   uint32_t samplers_2d_array_declared;
+ 
+    uint32_t ssbo_first_binding;
+    uint32_t ssbo_used_mask;
+@@ -1120,6 +1121,14 @@
+    return -1;
+ }
+ 
++/* Pingouin: sampler view i is declared 2D_ARRAY and bound to a plain 2D texture (the key);
++ * not for samplers indexed indirectly (their arrays keep one type) */
++static bool sampler_2d_for_array(const struct dump_ctx *ctx, int i)
++{
++   return i >= 0 && i < 32 && (ctx->key->sampler_views_2d_for_array_mask & (1u << i)) &&
++          !(ctx->info.indirect_files & (1 << TGSI_FILE_SAMPLER));
++}
++
+ // TODO Consider exposing non-const ctx-> members as args to make *ctx const
+ static bool add_samplers(struct dump_ctx *ctx, int first, int last, int sview_type, enum tgsi_return_type sview_rtype)
+ {
+@@ -1130,6 +1139,15 @@
+    for (int i = first; i <= last; i++) {
+       ctx->samplers[i].tgsi_sampler_return = sview_rtype;
+       ctx->samplers[i].tgsi_sampler_type = sview_type;
++      /* Pingouin: a 2D_ARRAY sampler whose bound view is a plain 2D texture (Mesa's VA-API
++       * video compositor declares its planes so): GL samples a 2D texture only through a
++       * sampler2D, a sampler2DArray reads nothing there. Gallium reads such a view as
++       * layer 0; declared as 2D, the shader does the same (iter_instruction). */
++      if (sview_type == TGSI_TEXTURE_2D_ARRAY && i < 32) {
++         ctx->samplers_2d_array_declared |= 1u << i;
++         if (sampler_2d_for_array(ctx, i))
++            ctx->samplers[i].tgsi_sampler_type = TGSI_TEXTURE_2D;
++      }
+    }
+ 
+    if (ctx->info.indirect_files & (1 << TGSI_FILE_SAMPLER)) {
+@@ -5884,6 +5902,24 @@
+                ctx->inputs[i].invariant = 0;
+          }
+       }
++   }
++
++   /* Pingouin: a 2D_ARRAY lookup on a sampler declared 2D for its plain 2D view (add_samplers)
++    * takes the 2D form: the coordinate's x and y, layer 0. A shader that declares no sampler
++    * views (SAMP only: Mesa's deinterlacer, vl_deint_filter.c) has the target only in its
++    * lookups: a 2D_ARRAY lookup counts as a 2D_ARRAY declaration of that sampler. */
++   if (inst->Instruction.Texture && inst->Texture.Texture == TGSI_TEXTURE_2D_ARRAY) {
++      for (unsigned i = 0; i < inst->Instruction.NumSrcRegs; i++) {
++         const struct tgsi_src_register *reg = &inst->Src[i].Register;
++         if ((reg->File != TGSI_FILE_SAMPLER && reg->File != TGSI_FILE_SAMPLER_VIEW) ||
++             reg->Indirect)
++            continue;
++         if (reg->File == TGSI_FILE_SAMPLER && !ctx->info.file_count[TGSI_FILE_SAMPLER_VIEW] &&
++             reg->Index >= 0 && reg->Index < 32)
++            ctx->samplers_2d_array_declared |= 1u << reg->Index;
++         if (sampler_2d_for_array(ctx, reg->Index))
++            inst->Texture.Texture = TGSI_TEXTURE_2D;
++      }
+    }
+
+    if (!get_destination_info(ctx, inst, &dinfo, ctx->dst_bufs, fp64_dsts, writemask))
+@@ -8183,6 +8219,7 @@
+ {
+    sinfo->use_pervertex_in = ctx->has_pervertex;
+    sinfo->samplers_used_mask = ctx->samplers_used;
++   sinfo->samplers_2d_array_mask = ctx->samplers_2d_array_declared;
+    sinfo->images_used_mask = ctx->images_used_mask;
+    sinfo->image_binding_offset = ctx->key->image_binding_offset;
+    sinfo->image_last_binding = ctx->key->image_binding_offset + ctx->image_last_binding;
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -4861,6 +4861,20 @@
+       bits |= 1u << 0;
+    if (view->texture->target == GL_TEXTURE_BUFFER && vrend_get_swizzle(view, swizzle))
+       bits |= 1u << 1 | swizzle[0] << 2 | swizzle[1] << 5 | swizzle[2] << 8 | swizzle[3] << 11;
++   return bits;
++}
++
++/* Pingouin: a slot's key bits with the stage's bound shader: also whether a plain 2D view sits
++ * where the shader declares a 2D_ARRAY sampler (sampler_views_2d_for_array_mask). */
++static uint32_t vrend_slot_key_bits(struct vrend_sub_context *sub, uint32_t shader_type,
++                                    uint32_t index, struct vrend_sampler_view *view)
++{
++   const struct vrend_shader_selector *sel = sub->shaders[shader_type];
++   uint32_t bits = vrend_view_key_bits(view);
++
++   if (view && view->texture && view->target == GL_TEXTURE_2D && sel && index < 32 &&
++       (sel->sinfo.samplers_2d_array_mask & (1u << index)))
++      bits |= 1u << 14;
+    return bits;
+ }
+ 
+@@ -4884,7 +4898,8 @@
+    struct vrend_shader_view *shader_view = &ctx->sub->views[shader_type];
+    struct vrend_sampler_view *view = NULL;
+    struct vrend_texture *tex;
+-   uint32_t old_key_bits = vrend_view_key_bits(shader_view->views[index]);
++   uint32_t old_key_bits = vrend_slot_key_bits(ctx->sub, shader_type, index,
++                                               shader_view->views[index]);
+ 
+    if (handle) {
+       view = vrend_object_lookup(ctx->sub->object_hash, handle, VIRGL_OBJECT_SAMPLER_VIEW);
+@@ -4992,7 +5007,8 @@
+    }
+ 
+    vrend_sampler_view_reference(&shader_view->views[index], view);
+-   vrend_view_key_changed(ctx->sub, shader_type, old_key_bits, vrend_view_key_bits(view));
++   vrend_view_key_changed(ctx->sub, shader_type, old_key_bits,
++                          vrend_slot_key_bits(ctx->sub, shader_type, index, view));
+ }
+ 
+ void vrend_set_num_sampler_views(struct vrend_context *ctx,
+@@ -5006,7 +5022,8 @@
+    struct vrend_shader_view *shader_view = &ctx->sub->views[shader_type];
+    for (i = last_slot; i < shader_view->max_num_views; i++) {
+       vrend_view_key_changed(ctx->sub, shader_type,
+-                             vrend_view_key_bits(shader_view->views[i]), 0);
++                             vrend_slot_key_bits(ctx->sub, shader_type, i,
++                                                 shader_view->views[i]), 0);
+       vrend_sampler_view_reference(&shader_view->views[i], NULL);
+    }
+ 
+@@ -5567,6 +5584,10 @@
+       if (view->emulated_rect) {
+          vrend_shader_sampler_views_mask_set(key->sampler_views_emulated_rect_mask, i);
+       }
++
++      /* Pingouin: a plain 2D view where the shader declares a 2D_ARRAY sampler */
++      if (view->target == GL_TEXTURE_2D && i < 32 && (sel->sinfo.samplers_2d_array_mask & (1u << i)))
++         key->sampler_views_2d_for_array_mask |= 1u << i;
+ 
+       /* Native GL already applies alpha swizzles in sampler state. Applying
+        * OOOR again in the shader would read zero instead of glyph coverage. */

@@ -1,0 +1,71 @@
+From: OmacVM
+Subject: [PATCH] vrend: poll fences when the sync thread cannot start
+
+With ASYNC_FENCE_CB, vrend leaves fence retirement to the sync thread. If
+that thread cannot start (no shared GL context, no eventfd, no thread),
+use_async_fence_cb stayed set: fences went to fence_list, and
+vrend_renderer_poll() in async mode never looks there. The guest's GPU
+then waited forever.
+
+Fall back instead: clear use_async_fence_cb, so vrend_renderer_poll()
+retires fences on the render thread as without the sync thread, and close
+the eventfd, so virgl_renderer_get_poll_fd() returns -1 and the caller can
+tell (QEMU logs the path it really took, qemu-cocoa-gl-async-fence.patch).
+
+Upstream: not sent; the bug is upstream too (any platform where the
+thread or its context fails).
+Test: app/runtime/Tests/virgl/test-thread-sync-fallback.c (no context, no
+eventfd, and the normal start) at every runtime build; an app VM started
+with TMPDIR pointing nowhere logs the polled path and runs glmark2.
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 339c15f..aa0c542 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -7585,7 +7585,7 @@ static void vrend_renderer_use_threaded_sync(void)
+    vrend_state.sync_context = vrend_clicbs->create_gl_context_surfaceless(0, &ctx_params);
+    if (vrend_state.sync_context == NULL) {
+       virgl_error("Failed to create sync opengl context\n");
+-      return;
++      goto no_thread;
+    }
+ 
+    if (vrend_state.eventfd == -1) {
+@@ -7593,7 +7593,7 @@ static void vrend_renderer_use_threaded_sync(void)
+       if (vrend_state.eventfd == -1) {
+          virgl_error("Failed to create eventfd\n");
+          vrend_clicbs->destroy_gl_context_surfaceless(vrend_state.sync_context);
+-         return;
++         goto no_thread;
+       }
+    }
+ 
+@@ -7607,14 +7607,26 @@ static void vrend_renderer_use_threaded_sync(void)
+ 
+    vrend_state.sync_thread = u_thread_create(thread_sync, NULL);
+    if (!vrend_state.sync_thread) {
+-      close(vrend_state.eventfd);
+-      vrend_state.eventfd = -1;
+       vrend_clicbs->destroy_gl_context_surfaceless(vrend_state.sync_context);
+       cnd_destroy(&vrend_state.fence_cond);
+       mtx_destroy(&vrend_state.fence_mutex);
+       cnd_destroy(&vrend_state.poll_cond);
+       mtx_destroy(&vrend_state.poll_mutex);
++      goto no_thread;
+    }
++   return;
++
++no_thread:
++   /* Without the sync thread no one retires fences in async mode and the
++    * guest's GPU waits forever: poll them on the render thread instead.
++    * No poll fd either, so the caller can tell (get_poll_fd() < 0). */
++   if (vrend_state.eventfd != -1) {
++      close(vrend_state.eventfd);
++      vrend_state.eventfd = -1;
++   }
++   if (vrend_state.use_async_fence_cb)
++      virgl_error("sync thread not started, fences are polled\n");
++   vrend_state.use_async_fence_cb = false;
+ }
+ 
+ static void vrend_debug_cb(UNUSED GLenum source, GLenum type, UNUSED GLuint id,

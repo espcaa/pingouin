@@ -12,10 +12,12 @@ public struct VMConfig: Codable, Equatable, Sendable {
     public var fullPanel: Bool
     /// A Mac folder the guest sees as ~/Mac (virtio-9p, mount tag "pingouin").
     public var sharedFolder: String?
+    /// Vulkan in the guest (Venus on MoltenVK); OpenGL works either way.
+    public var vulkan: Bool
 
     public init(name: String, cpus: Int = VMConfig.defaultCPUs, memoryMiB: Int = VMConfig.defaultMemoryMiB,
                 diskGiB: Int = 80, isoKeyboard: Bool = false, fullPanel: Bool = true,
-                sharedFolder: String? = nil) {
+                sharedFolder: String? = nil, vulkan: Bool = true) {
         self.name = name
         self.cpus = cpus
         self.memoryMiB = memoryMiB
@@ -23,6 +25,20 @@ public struct VMConfig: Codable, Equatable, Sendable {
         self.isoKeyboard = isoKeyboard
         self.fullPanel = fullPanel
         self.sharedFolder = sharedFolder
+        self.vulkan = vulkan
+    }
+
+    /// Settings added later default when an older config.json lacks them.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        cpus = try c.decodeIfPresent(Int.self, forKey: .cpus) ?? VMConfig.defaultCPUs
+        memoryMiB = try c.decodeIfPresent(Int.self, forKey: .memoryMiB) ?? VMConfig.defaultMemoryMiB
+        diskGiB = try c.decodeIfPresent(Int.self, forKey: .diskGiB) ?? 80
+        isoKeyboard = try c.decodeIfPresent(Bool.self, forKey: .isoKeyboard) ?? false
+        fullPanel = try c.decodeIfPresent(Bool.self, forKey: .fullPanel) ?? true
+        sharedFolder = try c.decodeIfPresent(String.self, forKey: .sharedFolder)
+        vulkan = try c.decodeIfPresent(Bool.self, forKey: .vulkan) ?? true
     }
 
     /// All cores but two: QEMU's GPU work (virgl) runs on the Mac side and needs some.

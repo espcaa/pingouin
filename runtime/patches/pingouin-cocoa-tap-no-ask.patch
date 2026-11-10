@@ -1,0 +1,64 @@
+From: OmacVM
+Subject: [PATCH] cocoa: no macOS prompt for the full-grab tap at the VM's start
+
+What: setFullGrab makes the full-grab event tap only when macOS already lets
+OmacVM control the computer (CGPreflightPostEventAccess, an answer without a
+prompt; Accessibility's answer when there is no entry of its own). Without
+it: no CGEventTapCreate, qemu.log says "Could not create event tap" as before
+(OmacVM.app's window note reads it) and why.
+
+Why: CGEventTapCreate for an app that is not allowed is refused anyway, and
+macOS 27 shows "<app> would like to control this Mac ... Open System Settings
+/ Deny" for it (tccd: "Notifying for access kTCCServicePostEvent ... Service
+kTCCServicePostEvent does not allow prompting; returning denied"). That came
+at every VM start, also with nobody at the Mac: 54 such dialogs in 36 hours on
+the test Mac mini (test copies under bundle ids without a grant), and every
+VM start for a person who has not turned OmacVM on (the app clears an old
+entry once per launch, a Deny with it: KeyAccess.clearOldEntryOnce). OmacVM.app
+asks only when the person clicks Allow... in the VM window (KeyAccess.request:
+CGRequestPostEventAccess and the Accessibility pane).
+
+Upstream: not sent (OmacVM's own rule on top of the full-grab patches).
+
+Test: app/runtime/Tests/keys/test-tap-no-ask.sh (CI: pingouin_tap_allowed from
+this patch with made-up answers; the runtime build: also that setFullGrab asks
+it before its only CGEventTapCreate). Applies after pingouin-cocoa-keys-last.patch.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -2186,12 +2186,35 @@
+     return v && !strcmp(v, "1") ? kCGTailAppendEventTap : kCGHeadInsertEventTap;
+ }
+ 
++/*
++ * Pingouin: the full-grab tap is made only when macOS already lets Pingouin
++ * control the computer (CGPreflightPostEventAccess: an answer, no prompt).
++ * Without that, CGEventTapCreate is refused anyway, and macOS shows "... would
++ * like to control this Mac" for it at every VM start (tccd: "Notifying for
++ * access kTCCServicePostEvent"), also while nobody is at the Mac. Pingouin.app
++ * asks only from Allow... in the VM window (KeyAccess.request). qemu.log
++ * still says "Could not create event tap", which the window's note reads.
++ */
++static bool pingouin_tap_allowed(void)
++{
++    if (CGPreflightPostEventAccess()) {
++        return true;
++    }
++    info_report("cocoa: not allowed to control the computer: no full-grab tap, "
++                "and no macOS prompt at the start (Allow... in the VM window asks)");
++    return false;
++}
++
+ - (void) setFullGrab:(id)sender
+ {
+     COCOA_DEBUG("QemuCocoaView: setFullGrab\n");
+ 
+     CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(kCGEventFlagsChanged);
+     CGEventTapPlacement place = pingouin_keys_place();
++    if (!pingouin_tap_allowed()) {
++        warn_report("Could not create event tap, system key combos will not be captured.\n");
++        return;
++    }
+     eventsTap = CGEventTapCreate(kCGHIDEventTap, place, kCGEventTapOptionDefault,
+                                  mask, handleTapEvent, self);
+     if (!eventsTap) {

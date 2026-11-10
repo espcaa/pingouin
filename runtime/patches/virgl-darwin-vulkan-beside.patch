@@ -1,0 +1,94 @@
+From: OmacVM
+Subject: [PATCH] venus: load the Vulkan loader and driver from the app runtime
+
+Load libvulkan.1.dylib from beside libvirglrenderer, and pick the driver
+(KosmicKrisp on macOS 26+, MoltenVK before) from share/vulkan/icd.d unless
+VK_DRIVER_FILES or VK_ICD_FILENAMES is set. PINGOUIN_VULKAN_DRIVER overrides.
+With MoltenVK, MVK_CONFIG_USE_MTLHEAP=1: Venus shares memory as MTLHeaps.
+
+Upstream: not sent (OmacVM's runtime layout).
+Test: vulkaninfo in an app VM finds Venus on MoltenVK from the runtime,
+no DYLD path set.
+
+diff --git a/src/venus/vkr_library.c b/src/venus/vkr_library.c
+index ea5c2c5..3096feb 100644
+--- a/src/venus/vkr_library.c
++++ b/src/venus/vkr_library.c
+@@ -43,12 +43,77 @@ vkr_library_preload_icd(void)
+ #define LIBVULKAN  "libvulkan.so"
+ #endif
+ 
++#ifdef __APPLE__
++#include <libgen.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/sysctl.h>
++#include <unistd.h>
++
++/* Pingouin: the Vulkan loader and its drivers sit in the app's runtime, beside
++ * this library (lib/) and in share/vulkan/icd.d. Load that loader, and unless
++ * VK_DRIVER_FILES or VK_ICD_FILENAMES is set, point it at one driver:
++ * KosmicKrisp on macOS 26 and newer (it needs Metal 4), MoltenVK otherwise.
++ * PINGOUIN_VULKAN_DRIVER=moltenvk|kosmickrisp picks one by hand. */
++static void *
++vkr_library_open_beside(void)
++{
++   Dl_info info;
++   char path[PATH_MAX], dir[PATH_MAX], json[PATH_MAX];
++
++   if (!dladdr((const void *)vkr_library_open_beside, &info) || !info.dli_fname)
++      return NULL;
++   snprintf(path, sizeof(path), "%s", info.dli_fname);
++   snprintf(dir, sizeof(dir), "%s", dirname(path));
++
++   if (!getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES")) {
++      const char *want = getenv("PINGOUIN_VULKAN_DRIVER");
++      int major = 0;
++      char version[32] = { 0 };
++      size_t len = sizeof(version) - 1;
++      if (sysctlbyname("kern.osproductversion", version, &len, NULL, 0) == 0)
++         major = atoi(version);
++      const char *order[2] = { "kosmickrisp_mesa_icd.json", "MoltenVK_icd.json" };
++      if (want && !strcmp(want, "moltenvk")) {
++         order[0] = "MoltenVK_icd.json";
++         order[1] = NULL;
++      } else if (want && !strcmp(want, "kosmickrisp")) {
++         order[1] = NULL;
++      } else if (major < 26) {
++         order[0] = "MoltenVK_icd.json";
++         order[1] = NULL;
++      }
++      for (int i = 0; i < 2 && order[i]; i++) {
++         snprintf(json, sizeof(json), "%s/../share/vulkan/icd.d/%s", dir, order[i]);
++         if (access(json, R_OK) == 0) {
++            setenv("VK_DRIVER_FILES", json, 0);
++            /* Venus shares device memory as MTLHeaps: MoltenVK only backs
++             * memory with heaps when asked to. */
++            if (strstr(order[i], "MoltenVK"))
++               setenv("MVK_CONFIG_USE_MTLHEAP", "1", 0);
++            vkr_log("vulkan driver: %s", json);
++            break;
++         }
++      }
++   }
++
++   snprintf(path, sizeof(path), "%s/%s", dir, LIBVULKAN1);
++   return dlopen(path, RTLD_NOW | RTLD_LOCAL);
++}
++#endif
++
+ bool
+ vkr_library_load(struct vulkan_library *lib)
+ {
+    if (lib->handle)
+       return true;
+ 
++#ifdef __APPLE__
++   lib->handle = vkr_library_open_beside();
++   if (lib->handle == NULL)
++#endif
+    lib->handle = dlopen(LIBVULKAN1, RTLD_NOW | RTLD_LOCAL);
+    if (lib->handle == NULL)
+       lib->handle = dlopen(LIBVULKAN, RTLD_NOW | RTLD_LOCAL);

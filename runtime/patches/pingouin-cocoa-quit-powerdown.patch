@@ -1,0 +1,51 @@
+From: OmacVM
+Subject: [PATCH] cocoa: Quit shuts the guest down
+
+Quit, the close button, a logout or a restart press the guest's power
+button and wait for it (NSTerminateLater); QEMU exits when the guest is off.
+A paused VM is resumed first; a guest that hangs is stopped after a minute.
+Applies after pingouin-cocoa-identity.patch.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -1787,12 +1787,39 @@
+ {
+     return YES;
+ }
++
++/*
++ * Pingouin: Quit, the close button, a logout or a restart press the guest's
++ * power button, and the quit waits (NSTerminateLater): QEMU exits by itself
++ * once the guest is off (-action shutdown=poweroff). A guest that does not
++ * shut down within a minute is stopped. A VM paused (by the Mac's sleep) is
++ * resumed first, so it can shut down.
++ */
++static bool powerdownPending;
+ 
+ - (NSApplicationTerminateReply)applicationShouldTerminate:
+                                                          (NSApplication *)sender
+ {
+     COCOA_DEBUG("QemuCocoaAppController: applicationShouldTerminate\n");
+-    return [self verifyQuit];
++    if (runstate_check(RUN_STATE_PAUSED)) {
++        with_bql(^{
++            qmp_cont(NULL);
++        });
++    }
++    if (!runstate_is_running()) {
++        return NSTerminateNow;
++    }
++    if (!powerdownPending) {
++        powerdownPending = true;
++        with_bql(^{
++            qemu_system_powerdown_request();
++        });
++        [[cocoaView window] setTitle:[NSString stringWithFormat:@"%@ (shutting down)", pingouin_product_name()]];
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++            [NSApp replyToApplicationShouldTerminate:YES];
++        });
++    }
++    return NSTerminateLater;
+ }
+ 
+ - (void)windowDidChangeScreen:(NSNotification *)notification

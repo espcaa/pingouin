@@ -1,0 +1,350 @@
+From: OmacVM
+Subject: [PATCH] ui: the rules for the Mac's input methods in the VM (mac-ime)
+
+What: a header with no AppKit in it, for pingouin-cocoa-ime.patch: lines from
+the guest's port (complete lines only, at most 4 KiB, a longer one dropped
+whole), the guest's numbers checked (finite, below 1e7, no negative sizes),
+when keys go to the Mac's input method (a text field in the VM has the
+focus, not a password field, the VM has the keyboard, the Mac's input
+source is an input method), where each key goes (Cmd and Control chords and
+every modifier change stay the VM's; the release of a key the input method
+used is dropped; macOS's input source shortcuts switch the Mac's source
+only while macOS's own shortcuts are off), which guest output a caret is on
+and where on it, and UTF-16 positions as code points.
+
+Why its own file: so the rules are tested without QEMU, a display or an
+input method (app/runtime/Tests/keys/test-ime.sh applies this patch to an
+empty folder; at build time and in CI).
+
+Upstream: not applicable (OmacVM's Fcitx5 module in the guest, ADR 0043).
+Test: app/runtime/Tests/keys/test-ime.c.
+
+diff --git a/ui/pingouin-ime.h b/ui/pingouin-ime.h
+new file mode 100644
+--- /dev/null
++++ b/ui/pingouin-ime.h
+@@ -0,0 +1,324 @@
++/*
++ * Pingouin mac-ime: the Mac's input methods type into the VM
++ * (docs/adr/0043-mac-ime.md). The rules ui/cocoa.m follows, with no AppKit
++ * in here, so they are tested on their own
++ * (app/runtime/Tests/keys/test-ime.c): the guest's lines (framing, numbers),
++ * when the Mac's input method gets keys, which key goes where, the caret's
++ * place on the Mac's screens, and code point positions.
++ *
++ * Off (no PINGOUIN_IME_SOCKET: the feature is off for the VM) none of this
++ * runs: ui/cocoa.m checks pingouin_ime_on before anything else, and every key
++ * takes QEMU's path as before.
++ */
++#ifndef PINGOUIN_IME_H
++#define PINGOUIN_IME_H
++
++#include <math.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#define PINGOUIN_IME_MAX_LINE 4096     /* a longer line from the guest is dropped */
++#define PINGOUIN_IME_MAX_TEXT 1024     /* bytes of UTF-8 per commit or preedit line */
++
++/* Lines from the guest's port: complete lines only, at most MAX_LINE bytes. */
++typedef struct PingouinImeLines {
++    char buf[PINGOUIN_IME_MAX_LINE];
++    size_t len;
++    bool skipping;                 /* in a line that was too long */
++} PingouinImeLines;
++
++typedef void (*PingouinImeLineFn)(const char *line, size_t len, void *opaque);
++
++static inline void pingouin_ime_lines_reset(PingouinImeLines *l)
++{
++    l->len = 0;
++    l->skipping = false;
++}
++
++static inline void pingouin_ime_lines_feed(PingouinImeLines *l, const char *p, size_t n,
++                                         PingouinImeLineFn fn, void *opaque)
++{
++    for (size_t i = 0; i < n; i++) {
++        if (p[i] == '\n') {
++            if (!l->skipping && l->len) {
++                fn(l->buf, l->len, opaque);
++            }
++            pingouin_ime_lines_reset(l);
++        } else if (l->skipping) {
++            continue;
++        } else if (l->len >= PINGOUIN_IME_MAX_LINE) {
++            l->len = 0;
++            l->skipping = true;
++        } else {
++            l->buf[l->len++] = p[i];
++        }
++    }
++}
++
++/* A number the guest sent: finite and below 1e7 (as the display port). */
++static inline bool pingouin_ime_number_ok(double v)
++{
++    return isfinite(v) && fabs(v) < 1e7;
++}
++
++/* A caret box in Hyprland's logical pixels: sane numbers, not negative in size. */
++static inline bool pingouin_ime_rect_ok(double x, double y, double w, double h)
++{
++    return pingouin_ime_number_ok(x) && pingouin_ime_number_ok(y) &&
++           pingouin_ime_number_ok(w) && pingouin_ime_number_ok(h) && w >= 0 && h >= 0;
++}
++
++/* What the Mac knows (main thread). */
++typedef struct PingouinImeState {
++    bool hello;            /* the guest's Fcitx5 module said hello */
++    bool focus;            /* a text field in the VM has the focus */
++    bool password;         /* ... and it is a password field */
++    bool has_rect;
++    double x, y, w, h;     /* the caret (or the window's box), guest logical pixels */
++    bool exact;            /* the caret itself, not the window's box */
++    bool source_im;        /* the Mac's input source is an input method */
++    bool window_key;       /* a window of the VM has the keyboard */
++} PingouinImeState;
++
++/* A text field in the VM has the focus and the VM the keyboard. */
++static inline bool pingouin_ime_text_focus(const PingouinImeState *s)
++{
++    return s->hello && s->focus && !s->password && s->window_key;
++}
++
++/* ... and the Mac's input source is an input method: keys go to it. */
++static inline bool pingouin_ime_active(const PingouinImeState *s)
++{
++    return pingouin_ime_text_focus(s) && s->source_im;
++}
++
++/*
++ * Keys no longer go to the input method: its context goes off at once, or
++ * PINGOUIN_IME_OFF_DELAY seconds later when only the guest's field went (it
++ * would be active with the field: the VM still has the keyboard, the source
++ * is still an input method, the module is there). A field that comes back
++ * meanwhile (a terminal takes its focus again after Enter) keeps it on:
++ * some input methods (WeChat Input) go back to their first mode when their
++ * context goes off and on (#357). Anything else while it waits (a password
++ * field, another window, a plain layout, the module gone): off at once.
++ */
++#define PINGOUIN_IME_OFF_DELAY 0.2
++static inline bool pingouin_ime_off_later(const PingouinImeState *s)
++{
++    PingouinImeState with = *s;
++    with.focus = true;
++    with.password = false;
++    return !s->password && pingouin_ime_active(&with);
++}
++
++typedef enum PingouinImeOff {
++    PINGOUIN_IME_OFF_NONE,    /* nothing to do */
++    PINGOUIN_IME_OFF_NOW,     /* deactivate the context now */
++    PINGOUIN_IME_OFF_LATER,   /* deactivate it after PINGOUIN_IME_OFF_DELAY (pingouin_ime_off_due) */
++    PINGOUIN_IME_OFF_KEPT,    /* active again while an off waited: it stays on */
++} PingouinImeOff;
++
++typedef struct PingouinImeOffState {
++    bool was_active;
++    bool waiting;           /* a later off is due (the context is still on) */
++    unsigned gen;           /* which later off counts */
++} PingouinImeOffState;
++
++/* After any change of the state: what happens to the input method's context. */
++static inline PingouinImeOff pingouin_ime_off_step(PingouinImeOffState *o, const PingouinImeState *s)
++{
++    bool active = pingouin_ime_active(s);
++    if (active != o->was_active) {
++        bool waited = o->waiting;
++        o->was_active = active;
++        o->waiting = false;
++        o->gen++;
++        if (active) {
++            return waited ? PINGOUIN_IME_OFF_KEPT : PINGOUIN_IME_OFF_NONE;
++        }
++        if (pingouin_ime_off_later(s)) {
++            o->waiting = true;
++            return PINGOUIN_IME_OFF_LATER;
++        }
++        return PINGOUIN_IME_OFF_NOW;
++    }
++    if (!active && o->waiting && !pingouin_ime_off_later(s)) {
++        o->waiting = false;
++        o->gen++;
++        return PINGOUIN_IME_OFF_NOW;
++    }
++    return PINGOUIN_IME_OFF_NONE;
++}
++
++/* The later off of generation `gen` is due: true when the context goes off now. */
++static inline bool pingouin_ime_off_due(PingouinImeOffState *o, unsigned gen)
++{
++    if (!o->waiting || gen != o->gen) {
++        return false;
++    }
++    o->waiting = false;
++    return true;
++}
++
++/* NSEvent's modifier flags (the same bits macOS's shortcut list uses). */
++#define PINGOUIN_IME_SHIFT   (1u << 17)
++#define PINGOUIN_IME_CONTROL (1u << 18)
++#define PINGOUIN_IME_OPTION  (1u << 19)
++#define PINGOUIN_IME_COMMAND (1u << 20)
++#define PINGOUIN_IME_MODS    (PINGOUIN_IME_SHIFT | PINGOUIN_IME_CONTROL | PINGOUIN_IME_OPTION | PINGOUIN_IME_COMMAND)
++
++/* macOS's "Select the previous/next input source" shortcut (hot keys 60, 61). */
++typedef struct PingouinImeHotKey {
++    bool enabled;
++    int keycode;
++    uint32_t mods;
++} PingouinImeHotKey;
++
++static inline bool pingouin_ime_hotkey_is(const PingouinImeHotKey *h, int keycode, uint32_t mods)
++{
++    return h->enabled && h->keycode == keycode &&
++           (mods & PINGOUIN_IME_MODS) == (h->mods & PINGOUIN_IME_MODS);
++}
++
++typedef enum PingouinImeKeyType {
++    PINGOUIN_IME_DOWN,
++    PINGOUIN_IME_UP,
++    PINGOUIN_IME_FLAGS,
++} PingouinImeKeyType;
++
++typedef enum PingouinImeRoute {
++    PINGOUIN_IME_PASS,           /* QEMU's path: a key to the VM, as without mac-ime */
++    PINGOUIN_IME_TO_IM,          /* to the Mac's input method */
++    PINGOUIN_IME_DROP,           /* the release of a key the Mac used */
++    PINGOUIN_IME_SWITCH_PREV,    /* the Mac's previous input source */
++    PINGOUIN_IME_SWITCH_NEXT,    /* the Mac's next input source */
++} PingouinImeRoute;
++
++typedef struct PingouinImeKeys {
++    bool taken[128];           /* key down went to the Mac: its key up does too */
++    PingouinImeHotKey prev, next;
++} PingouinImeKeys;
++
++/*
++ * Where a key goes. With Cmd or Control held, and every modifier change, it
++ * is the VM's (its shortcuts and Hyprland's binds as before). macOS's input
++ * source shortcuts switch the Mac's input source in a text field: a key that
++ * reaches QEMU was not taken by macOS (its full-grab tap comes first). The caller
++ * marks a key down the input method used up (pingouin_ime_take), so its key up
++ * is dropped too; the switch shortcuts mark themselves.
++ */
++static inline PingouinImeRoute pingouin_ime_route(PingouinImeKeys *k, const PingouinImeState *s,
++                                              PingouinImeKeyType type, int keycode, uint32_t mods)
++{
++    if (keycode < 0 || keycode >= 128 || type == PINGOUIN_IME_FLAGS) {
++        return PINGOUIN_IME_PASS;
++    }
++    if (type == PINGOUIN_IME_UP) {
++        if (k->taken[keycode]) {
++            k->taken[keycode] = false;
++            return PINGOUIN_IME_DROP;
++        }
++        return PINGOUIN_IME_PASS;
++    }
++    if (pingouin_ime_text_focus(s)) {
++        if (pingouin_ime_hotkey_is(&k->prev, keycode, mods)) {
++            k->taken[keycode] = true;
++            return PINGOUIN_IME_SWITCH_PREV;
++        }
++        if (pingouin_ime_hotkey_is(&k->next, keycode, mods)) {
++            k->taken[keycode] = true;
++            return PINGOUIN_IME_SWITCH_NEXT;
++        }
++    }
++    if (!pingouin_ime_active(s) || (mods & (PINGOUIN_IME_COMMAND | PINGOUIN_IME_CONTROL))) {
++        return PINGOUIN_IME_PASS;
++    }
++    return PINGOUIN_IME_TO_IM;
++}
++
++static inline void pingouin_ime_take(PingouinImeKeys *k, int keycode)
++{
++    if (keycode >= 0 && keycode < 128) {
++        k->taken[keycode] = true;
++    }
++}
++
++/* The focus moved or the window lost the keyboard: no key is held for the Mac. */
++static inline void pingouin_ime_release_all(PingouinImeKeys *k)
++{
++    memset(k->taken, 0, sizeof(k->taken));
++}
++
++/* A box in guest logical pixels (y down), as the display port's outputs. */
++typedef struct PingouinImeBox {
++    double x, y, w, h;
++} PingouinImeBox;
++
++/*
++ * The guest output a caret is on: the one that has its top-left corner, else
++ * the nearest (a caret just off an edge). -1: no output known.
++ */
++static inline int pingouin_ime_output_for(const PingouinImeBox *outs, int n, double x, double y)
++{
++    int best = -1;
++    double best_d = 0;
++
++    for (int i = 0; i < n; i++) {
++        const PingouinImeBox *b = &outs[i];
++        if (b->w > 0 && b->h > 0 && x >= b->x && x < b->x + b->w && y >= b->y && y < b->y + b->h) {
++            return i;
++        }
++    }
++    for (int i = 0; i < n; i++) {
++        const PingouinImeBox *b = &outs[i];
++        if (b->w <= 0 || b->h <= 0) {
++            continue;
++        }
++        double dx = x < b->x ? b->x - x : x >= b->x + b->w ? x - (b->x + b->w) : 0;
++        double dy = y < b->y ? b->y - y : y >= b->y + b->h ? y - (b->y + b->h) : 0;
++        double d = dx * dx + dy * dy;
++        if (best < 0 || d < best_d) {
++            best = i;
++            best_d = d;
++        }
++    }
++    return best;
++}
++
++/* The caret box as fractions of output `b` (0..1, top-left origin), clamped. */
++static inline void pingouin_ime_fractions(PingouinImeBox b, double x, double y, double w, double h,
++                                        double *u0, double *v0, double *u1, double *v1)
++{
++#define PINGOUIN_IME_CLAMP(v) ((v) < 0 ? 0 : (v) > 1 ? 1 : (v))
++    *u0 = PINGOUIN_IME_CLAMP((x - b.x) / b.w);
++    *v0 = PINGOUIN_IME_CLAMP((y - b.y) / b.h);
++    *u1 = PINGOUIN_IME_CLAMP((x + w - b.x) / b.w);
++    *v1 = PINGOUIN_IME_CLAMP((y + h - b.y) / b.h);
++#undef PINGOUIN_IME_CLAMP
++}
++
++/*
++ * Code points before UTF-16 index `u16` in `s` (the guest counts code
++ * points; AppKit counts UTF-16 units). An index inside a surrogate pair
++ * counts the pair.
++ */
++static inline size_t pingouin_ime_code_points(const uint16_t *s, size_t len, size_t u16)
++{
++    size_t n = 0;
++
++    if (u16 > len) {
++        u16 = len;
++    }
++    for (size_t i = 0; i < u16; i++) {
++        if (s[i] >= 0xD800 && s[i] <= 0xDBFF && i + 1 < len &&
++            s[i + 1] >= 0xDC00 && s[i + 1] <= 0xDFFF) {
++            i++;
++        }
++        n++;
++    }
++    return n;
++}
++
++#endif

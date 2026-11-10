@@ -1,0 +1,168 @@
+From: OmacVM
+Subject: [PATCH] cocoa: the full-grab tap goes when its permission is taken away
+
+What: the full-grab event tap remembers whether it was made with
+Accessibility (AXIsProcessTrusted) and with "control the computer"
+(CGPreflightPostEventAccess, also listed under Accessibility; macOS makes an
+active tap only with it). When one it was made with is gone, the tap is
+removed (disabled, its Mach port and run-loop source invalidated) and never
+enabled again; system shortcuts go to macOS until the VM is started again.
+AXIsProcessTrusted is answered in the process and looked at every second;
+CGPreflightPostEventAccess asks tccd (about 5 ms each), so it is asked off the
+main thread every 2 s. Both also when macOS posts that its Accessibility list
+changed (com.apple.accessibility.api) and when macOS disables the tap
+(reenableEventTap, qemu-cocoa-full-grab-reenable.patch). An app allowed only
+through "control the computer" (OmacVM.app asks with CGRequestPostEventAccess)
+keeps its tap: Accessibility alone does not decide.
+
+Why: issue #192. The tap is an active filter at the head of the HID chain.
+When the user takes the permission away while it exists, macOS keeps it in
+the chain but no longer takes the events it hands back ("Sender is prohibited
+from synthesizing events") and disables it on timeout; reenableEventTap
+enabled it again at once, so the Mac's keys stayed held until the process
+ended. OmacVM Gestures and the Bridge had the same loop and follow the same
+rule.
+
+Upstream: not sent (it builds on the Try Omarchy full-grab patches).
+
+Test: app/runtime/Tests/keys/test-tap-permission.sh (CI: the methods from this
+patch with a made-up tap and permissions; the runtime build: the same against
+the patched ui/cocoa.m). Applies last of the cocoa patches.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -467,6 +467,8 @@
+     BOOL isMouseGrabbed;
+     BOOL isAbsoluteEnabled;
+     CFMachPortRef eventsTap;
++    /* Pingouin: what the tap was made with, the last answer (pingouinKeepTap) */
++    BOOL pingouinTapMadeWithAX, pingouinTapMadeWithPost, pingouinTapPost, pingouinAskingPost;
+     CGColorSpaceRef colorspace;
+     CALayer *cursorLayer;
+     QEMUCursor *cursor;
+@@ -489,6 +491,9 @@
+ - (BOOL) isMouseGrabbed;
+ - (BOOL) isKeyboardCaptured;
+ - (void) reenableEventTap;
++- (BOOL) pingouinTapAllowed;
++- (BOOL) pingouinKeepTap;
++- (void) pingouinAskPostEvent;
+ - (void) raiseAllKeys;
+ #ifdef CONFIG_OPENGL
+ - (void)useCGLLayer;
+@@ -1878,6 +1883,33 @@
+ 
+     CFRunLoopAddSource(runLoop, tapEventsSrc, kCFRunLoopDefaultMode);
+     CFRelease(tapEventsSrc);
++
++    /* Pingouin: the tap goes when a permission it was made with does (pingouinKeepTap). */
++    pingouinTapPost = CGPreflightPostEventAccess();
++    pingouinTapMadeWithPost = pingouinTapPost;
++    pingouinTapMadeWithAX = AXIsProcessTrusted();
++    __block unsigned ticks = 0;
++    NSTimer *permission = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
++        if (![self pingouinKeepTap]) {
++            [t invalidate];
++        } else if (++ticks % 2 == 0) {
++            [self pingouinAskPostEvent];
++        }
++    }];
++    [permission setTolerance:0.1];
++    [[NSRunLoop mainRunLoop] addTimer:permission forMode:NSRunLoopCommonModes];
++    [[NSDistributedNotificationCenter defaultCenter]
++        addObserverForName:@"com.apple.accessibility.api" object:nil
++                     queue:[NSOperationQueue mainQueue]
++                usingBlock:^(NSNotification *note) {
++        [self pingouinKeepTap];
++        [self pingouinAskPostEvent];
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
++                       dispatch_get_main_queue(), ^{
++            [self pingouinKeepTap];
++            [self pingouinAskPostEvent];
++        });
++    }];
+ }
+ 
+ - (void) toggleKey: (unsigned int)keycode {
+@@ -2651,12 +2683,79 @@
+  */
+ - (void) reenableEventTap
+ {
+-    if (eventsTap) {
+-        CGEventTapEnable(eventsTap, true);
++    if (!eventsTap) {
++        return;
++    }
++    /*
++     * Pingouin: never again without the permissions it was made with; the tap
++     * goes once this callback has returned (pingouinKeepTap).
++     */
++    if (![self pingouinTapAllowed]) {
++        dispatch_async(dispatch_get_main_queue(), ^{ [self pingouinKeepTap]; });
++        return;
+     }
++    CGEventTapEnable(eventsTap, true);
++    [self pingouinAskPostEvent];
+ }
+ 
+ /*
++ * Pingouin (issue #192): the full-grab tap is an active filter at the head of
++ * the HID chain. macOS makes it only for an app allowed to control the
++ * computer (CGPreflightPostEventAccess, listed under Accessibility; a "post
++ * event" grant of its own or Accessibility's). When the user takes that away
++ * while the VM runs, macOS keeps the tap in the chain but no longer takes the
++ * events it hands back ("Sender is prohibited from synthesizing events") and
++ * disables it on timeout; enabling it again (reenableEventTap) held the Mac's
++ * keys until the process ended. So the tap goes at once, and for good, when
++ * Accessibility or "control the computer" is gone after it was made with it:
++ * system shortcuts stay with macOS until the VM is started again.
++ * AXIsProcessTrusted is answered in the process (about 5 us) and looked at
++ * every second; CGPreflightPostEventAccess asks tccd (about 5 ms), off the
++ * main thread every 2 s (pingouinAskPostEvent). Both also when macOS's
++ * Accessibility list changes and when macOS disables the tap. Main thread.
++ */
++- (BOOL) pingouinTapAllowed
++{
++    return (!pingouinTapMadeWithAX || AXIsProcessTrusted()) &&
++           (!pingouinTapMadeWithPost || pingouinTapPost);
++}
++
++/* NO: there is no tap (any more). */
++- (BOOL) pingouinKeepTap
++{
++    if (!eventsTap) {
++        return NO;
++    }
++    if ([self pingouinTapAllowed]) {
++        return YES;
++    }
++    CGEventTapEnable(eventsTap, false);
++    CFMachPortInvalidate(eventsTap);   /* its run-loop source goes with it */
++    CFRelease(eventsTap);
++    eventsTap = NULL;
++    warn_report("Accessibility was taken away: the full-grab event tap is removed "
++                "(system shortcuts go to macOS until the VM is started again)");
++    return NO;
++}
++
++/* CGPreflightPostEventAccess off the main thread, then pingouinKeepTap on it. */
++- (void) pingouinAskPostEvent
++{
++    if (!eventsTap || !pingouinTapMadeWithPost || pingouinAskingPost) {
++        return;
++    }
++    pingouinAskingPost = YES;
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++        BOOL post = CGPreflightPostEventAccess();
++        dispatch_async(dispatch_get_main_queue(), ^{
++            pingouinAskingPost = NO;
++            pingouinTapPost = post;
++            [self pingouinKeepTap];
++        });
++    });
++}
++
++/*
+  * Makes the target think all down keys are being released.
+  * This prevents a stuck key problem, since we will not see
+  * key up events for those keys after we have lost focus.

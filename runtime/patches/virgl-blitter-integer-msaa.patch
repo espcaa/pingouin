@@ -1,0 +1,24 @@
+virglrenderer: blits from integer multisample textures fetch sample 0
+
+What: an integer multisample source is passed to blit_build_frag_tex_col() with
+nr_samples 1 (integers are not averaged), but "msaa" was nr_samples > 1, so the
+shader used texture() on an isampler2DMS, which no GLSL compiler accepts. Now
+any nr_samples > 0 takes the texelFetch() path, which reads sample 0.
+Why: found by Tests/virgl/test-blitter-shaders.c; the blit drew nothing.
+Upstream bug (same code upstream); upstreamable; not sent.
+Applies after virgl-blitter-core-glsl-version.patch.
+Tests: Tests/virgl/test-blitter-shaders.c "color 2D_MSAA uint/int",
+"color 2D_ARRAY_MSAA uint/int".
+--- a/src/vrend/vrend_blitter.c
++++ b/src/vrend/vrend_blitter.c
+@@ -289,7 +289,9 @@
+    unsigned swizzle_flags = 0;
+    char dest_swizzle_snippet[DEST_SWIZZLE_SNIPPET_SIZE] = "texel";
+    const char *ext_str = "";
+-   bool msaa = nr_samples > 1;
++   /* Integer multisample sources come with nr_samples 1: they are not averaged,
++    * sample 0 is fetched. texture() does not take multisample samplers. */
++   bool msaa = nr_samples > 0;
+ 
+    if (msaa && !blit_ctx->use_gles) {
+       if (blit_ctx->glsl_ver < 150)

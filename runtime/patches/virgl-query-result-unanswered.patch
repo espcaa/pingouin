@@ -1,0 +1,146 @@
+virglrenderer: a query result the GL does not answer reaches the guest as 0, not stack bytes
+
+What: vrend_get_one_query_result() starts its variables set: the result at 0, the
+"available" answer at ~0 (the GL writes only 0 or 1 there). When the GL writes nothing,
+the query counts as done with result 0, logged once. The four result variables of the
+GL_ANY_SAMPLES_PASSED stand-in for query buffer objects start at 0 too (that path needs
+GL 4.4 query buffers, so it does not run on the Mac today). A query still waiting when
+its context is lost (in_error) is done with 0 too: vrend_renderer_check_queries took it
+off the waiting list without writing anything.
+Why: the GL writes these only when it answers. GET_QUERY_RESULT for a query that was
+never begun or is still running (any guest can send that), or a GL that refuses calls of a
+context (#547), leaves them as they were, and vrend copied them into the guest's query
+buffer: host stack bytes for the guest (#573). Starting `ready` at 0 would leave such a
+query "not ready" for ever, and the guest's Mesa waits until a query is done. The same
+wait for ever came from a query dropped with its lost context.
+Trade-off: for an occlusion query 0 means "nothing drawn", so an app may skip an object
+for one frame. Only a guest that breaks the protocol, a GL that refuses calls, or a lost
+context gets here.
+Upstream: the same uninitialised reads and the dropped query are in upstream
+virglrenderer; not sent.
+Test: Tests/virgl/test-query-result.c with query-result-gl.c (a query never begun, 4 and
+8 bytes, one still running, and the result refused while it is available: done with 0,
+one log line; answered queries still get the GL's sample count; a query the GL has not
+finished still waits; a query waiting when its context is lost: done with 0).
+
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -15375,14 +15375,28 @@
+    }
+ }
+ 
++/* Pingouin: the GL writes these only when it answers. A query never begun or still running,
++ * or a GL that refuses calls (#547), leaves them as they were: host stack bytes went into
++ * the guest's result. Unanswered reads as done with 0, not as "not ready": the guest's Mesa
++ * waits until a query is done, so that would be a wait for ever. */
+ static bool vrend_get_one_query_result(GLuint query_id, bool use_64, uint64_t *result)
+ {
+-   GLuint ready;
+-   GLuint passed;
+-   GLuint64 pass64;
++   GLuint ready = ~0u;
++   GLuint passed = 0;
++   GLuint64 pass64 = 0;
+ 
+    glGetQueryObjectuiv(query_id, GL_QUERY_RESULT_AVAILABLE_ARB, &ready);
+ 
++   if (ready == ~0u) {
++      static bool logged;
++      if (!logged) {
++         logged = true;
++         virgl_warn("query result: the GL did not answer (GL query %u); the guest reads it "
++                    "as done with 0 (logged once)\n", query_id);
++      }
++      *result = 0;
++      return true;
++   }
+    if (!ready)
+       return false;
+ 
+@@ -15408,6 +15422,22 @@
+    }
+ }
+ 
++
++/* Pingouin: the query's state into the guest's query buffer (no GL call) */
++static void vrend_write_query_state(struct vrend_query *query,
++                                    const struct virgl_host_query_state *state)
++{
++   if (query->res->iov) {
++      if (vrend_write_to_iovec(query->res->iov, query->res->num_iovs, 0,
++                               (const void *) state, sizeof(*state)) != sizeof(*state))
++         virgl_error("Query state does not fit IOV size\n");
++   } else {
++      if (query->res->base.width0 >= sizeof(*state) )
++         *((struct virgl_host_query_state *) query->res->ptr) = *state;
++      else
++         virgl_error("Query state does not fit buffer size\n");
++   }
++}
+ 
+ static bool vrend_check_query(struct vrend_query *query)
+ {
+@@ -15429,18 +15459,7 @@
+    }
+ 
+    state.query_state = VIRGL_QUERY_STATE_DONE;
+-
+-   if (query->res->iov) {
+-      if (vrend_write_to_iovec(query->res->iov, query->res->num_iovs, 0,
+-                               (const void *) &state, sizeof(state)) != sizeof(state))
+-         virgl_error("Query state does not fit IOV size\n");
+-   } else {
+-      if (query->res->base.width0 >= sizeof(state) )
+-         *((struct virgl_host_query_state *) query->res->ptr) = state;
+-      else
+-         virgl_error("Query state does not fit buffer size\n");
+-   }
+-
++   vrend_write_query_state(query, &state);
+    return true;
+ }
+ 
+@@ -15494,6 +15513,13 @@
+       if (!vrend_hw_switch_context_with_sub(query->ctx, query->sub_ctx_id)) {
+          virgl_warn("Failed to switch to context (%d) with sub (%d) for query %u\n",
+                       query->ctx->ctx_id, query->sub_ctx_id, query->id);
++         /* Pingouin: the context is lost (in_error): no answer will come, and the guest's
++          * Mesa waits until the query is done. Done with 0, as an unanswered query. */
++         struct virgl_host_query_state state = {
++            .query_state = VIRGL_QUERY_STATE_DONE,
++            .result_size = vrend_is_timer_query(query->gltype) ? 8 : 4,
++         };
++         vrend_write_query_state(query, &state);
+       }
+       else if (!vrend_check_query(query)) {
+          continue;
+@@ -15845,25 +15871,25 @@
+      vrend_update_oq_samples_multiplier(ctx);
+      switch ((enum pipe_query_value_type)result_type) {
+      case PIPE_QUERY_TYPE_I32: {
+-        GLint value;
++        GLint value = 0;
+         glGetQueryObjectiv(q->id, qtype, &value);
+         COPY_QUERY_RESULT_TO_BUFFER(res->gl_id, offset, value, 4, ctx->sub->fake_occlusion_query_samples_passed_multiplier);
+         break;
+      }
+      case PIPE_QUERY_TYPE_U32: {
+-        GLuint value;
++        GLuint value = 0;
+         glGetQueryObjectuiv(q->id, qtype, &value);
+         COPY_QUERY_RESULT_TO_BUFFER(res->gl_id, offset, value, 4, ctx->sub->fake_occlusion_query_samples_passed_multiplier);
+         break;
+      }
+      case PIPE_QUERY_TYPE_I64: {
+-        GLint64 value;
++        GLint64 value = 0;
+         glGetQueryObjecti64v(q->id, qtype, &value);
+         COPY_QUERY_RESULT_TO_BUFFER(res->gl_id, offset, value, 8, ctx->sub->fake_occlusion_query_samples_passed_multiplier);
+         break;
+      }
+      case PIPE_QUERY_TYPE_U64: {
+-        GLuint64 value;
++        GLuint64 value = 0;
+         glGetQueryObjectui64v(q->id, qtype, &value);
+         COPY_QUERY_RESULT_TO_BUFFER(res->gl_id, offset, value, 8, ctx->sub->fake_occlusion_query_samples_passed_multiplier);
+         break;

@@ -1,0 +1,513 @@
+From: OmacVM
+Subject: [PATCH] ui: FullPanel's decisions, tested without a notched Mac
+
+What: a header with no AppKit in it: whether a start asked for FullPanel
+(PINGOUIN_FULLPANEL=1); why a full screen gets normal full screen, first
+reason first (no camera housing, macOS's "Always show the menu bar in full
+screen" in the way, AppKit's menu bar reservation not there or not
+AppKit's own, no SkyLight), and whether that is the line omacvm check
+reads (not for an external display beside the open MacBook); whether that reservation may be answered
+(AppKit's own method, nobody else's change before or after ours); whether
+AppKit gave a full screen the whole display (counted once the window
+covers it, final at didEnterFullScreen: Split View keeps AppKit's layout);
+when the strip is lost for the rest of a full screen; when a Space on a
+display without a housing is normal full screen there and when it gets
+the strip back; whether the guest may be a few rows shorter (never over
+the whole panel); where the pointer is (the top row, the strip, the
+picture) and whether the menu bar is asked for; what the backdrop, the
+app's presentation options and AppKit's titlebar window should be for a
+set of facts (one rule, applied in one place); where the options go when
+FullPanel relaxes or lets go of them (never with "Keep the Dock away",
+QEMU's immersive=on, the menu bar held back all the time); and the
+Mission Control and Space return checks (WindowServer has the window in
+place, at most 2 s). Used by pingouin-cocoa-fullpanel.patch (which explains
+the why).
+
+Why its own file: so the rules are tested on the sizes of every notched
+MacBook, external displays and a window moving between them, without QEMU,
+a display or a notch (app/runtime/Tests/display/test-fullpanel.sh applies
+this patch to an empty folder; at build time and in CI).
+
+Where it comes from: the reservation, verdict, release, pointer, intent,
+restore and return rules are new in this version; the requested, menu bar,
+cut-rows, reveal-shown and relaxed rules are kept from the earlier version
+of this patch. It replaces that earlier header's frame, keep, strip-lost,
+reveal-allowed and presentation rules (docs/adr/0044-fullpanel.md,
+"Replacement").
+
+Upstream: not applicable (OmacVM's notch strip).
+Test: app/runtime/Tests/display/test-fullpanel.c.
+
+diff --git a/ui/pingouin-fullpanel.h b/ui/pingouin-fullpanel.h
+new file mode 100644
+--- /dev/null
++++ b/ui/pingouin-fullpanel.h
+@@ -0,0 +1,468 @@
++/*
++ * Pingouin: FullPanel, the VM's full-screen window over the whole notched
++ * display, the strip beside the camera housing included (experimental,
++ * PINGOUIN_FULLPANEL=1 from Pingouin.app for one start).
++ *
++ * The decisions only, no AppKit in here, so they are tested on their own
++ * (app/runtime/Tests/display/test-fullpanel.c); ui/cocoa.m feeds them
++ * (pingouin-cocoa-fullpanel.patch).
++ *
++ * Rects are in points, AppKit's bottom-left origin, as NSRect.
++ *
++ * pingouin_fp_fallback, _hook, _verdict, _screen_releases/_resumes, _zone,
++ * _asked_after_move, _own_options, _intent, _restore, _compositor_matches
++ * and the _return_ rules are new in this version; the requested, menu
++ * bar, cut-rows, reveal-shown and relaxed rules are kept from the earlier
++ * one. Where each part comes from:
++ * docs/adr/0044-fullpanel.md.
++ */
++#ifndef PINGOUIN_FULLPANEL_H
++#define PINGOUIN_FULLPANEL_H
++
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++
++typedef struct {
++    double x, y, w, h;
++} PingouinFPRect;
++
++/* Asked for this start: PINGOUIN_FULLPANEL=1, nothing else. */
++static inline bool pingouin_fp_requested(const char *env)
++{
++    return env && !strcmp(env, "1");
++}
++
++static inline bool pingouin_fp_rect_equal(PingouinFPRect a, PingouinFPRect b)
++{
++    return fabs(a.x - b.x) < 0.5 && fabs(a.y - b.y) < 0.5 &&
++           fabs(a.w - b.w) < 0.5 && fabs(a.h - b.h) < 0.5;
++}
++
++/*
++ * "Always show the menu bar in full screen" (AppleMenuBarVisibleInFullscreen)
++ * is in the way only without "Keep the Dock away" (QEMU's immersive=on): its
++ * presentation options hide the menu bar in full screen whatever that
++ * setting says, so the strip stays the VM's (probed on the MacBook Air and
++ * the Mac mini, 2026-10-12, work/tracks/fullpanel-menubar.md). Without it
++ * the menu bar would sit on the VM's top rows: normal full screen.
++ */
++static inline bool pingouin_fp_menu_bar_in_the_way(bool always_shown, bool immersive)
++{
++    return always_shown && !immersive;
++}
++
++/*
++ * Why an entry into full screen gets normal full screen, first reason
++ * first; PINGOUIN_FP_OK when it may cover the strip.
++ */
++typedef enum {
++    PINGOUIN_FP_OK,
++    PINGOUIN_FP_NO_NOTCH,          /* the display has no camera housing (external displays) */
++    PINGOUIN_FP_MENU_BAR_SHOWN,    /* pingouin_fp_menu_bar_in_the_way */
++    PINGOUIN_FP_NO_RESERVATION,    /* AppKit's menu bar reservation is not there or not ours */
++    PINGOUIN_FP_NO_SKYLIGHT,       /* SkyLight lacks a function, or gave no transaction */
++} PingouinFPFallback;
++
++static inline PingouinFPFallback pingouin_fp_fallback(double notch_inset, bool menu_bar_in_the_way,
++                                                  bool reservation, bool skylight)
++{
++    if (notch_inset <= 0) {
++        return PINGOUIN_FP_NO_NOTCH;
++    }
++    if (menu_bar_in_the_way) {
++        return PINGOUIN_FP_MENU_BAR_SHOWN;
++    }
++    if (!reservation) {
++        return PINGOUIN_FP_NO_RESERVATION;
++    }
++    return skylight ? PINGOUIN_FP_OK : PINGOUIN_FP_NO_SKYLIGHT;
++}
++
++static inline const char *pingouin_fp_fallback_text(PingouinFPFallback f)
++{
++    switch (f) {
++    case PINGOUIN_FP_OK:
++        return "none";
++    case PINGOUIN_FP_NO_NOTCH:
++        return "this window's display has no camera housing";
++    case PINGOUIN_FP_MENU_BAR_SHOWN:
++        return "the menu bar is always shown in full screen and Keep the Dock away is off";
++    case PINGOUIN_FP_NO_RESERVATION:
++        return "AppKit's full-screen menu bar reservation is not there (or other code replaced it)";
++    case PINGOUIN_FP_NO_SKYLIGHT:
++        return "SkyLight's menu bar transaction is not there";
++    }
++    return "unknown";
++}
++
++/*
++ * Whether a fallback is logged as the line pingouin check reads ("...: normal
++ * full screen"). Not for a window on another display than the Mac's
++ * built-in one while that one is on (a head window with "Use external
++ * displays"): its line came after the built-in display's "strip covered",
++ * was the last one check read, and check warned. Such a window logs a line
++ * of its own.
++ */
++static inline bool pingouin_fp_fallback_checked(PingouinFPFallback f, bool beside_builtin)
++{
++    return f != PINGOUIN_FP_OK && !(f == PINGOUIN_FP_NO_NOTCH && beside_builtin);
++}
++
++/*
++ * AppKit's answer to its full-screen content controller's question
++ * "does this window leave the menu bar's band free?"
++ * (-reservesSpaceForMenuBarInFullScreen) is changed only when it is
++ * AppKit's own: the controller class implements the method itself (not
++ * inherited), with the type encodings checked; before it is changed the
++ * implementation lies in AppKit's image (no other code changed it first);
++ * after, it is still ours.
++ */
++typedef enum {
++    PINGOUIN_FP_HOOK_USABLE,
++    PINGOUIN_FP_HOOK_MISSING,      /* class, selector or encoding not as on macOS 27 */
++    PINGOUIN_FP_HOOK_INHERITED,    /* the class does not implement it itself */
++    PINGOUIN_FP_HOOK_INTERCEPTED,  /* other code replaced it before us: left alone */
++    PINGOUIN_FP_HOOK_REPLACED,     /* other code replaced ours later */
++} PingouinFPHook;
++
++static inline PingouinFPHook pingouin_fp_hook(bool methods_match, bool own_method,
++                                          bool imp_in_appkit, bool installed, bool imp_ours)
++{
++    if (!methods_match) {
++        return PINGOUIN_FP_HOOK_MISSING;
++    }
++    if (!own_method) {
++        return PINGOUIN_FP_HOOK_INHERITED;
++    }
++    if (installed) {
++        return imp_ours ? PINGOUIN_FP_HOOK_USABLE : PINGOUIN_FP_HOOK_REPLACED;
++    }
++    return imp_in_appkit ? PINGOUIN_FP_HOOK_USABLE : PINGOUIN_FP_HOOK_INTERCEPTED;
++}
++
++static inline const char *pingouin_fp_hook_text(PingouinFPHook h)
++{
++    switch (h) {
++    case PINGOUIN_FP_HOOK_USABLE:
++        return "usable";
++    case PINGOUIN_FP_HOOK_MISSING:
++        return "AppKit's full-screen menu bar reservation is not there or changed";
++    case PINGOUIN_FP_HOOK_INHERITED:
++        return "AppKit's full-screen menu bar reservation is inherited, not AppKit's own";
++    case PINGOUIN_FP_HOOK_INTERCEPTED:
++        return "other code replaced AppKit's full-screen menu bar reservation first";
++    case PINGOUIN_FP_HOOK_REPLACED:
++        return "other code replaced FullPanel's full-screen menu bar reservation";
++    }
++    return "unknown";
++}
++
++/*
++ * Whether AppKit gave the entry the whole display. There is no frame to
++ * hand out: AppKit lays the window out itself, and the entry counts once
++ * the window, in full screen, covers a display with a camera housing.
++ * At didEnterFullScreen the answer is final (definitive): a window that
++ * does not cover it then (Split View's tile, or AppKit kept it below the
++ * notch) is rejected, the band is left to AppKit for that full screen.
++ */
++typedef enum {
++    PINGOUIN_FP_PENDING,
++    PINGOUIN_FP_ACCEPTED,
++    PINGOUIN_FP_REJECTED,
++} PingouinFPVerdict;
++
++static inline PingouinFPVerdict pingouin_fp_verdict(bool claiming, bool full_screen, bool covers,
++                                                bool notch, bool definitive)
++{
++    if (!claiming || !full_screen) {
++        return PINGOUIN_FP_PENDING;
++    }
++    if (covers && notch) {
++        return PINGOUIN_FP_ACCEPTED;
++    }
++    return definitive ? PINGOUIN_FP_REJECTED : PINGOUIN_FP_PENDING;
++}
++
++/*
++ * The strip is gone for this full screen: the window was accepted, is
++ * still in full screen, no longer covers its display, and the display did
++ * not change (a new resolution moves both; the window follows). AppKit
++ * moved it (Split View joined, ...); it gets AppKit's layout until the
++ * next full screen, nothing forces it back.
++ */
++static inline bool pingouin_fp_lost(bool accepted, bool full_screen, bool covers,
++                                  bool display_unchanged)
++{
++    return accepted && full_screen && !covers && display_unchanged;
++}
++
++/*
++ * A full-screen Space on (or moved to) a display without a camera housing
++ * is normal full screen there; back beside one, the entry covers the strip
++ * again (AppKit's layout under the reservation answer).
++ */
++static inline bool pingouin_fp_screen_releases(bool armed, bool full_screen, bool notch,
++                                             bool released)
++{
++    return armed && full_screen && !notch && !released;
++}
++
++static inline bool pingouin_fp_screen_resumes(bool released, bool full_screen, bool notch)
++{
++    return released && full_screen && notch;
++}
++
++/*
++ * Whether the guest may be a few rows shorter than the full-screen area
++ * (ui/pingouin-clean-size.h: so Omarchy's scale presets fit, the rows left
++ * over black at the bottom). Only below a notch, with the IOSurface layer
++ * that draws the guest at the top. A window over the whole display has the
++ * strip at the top and the panel's bottom edge below it: the guest is the
++ * whole panel (2940x1912 on a 13-inch MacBook Air), never cut, or the
++ * left-over rows show as a black band at the bottom.
++ */
++static inline bool pingouin_fp_cut_rows(bool full_screen, bool layer,
++                                      double notch_inset, bool usable)
++{
++    return full_screen && layer && notch_inset > 0 && !usable;
++}
++
++/*
++ * Where the pointer is: the display's very top row, the strip below it,
++ * or the VM's picture. y and top in global points (bottom-left origin).
++ */
++typedef enum {
++    PINGOUIN_FP_ZONE_PICTURE,
++    PINGOUIN_FP_ZONE_STRIP,
++    PINGOUIN_FP_ZONE_TOP_ROW,
++} PingouinFPZone;
++
++static inline PingouinFPZone pingouin_fp_zone(double y, double top, double notch)
++{
++    if (y >= top - 0.5) {
++        return PINGOUIN_FP_ZONE_TOP_ROW;
++    }
++    return y >= top - notch ? PINGOUIN_FP_ZONE_STRIP : PINGOUIN_FP_ZONE_PICTURE;
++}
++
++/*
++ * The menu bar is asked for once the pointer touches the top row. The ask
++ * holds while the pointer stays in the strip, and while the menu bar is on
++ * screen (the pointer in an open menu); back in the picture with the menu
++ * bar gone, it ends.
++ */
++static inline bool pingouin_fp_asked_after_move(bool asked, PingouinFPZone zone, bool shown)
++{
++    switch (zone) {
++    case PINGOUIN_FP_ZONE_TOP_ROW:
++        return true;
++    case PINGOUIN_FP_ZONE_PICTURE:
++        return shown ? asked : false;
++    case PINGOUIN_FP_ZONE_STRIP:
++        return asked;
++    }
++    return asked;
++}
++
++/*
++ * AppKit's menu bar companion reveals the menu bar (and the full-screen
++ * toolbar) on its own at the end of the way into full screen. That reveal is
++ * shown over the strip only when it was allowed (the pointer at the top row,
++ * never with "Keep the Dock away"); else the menu bar stays transparent.
++ * Before, the entry's own reveal was shown for a moment and logged as "came
++ * down at the top edge" with the pointer elsewhere (MacBook Air, 3.0.18).
++ */
++static inline bool pingouin_fp_reveal_shown(bool appkit_reveal, bool allowed)
++{
++    return appkit_reveal && allowed;
++}
++
++/*
++ * AppKit's NSApplicationPresentationOptions bits (public values; ui/cocoa.m
++ * checks them against AppKit's at build time).
++ */
++#define PINGOUIN_FP_AUTO_HIDE_DOCK     (1ull << 0)
++#define PINGOUIN_FP_HIDE_DOCK          (1ull << 1)
++#define PINGOUIN_FP_AUTO_HIDE_MENU_BAR (1ull << 2)
++#define PINGOUIN_FP_HIDE_MENU_BAR      (1ull << 3)
++#define PINGOUIN_FP_FULL_SCREEN        (1ull << 10)
++
++/* The menu bar held back over the strip (AppKit wants the Dock hidden with it). */
++#define PINGOUIN_FP_HELD_BACK (PINGOUIN_FP_FULL_SCREEN | PINGOUIN_FP_HIDE_MENU_BAR | PINGOUIN_FP_HIDE_DOCK)
++
++/*
++ * The options that let macOS bring the menu bar down at the top edge as
++ * in other full-screen apps: the full screen's own, with the menu bar
++ * auto-hidden. The Dock stays as it was (AppKit wants it hidden or
++ * auto-hidden with an auto-hidden menu bar).
++ */
++static inline uint64_t pingouin_fp_relaxed(uint64_t own)
++{
++    uint64_t o = (own & ~(PINGOUIN_FP_HIDE_MENU_BAR | PINGOUIN_FP_AUTO_HIDE_MENU_BAR)) |
++                 PINGOUIN_FP_AUTO_HIDE_MENU_BAR | PINGOUIN_FP_FULL_SCREEN;
++
++    if (!(o & (PINGOUIN_FP_HIDE_DOCK | PINGOUIN_FP_AUTO_HIDE_DOCK))) {
++        o |= PINGOUIN_FP_AUTO_HIDE_DOCK;
++    }
++    return o;
++}
++
++/*
++ * Where relaxing goes: the full screen's own options (AppKit's, with "Keep
++ * the Dock away" QEMU's), else the ones from before the menu bar was held
++ * back; made revealable only when the menu bar may come down at all. With
++ * "Keep the Dock away" they are the held-back ones already.
++ */
++static inline uint64_t pingouin_fp_relax_target(bool own_known, uint64_t own, uint64_t before,
++                                              bool reveal)
++{
++    uint64_t base = own_known ? own : before;
++
++    return reveal ? pingouin_fp_relaxed(base) : base;
++}
++
++/*
++ * AppKit's own full-screen options are what the app has in full screen
++ * before FullPanel held the menu bar back (the windowed ones, read early,
++ * do not count).
++ */
++static inline bool pingouin_fp_own_options(bool full_screen, uint64_t current)
++{
++    return full_screen && (current & PINGOUIN_FP_FULL_SCREEN) && current != PINGOUIN_FP_HELD_BACK;
++}
++
++/* The facts the menu bar, the app's options and the titlebar follow. */
++typedef struct {
++    bool covering;     /* the window covers the strip of its own full-screen Space */
++    bool key;          /* the window is the key window */
++    bool on_space;     /* its Space is the active one (not Mission Control, another Space) */
++    bool reveal;       /* the menu bar may come down (not with "Keep the Dock away") */
++    bool asked;        /* pingouin_fp_asked_after_move */
++    bool shown;        /* AppKit shows its menu bar reveal (the titlebar window) */
++    bool releasing;    /* a return's one-turn release of the held-back options */
++    bool holding;      /* the held-back options are set */
++} PingouinFPFacts;
++
++typedef enum {
++    PINGOUIN_FP_OPTIONS_LEAVE,
++    PINGOUIN_FP_OPTIONS_HOLD,    /* PINGOUIN_FP_HELD_BACK */
++    PINGOUIN_FP_OPTIONS_RELAX,   /* back to the full screen's own (pingouin_fp_relaxed) */
++} PingouinFPOptions;
++
++typedef struct {
++    bool menu_bar_opaque;  /* SkyLight's backdrop over the strip as macOS draws it */
++    PingouinFPOptions options;
++    bool pass_through;     /* clicks in the strip go past the titlebar window to the VM */
++} PingouinFPIntent;
++
++/*
++ * What FullPanel wants from the facts, applied in one place. Covering: the
++ * menu bar's backdrop is transparent unless a reveal that was asked for is
++ * on screen; the options hold the menu bar back while the window is key
++ * and no reveal is asked for, else they are relaxed once. Away from its
++ * Space (Mission Control, another Space) the options are the system's
++ * transition: neither held nor relaxed until it is back. Not covering:
++ * options left over are relaxed, the rest is the release's.
++ */
++static inline PingouinFPIntent pingouin_fp_intent(PingouinFPFacts f)
++{
++    PingouinFPIntent i = { .menu_bar_opaque = true, .options = PINGOUIN_FP_OPTIONS_LEAVE,
++                         .pass_through = false };
++    bool wanted = f.reveal && f.asked;
++    bool shown = f.reveal && pingouin_fp_reveal_shown(f.shown, f.asked);
++
++    if (!f.covering) {
++        if (f.holding) {
++            i.options = PINGOUIN_FP_OPTIONS_RELAX;
++        }
++        return i;
++    }
++    i.menu_bar_opaque = shown;
++    i.pass_through = !shown;
++    if (!f.on_space) {
++        return i;
++    }
++    if (f.key && !wanted && !f.releasing) {
++        i.options = PINGOUIN_FP_OPTIONS_HOLD;
++    } else if (f.holding) {
++        i.options = PINGOUIN_FP_OPTIONS_RELAX;
++    }
++    return i;
++}
++
++/*
++ * Where the app's options go when FullPanel lets go: in full screen the
++ * full screen's own (when known; else they stay for AppKit), outside it
++ * the ones from before.
++ */
++static inline bool pingouin_fp_restore(bool full_screen, bool own_known, uint64_t own,
++                                     uint64_t windowed, uint64_t *out)
++{
++    if (full_screen) {
++        if (!own_known) {
++            return false;
++        }
++        *out = own;
++        return true;
++    }
++    *out = windowed;
++    return true;
++}
++
++/*
++ * Back in the Space (Mission Control, another Space, the Dock, Command-Tab):
++ * WindowServer may still be moving the window while AppKit's frame stays.
++ * WindowServer's bounds are top-left based; the primary display's top
++ * turns AppKit's frame into them.
++ */
++static inline bool pingouin_fp_compositor_matches(PingouinFPRect ws, PingouinFPRect frame,
++                                                double primary_top)
++{
++    PingouinFPRect expected = { frame.x, primary_top - (frame.y + frame.h), frame.w, frame.h };
++
++    return pingouin_fp_rect_equal(ws, expected);
++}
++
++/* Checks after a return, at 1/60 s: 2 s, then nothing is forced. */
++#define PINGOUIN_FP_RETURN_CHECKS 120
++/* WindowServer gives no bounds: a settled key window after 0.3 s will do. */
++#define PINGOUIN_FP_RETURN_UNKNOWN_AFTER 102
++
++/* compositor: 1 in place, 0 still moving, -1 not known. */
++static inline bool pingouin_fp_return_ready(bool covers, bool on_space, bool key,
++                                          int compositor, unsigned checks_left)
++{
++    bool unknown_long_enough = compositor < 0 && checks_left <= PINGOUIN_FP_RETURN_UNKNOWN_AFTER;
++
++    return covers && on_space && key && (compositor == 1 || unknown_long_enough);
++}
++
++/*
++ * A check started while Mission Control was still open must not use up its
++ * time before the real return: started again once, when the window is back.
++ */
++static inline bool pingouin_fp_return_again(bool pending, bool was_away, bool key, bool on_space,
++                                          bool visible, bool done_once)
++{
++    return pending && !done_once && was_away && key && on_space && visible;
++}
++
++/*
++ * After a return from away with the menu bar held back: let go of the
++ * options for one turn and hold them again, then the backdrop again, the
++ * order a top-edge reveal ends with (Mission Control's own options were
++ * left on the app otherwise).
++ */
++static inline bool pingouin_fp_return_reassert(bool from_away, bool reveal_tracking, bool holding,
++                                             bool shown, bool scheduled)
++{
++    return from_away && reveal_tracking && holding && !shown && !scheduled;
++}
++
++/* SkyLight's Space types and masks: 4 an app's full-screen Space; 7 any kind. */
++#define PINGOUIN_FP_SPACE_FULL_SCREEN 4
++#define PINGOUIN_FP_SPACES_ANY 7
++
++#endif

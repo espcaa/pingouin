@@ -1,0 +1,193 @@
+virglrenderer: a resource the memory budget refused loses the context that made it
+
+What: when virgl-resource-memory-budget.patch refuses a resource, its handle is
+remembered (the last 64). When a GL context then attaches that handle (the
+guest's kernel does so right after creating it, for the context that asked),
+the context is lost at once, with one log line that says why ("context N (app)
+made resource H past the guest GPU memory budget (U MB of B MB in use): the
+context is lost"). The loss goes through vrend_report_context_error, so a guest
+Mesa with src/app/guest/mesa/mesa-virgl-reset-status.patch is told: a robust
+context reads GL_GUILTY_CONTEXT_RESET, other apps end at their next flush (see
+virgl-context-loss-report.patch). Only the first context that attaches a refused
+handle is lost; a handle the guest frees first is forgotten.
+Why: the guest's kernel makes a resource without waiting for the answer, so the
+app was not told its resource was refused. Its context was lost later, on the
+first command naming the resource ("Illegal resource"), or, for a resource only
+written by transfers, not at all while the app drew garbage.
+Upstream: not sent (depends on the budget, which upstream does not have).
+Tests: Tests/virgl/test-resource-budget.c (build time: the context that attaches
+a refused handle reads GUILTY in its status buffer and its commands are refused;
+another context, a never-made handle and a freed refused handle lose nothing).
+In a VM: tests/graphics/guest/gl-alloc.c with the guest Mesa reads
+GL_GUILTY_CONTEXT_RESET (0x8253) on the refused texture.
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -80,6 +80,34 @@ struct global_state {
+ 
+ static struct global_state state;
+ 
++/*
++ * Pingouin: handles of the last resources the GPU memory budget refused. The guest
++ * learns nothing when its resource create fails; when its context then attaches the
++ * handle, that context is lost and told (vrend_renderer_context_refused_resource).
++ * Only the last REFUSED_HANDLES are kept: a guest refused in a loop costs no memory.
++ * Handle 0 is never a resource, so 0 marks a free slot.
++ */
++#define REFUSED_HANDLES 64
++static uint32_t refused_handles[REFUSED_HANDLES];
++static unsigned refused_next;
++
++static void refused_handle_add(uint32_t handle)
++{
++   refused_handles[refused_next] = handle;
++   refused_next = (refused_next + 1) % REFUSED_HANDLES;
++}
++
++static bool refused_handle_take(uint32_t handle)
++{
++   for (unsigned i = 0; handle && i < REFUSED_HANDLES; i++) {
++      if (refused_handles[i] == handle) {
++         refused_handles[i] = 0;
++         return true;
++      }
++   }
++   return false;
++}
++
+ /* new API - just wrap internal API for now */
+ 
+ static int virgl_renderer_resource_create_internal(struct virgl_renderer_resource_create_args *args,
+@@ -114,8 +142,12 @@ static int virgl_renderer_resource_create_internal(struct virgl_renderer_resourc
+ 
+    pipe_res = vrend_renderer_resource_create(&vrend_args, image);
+    vrend_renderer_flush_current();
+-   if (!pipe_res)
++   if (!pipe_res) {
++      if (vrend_renderer_resource_refused_by_budget())
++         refused_handle_add(args->handle);
+       return EINVAL;
++   }
++   refused_handle_take(args->handle);
+ 
+    map_info = vrend_renderer_resource_get_map_info(pipe_res);
+    res = virgl_resource_create_from_pipe(args->handle, pipe_res, iov, num_iovs);
+@@ -170,8 +202,11 @@ void virgl_renderer_resource_unref(uint32_t res_handle)
+    struct virgl_resource *res = virgl_resource_lookup(res_handle);
+    struct virgl_context_foreach_args args;
+ 
+-   if (!res)
++   if (!res) {
++      /* the guest frees a handle the budget refused: forget it */
++      refused_handle_take(res_handle);
+       return;
++   }
+ 
+    args.callback = detach_resource;
+    args.data = res;
+@@ -505,6 +540,11 @@ void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle)
+    TRACE_FUNC();
+    struct virgl_context *ctx = virgl_context_lookup(ctx_id);
+    struct virgl_resource *res = virgl_resource_lookup(res_handle);
++   /* Pingouin: a GL context attaching a resource the budget refused is lost (told) now */
++   if (ctx && !res && (ctx->capset_id == VIRTGPU_DRM_CAPSET_VIRGL ||
++                       ctx->capset_id == VIRTGPU_DRM_CAPSET_VIRGL2) &&
++       refused_handle_take(res_handle))
++      vrend_decode_ctx_refused_resource(ctx, res_handle);
+    if (!ctx || !res)
+       return;
+    ctx->attach_resource(ctx, res);
+@@ -1067,6 +1107,7 @@ void virgl_renderer_reset(void)
+ 
+    if (state.resource_initialized)
+       virgl_resource_table_reset();
++   memset(refused_handles, 0, sizeof(refused_handles));
+ 
+    if (state.proxy_initialized)
+       proxy_renderer_reset();
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -1689,6 +1689,13 @@ static void vrend_decode_ctx_attach_resource(struct virgl_context *ctx,
+    vrend_renderer_attach_res_ctx(dctx->grctx, res);
+ }
+ 
++/* Pingouin: ctx attached a resource the memory budget refused (virglrenderer.c) */
++void vrend_decode_ctx_refused_resource(struct virgl_context *ctx, uint32_t res_handle)
++{
++   struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
++   vrend_renderer_context_refused_resource(dctx->grctx, res_handle);
++}
++
+ static void vrend_decode_ctx_detach_resource(struct virgl_context *ctx,
+                                              struct virgl_resource *res)
+ {
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -384,6 +384,8 @@ struct global_renderer_state {
+    uint64_t resource_budget;
+    uint64_t resource_refusals;
+    uint64_t resource_peak_logged;
++   /* the last vrend_renderer_resource_create failed on the budget */
++   bool resource_refused_last;
+ 
+    uint32_t max_draw_buffers;
+    uint32_t max_texture_buffer_size;
+@@ -9998,6 +10000,7 @@ static bool vrend_resource_charge(struct vrend_resource *gr,
+                     MAX2(args->depth, args->array_size), (unsigned long long)(size >> 10),
+                     (unsigned long long)(vrend_state.resource_bytes >> 20),
+                     (unsigned long long)n);
++      vrend_state.resource_refused_last = true;
+       return false;
+    }
+    gr->budget_bytes = size;
+@@ -10018,6 +10021,31 @@ static void vrend_resource_uncharge(struct vrend_resource *gr)
+    gr->budget_bytes = 0;
+ }
+ 
++/* Pingouin: did the last vrend_renderer_resource_create fail on the memory budget? */
++bool vrend_renderer_resource_refused_by_budget(void)
++{
++   return vrend_state.resource_refused_last;
++}
++
++/*
++ * Pingouin: the guest's kernel makes a resource without waiting for the answer, so an
++ * app whose resource the budget refused goes on as if it had it, and its context is
++ * lost later on some command that names it, with no word of why. The context that
++ * made the resource attaches it right away: lose that context there, and say why.
++ * A guest driver that named a reset status buffer is told (GL_GUILTY_CONTEXT_RESET).
++ */
++void vrend_renderer_context_refused_resource(struct vrend_context *ctx, uint32_t res_handle)
++{
++   if (!ctx || !ctx->ctx_id || ctx->in_error)
++      return;
++   virgl_error("context %d (%s) made resource %u past the guest GPU memory budget "
++               "(%llu MB of %llu MB in use): the context is lost\n", ctx->ctx_id,
++               ctx->debug_name, res_handle,
++               (unsigned long long)(vrend_state.resource_bytes >> 20),
++               (unsigned long long)(vrend_state.resource_budget >> 20));
++   vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, res_handle);
++}
++
+ static struct vrend_resource *
+ vrend_resource_create(const struct vrend_renderer_resource_create_args *args)
+ {
+@@ -10053,6 +10081,7 @@ vrend_renderer_resource_create(const struct vrend_renderer_resource_create_args
+    struct vrend_resource *gr;
+    int ret;
+ 
++   vrend_state.resource_refused_last = false;
+    gr = vrend_resource_create(args);
+    if (!gr)
+       return NULL;
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -536,6 +536,9 @@ vrend_resource_reference(struct vrend_resource **ptr, struct vrend_resource *tex
+ }
+ 
+ void vrend_renderer_force_ctx_0(void);
++bool vrend_renderer_resource_refused_by_budget(void);
++void vrend_renderer_context_refused_resource(struct vrend_context *ctx, uint32_t res_handle);
++void vrend_decode_ctx_refused_resource(struct virgl_context *ctx, uint32_t res_handle);
+ void vrend_renderer_flush_current(void);
+ 
+ void vrend_renderer_get_rect(struct pipe_resource *pres,

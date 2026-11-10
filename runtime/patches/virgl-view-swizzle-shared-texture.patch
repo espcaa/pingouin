@@ -1,0 +1,116 @@
+virglrenderer: views of one texture with their own swizzles
+
+What: GL keeps a swizzle per texture, not per view, and without GL texture
+views (macOS) a sampler view is its texture. When two views of one texture
+with different swizzles are bound in one stage, each view's swizzle now goes
+into the shader (sampler_views_lower_swizzle_mask, tex_swizzle, as for texture
+buffers) and the draw sets the texture's own swizzle to none. A draw also
+sets a bound texture's swizzle to its view's again, as another slot may have
+changed it since the view was bound. The slot key bits
+(vrend_slot_key_bits) include it with the swizzle, so such a view coming,
+going or changing selects the shaders again.
+Why: Mesa's VA-API video compositor reads U and V from the one UV plane of an
+NV12 video through two views (RRRR and GGGG). Both read the swizzle bound last,
+U = V, and every frame VA-API converted to RGB had wrong colours (red as
+magenta, blue as dark green): Google Chrome converts each decoded frame so.
+Applies on top of virgl-shader-array-sampler-2d-view.patch.
+Upstreamable; not sent.
+Tests: Tests/virgl/test-const-ubo.c case 24 (two views of one texture, RRR1 and
+GGG1, in one draw: 0x...c0c0 without the patch, each channel with it),
+test-view-key.c (dirty tracking and the key's lowering for such views).
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -4862,6 +4862,46 @@
+    if (view->texture->target == GL_TEXTURE_BUFFER && vrend_get_swizzle(view, swizzle))
+       bits |= 1u << 1 | swizzle[0] << 2 | swizzle[1] << 5 | swizzle[2] << 8 | swizzle[3] << 11;
+    return bits;
++}
++
++/* Pingouin: GL keeps a swizzle per texture, not per view. Two views of one texture (no GL
++ * texture view: the view is the texture itself) with different swizzles bound in one stage
++ * (Mesa's VA-API video compositor reads U and V from the one UV plane so) would both see the
++ * swizzle bound last; such views get their swizzle in the shader instead
++ * (sampler_views_lower_swizzle_mask) and the texture none while the draw reads them. */
++static bool vrend_view_swizzle_shared(const struct vrend_shader_view *views, uint32_t index,
++                                      const struct vrend_sampler_view *view)
++{
++   if (!view || !view->texture || view->gl_id != view->texture->gl_id ||
++       view->texture->target == GL_TEXTURE_BUFFER)
++      return false;
++   for (int j = 0; j < views->max_num_views; j++) {
++      const struct vrend_sampler_view *other = views->views[j];
++      if ((uint32_t)j != index && other && other->texture == view->texture &&
++          other->gl_id == view->gl_id &&
++          memcmp(other->gl_swizzle, view->gl_swizzle, sizeof(view->gl_swizzle)))
++         return true;
++   }
++   return false;
++}
++
++static enum pipe_swizzle vrend_pipe_swizzle(GLint gl)
++{
++   switch (gl) {
++   case GL_GREEN: return PIPE_SWIZZLE_Y;
++   case GL_BLUE: return PIPE_SWIZZLE_Z;
++   case GL_ALPHA: return PIPE_SWIZZLE_W;
++   case GL_ZERO: return PIPE_SWIZZLE_0;
++   case GL_ONE: return PIPE_SWIZZLE_1;
++   default: return PIPE_SWIZZLE_X;
++   }
++}
++
++/* the view's swizzle as the shader key packs it (tex_swizzle) */
++static uint16_t vrend_view_packed_swizzle(const struct vrend_sampler_view *view)
++{
++   return vrend_pipe_swizzle(view->gl_swizzle[0]) | vrend_pipe_swizzle(view->gl_swizzle[1]) << 3 |
++          vrend_pipe_swizzle(view->gl_swizzle[2]) << 6 | vrend_pipe_swizzle(view->gl_swizzle[3]) << 9;
+ }
+ 
+ /* Pingouin: a slot's key bits with the stage's bound shader: also whether a plain 2D view sits
+@@ -4875,6 +4915,10 @@
+    if (view && view->texture && view->target == GL_TEXTURE_2D && sel && index < 32 &&
+        (sel->sinfo.samplers_2d_array_mask & (1u << index)))
+       bits |= 1u << 14;
++   /* sharing a texture with another slot at a different swizzle (symmetric: the other
++    * slot's bits change too when this one comes or goes) */
++   if (vrend_view_swizzle_shared(&sub->views[shader_type], index, view))
++      bits |= 1u << 15 | (uint32_t)vrend_view_packed_swizzle(view) << 16;
+    return bits;
+ }
+ 
+@@ -5583,6 +5627,12 @@
+ 
+       if (view->emulated_rect) {
+          vrend_shader_sampler_views_mask_set(key->sampler_views_emulated_rect_mask, i);
++      }
++
++      /* Pingouin: this view's swizzle in the shader, its texture shared with another view */
++      if (vrend_view_swizzle_shared(&sub_ctx->views[type], i, view)) {
++         vrend_shader_sampler_views_mask_set(key->sampler_views_lower_swizzle_mask, i);
++         key->tex_swizzle[i] = vrend_view_packed_swizzle(view);
+       }
+ 
+       /* Pingouin: a plain 2D view where the shader declares a 2D_ARRAY sampler */
+@@ -6775,6 +6825,22 @@
+             vrend_apply_sampler_state(sub_ctx, tview->texture,
+                                       shader_view->samplers[i],
+                                       next_sampler_id, tview);
++            /* Pingouin: the texture's swizzle as this draw needs it: none where the shader
++             * applies the view's (a texture shared by views with different swizzles),
++             * else the view's own (another slot may have set the shared one since) */
++            if (target != GL_TEXTURE_BUFFER && id == tview->texture->gl_id &&
++                !(sprog->shadow_samp_mask[shader_type] & (1 << i)) && sprog->ss[shader_type]) {
++               static const GLint none[] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
++               struct vrend_texture *tex = (struct vrend_texture *)tview->texture;
++               const GLint *want = vrend_shader_sampler_views_mask_get(
++                  sprog->ss[shader_type]->key.sampler_views_lower_swizzle_mask, i) ?
++                  none : tview->gl_swizzle;
++               if (memcmp(tex->cur_swizzle, want, 4 * sizeof(GLint))) {
++                  for (unsigned c = 0; c < 4; ++c)
++                     glTexParameteri(target, GL_TEXTURE_SWIZZLE_R + c, want[c]);
++                  memcpy(tex->cur_swizzle, want, 4 * sizeof(GLint));
++               }
++            }
+ 
+             if (vrend_state.use_gles) {
+                const unsigned levels = tview->levels ? tview->levels : tview->texture->base.last_level + 1u;

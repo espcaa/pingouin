@@ -1,0 +1,73 @@
+From: OmacVM
+Subject: [PATCH] ui: what closing the VM window does, tested without AppKit
+
+What: a header with no AppKit in it: OmacVM.app's "Closing the window"
+(app.pingouin.Pingouin closeAction: shutdown, keepRunning, ask; anything else shuts
+down) and which value counts (the app's own setting when QEMU runs as the
+OmacVM app, else PINGOUIN_CLOSE_ACTION from the start). Used by
+pingouin-cocoa-close.patch (which explains the why).
+
+Why its own file: so the rules are tested without QEMU or a window
+(app/runtime/Tests/display/test-close.sh applies this patch to an empty
+folder; at build time and in CI).
+
+Upstream: not applicable (OmacVM.app's setting).
+Test: app/runtime/Tests/display/test-close.c.
+
+diff --git a/ui/pingouin-close.h b/ui/pingouin-close.h
+new file mode 100644
+--- /dev/null
++++ b/ui/pingouin-close.h
+@@ -0,0 +1,52 @@
++/*
++ * Pingouin: what closing the VM's window does (#358).
++ *
++ * No AppKit in here, so it is tested on its own
++ * (app/runtime/Tests/display/test-close.c); ui/cocoa.m feeds it.
++ *
++ * Pingouin.app's "Closing the window" (app.pingouin.Pingouin closeAction): "shutdown"
++ * (the default) presses the guest's power button and quits when it is off,
++ * "keepRunning" hides the window and the VM goes on (a click on the Dock icon
++ * shows it again; Quit still shuts it down), "ask" asks which. Anything else
++ * shuts down, as before the setting. QEMU started as the Pingouin app reads the
++ * app's own setting when the window closes, so a change while the VM runs
++ * counts; otherwise (a development build, PINGOUIN_DOCK_SEPARATE) what the app
++ * passed at the start, PINGOUIN_CLOSE_ACTION.
++ */
++#ifndef PINGOUIN_CLOSE_H
++#define PINGOUIN_CLOSE_H
++
++#include <stdbool.h>
++#include <string.h>
++
++typedef enum PingouinClose {
++    PINGOUIN_CLOSE_SHUTDOWN,
++    PINGOUIN_CLOSE_KEEP,
++    PINGOUIN_CLOSE_ASK,
++} PingouinClose;
++
++static inline PingouinClose pingouin_close_parse(const char *v)
++{
++    if (v && !strcmp(v, "keepRunning")) {
++        return PINGOUIN_CLOSE_KEEP;
++    }
++    if (v && !strcmp(v, "ask")) {
++        return PINGOUIN_CLOSE_ASK;
++    }
++    return PINGOUIN_CLOSE_SHUTDOWN;
++}
++
++/* app: QEMU runs as the Pingouin app (its own setting, live: NULL = never set). */
++static inline PingouinClose pingouin_close_pick(bool app, const char *live,
++                                            const char *env)
++{
++    return pingouin_close_parse(app ? live : env);
++}
++
++static inline const char *pingouin_close_name(PingouinClose c)
++{
++    return c == PINGOUIN_CLOSE_KEEP ? "keepRunning" :
++           c == PINGOUIN_CLOSE_ASK ? "ask" : "shutdown";
++}
++
++#endif

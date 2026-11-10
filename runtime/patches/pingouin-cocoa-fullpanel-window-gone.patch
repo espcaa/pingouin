@@ -1,0 +1,117 @@
+From: OmacVM
+Subject: [PATCH] cocoa: FullPanel's state lets go of a window that is freed
+
+What: a window's FullPanel state now hangs on the window through a small
+owner object that only the window holds. When the window is freed, the
+owner tells the state first (windowGone): it forgets the window, stops
+observing, and puts the menu bar and the app's presentation back without
+asking the window anything (releaseSystemState). Blocks and observers that
+still hold the state (a return check after a Space change, the
+presentation observer) find no window and do nothing.
+
+Why: #402. A VM started in "Full screen including notch" (PINGOUIN_FULLPANEL=1)
+died when the display its window was on was unplugged: macOS took the
+windows out of full screen, the display's own window (one window per display)
+was closed, and when AppKit's exit-full-screen transition let go of it the
+window was freed. Freeing it freed its state, whose dealloc asked the half
+freed window -isKeyWindow (SIGSEGV in -[NSWindow isKeyWindow] under
+-[PingouinFullPanelState dealloc], crash report on the Mac mini 2026-10-14).
+The state kept an unretained pointer to its window. (The same owner, kept
+for the reservation-based FullPanel of pingouin-cocoa-fullpanel.patch.)
+
+Upstream: not sent (OmacVM's FullPanel).
+Test: app/runtime/Tests/display/test-fullpanel-window-gone.sh (the wiring in
+the patched ui/cocoa.m at build time); src/tests/e2e/display-unplug.sh (a
+virtual display unplugged under a real VM, also with FullPanel; the release
+gate). Applies after pingouin-cocoa-fullpanel-scale.patch.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -3337,15 +3337,30 @@ - (id)initWithWindow:(NSWindow *)w;
+ - (bool)claimsStrip;
+ - (void)willEnterFullScreen;
+ - (void)releaseSystemState;
++- (void)windowGone;
+ @end
+ 
+ static char pingouin_fullpanel_state_key;
+ static char pingouin_fullpanel_titlebar_context;
+ static char pingouin_fullpanel_options_context;
+ 
++/*
++ * A window's state hangs on it through this owner, which only the window
++ * holds: freed with the window, it tells the state the window is gone
++ * before anything else can use it (#402).
++ */
++@interface PingouinFullPanelOwner : NSObject
++{
++@public
++    PingouinFullPanelState *state;
++}
++@end
++
+ static PingouinFullPanelState *pingouin_fullpanel_state(NSWindow *window)
+ {
+-    return window ? objc_getAssociatedObject(window, &pingouin_fullpanel_state_key) : nil;
++    PingouinFullPanelOwner *owner = window ?
++        objc_getAssociatedObject(window, &pingouin_fullpanel_state_key) : nil;
++    return owner ? owner->state : nil;
+ }
+ 
+ /* The guest's size, the full-screen area and the display box use the whole display. */
+@@ -3544,6 +3559,22 @@ - (id)initWithWindow:(NSWindow *)w
+     return self;
+ }
+ 
++/*
++ * The window is being freed (PingouinFullPanelOwner), e.g. a display's window
++ * closed while macOS took it out of full screen because its display was
++ * unplugged (#402): it must not be asked anything any more. Blocks and
++ * observers that still hold this state find no window; the menu bar and the
++ * app's presentation come back without it (the rules need it only while
++ * the strip is covered).
++ */
++- (void)windowGone
++{
++    window = nil;
++    [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
++    [[NSNotificationCenter defaultCenter] removeObserver:self];
++    [self releaseSystemState];
++}
++
+ - (void)dealloc
+ {
+     [self releaseSystemState];
+@@ -4260,18 +4291,28 @@ - (void)observeValueForKeyPath:(NSString *)keyPath
+ 
+ @end
+ 
++@implementation PingouinFullPanelOwner
++- (void)dealloc
++{
++    [state windowGone];
++    [state release];
++    [super dealloc];
++}
++@end
++
+ /* A VM window's FullPanel state, made before its first full screen. */
+ static void pingouin_fullpanel_prepare_window(NSWindow *window)
+ {
+-    PingouinFullPanelState *state;
++    PingouinFullPanelOwner *owner;
+ 
+     if (!window || pingouin_fullpanel_state(window)) {
+         return;
+     }
+-    state = [[PingouinFullPanelState alloc] initWithWindow:window];
+-    objc_setAssociatedObject(window, &pingouin_fullpanel_state_key, state,
++    owner = [[PingouinFullPanelOwner alloc] init];
++    owner->state = [[PingouinFullPanelState alloc] initWithWindow:window];
++    objc_setAssociatedObject(window, &pingouin_fullpanel_state_key, owner,
+                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+-    [state release];
++    [owner release];
+ }
+ 
+ /* The VM's windows: the main one and the other displays' (external displays on). */

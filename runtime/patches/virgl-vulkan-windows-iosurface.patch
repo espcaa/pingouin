@@ -1,0 +1,1363 @@
+virglrenderer: Vulkan windows without a copy on macOS (IOSurface window buffers)
+
+What: with PINGOUIN_VK_WINDOWS=iosurface (OmacVM.app's vkWindowsNoCopy) and
+KosmicKrisp, vkr makes the buffer Mesa's WSI exports for a Vulkan window (the
+PRIME blit target: transfer target only, exported as a dma-buf, a dedicated
+allocation) out of an IOSurface of 16 KiB rows (4096 BGRA texels a row),
+imported into the driver as host memory (VK_EXT_external_memory_host; the buffer
+is created with that handle type). The blob is a new resource type,
+VIRGL_RESOURCE_IOSURFACE (mapped as the IOSurface's own pages). When Hyprland
+imports it (PIPE_RESOURCE_SET_TYPE without EGL), vrend binds the IOSurface as a
+GL_TEXTURE_RECTANGLE and, when a draw samples the window, the blitter's own GL
+context re-strides it into the window's 2D texture with a small shader: 4-byte
+BGRA- or RGBA-ordered pixels, or 8-byte half-float pixels taken apart bit by
+bit (vkcube's format on Hyprland). Ordering: Venus finished the buffer before
+the guest handed it over; the re-stride is fenced into the guest's context
+(glFenceSync/glWaitSync), so the command buffer's own fence covers the read,
+and the guest writes the buffer again only after that fence (its implicit fence
+on the dma-buf). No CPU copy, no CPU wait.
+Why: the CPU copy (virgl-set-type-without-egl.patch) ran on QEMU's main loop,
+with the BQL, on every compositor frame that showed a Vulkan window: 2.5 ms for
+a 1816x870 FP16 window, 1.8-2.3 ms full screen at 3680x1840 (Mac mini M4), up
+to 5.6 ms at 4K when the GPU is busy. Re-stride: 0.3-0.4 ms of QEMU's time.
+Fails closed: another driver (MoltenVK), no host memory import, any other
+format, a layout outside the IOSurface, or a failed bind: the CPU copy from the
+same pages (or, when the IOSurface itself cannot be made, the Metal heap path),
+logged once. Every guest size is checked before Metal, IOSurface or CGL see it
+(vrend_iosurface_layout_ok). The IOSurface's pages outlive the Vulkan memory
+until every queue of the device passed the guest's vkFreeMemory (an empty
+submission per queue holds a reference), so the GPU never touches freed pages.
+Limits: such a buffer cannot be imported into another Venus context (a Vulkan
+compositor in the guest: VK_ERROR_INVALID_EXTERNAL_HANDLE); OFF by default.
+Upstream: not sent (macOS only; upstream's Metal path needs EGL on ANGLE).
+Test: Tests/virgl/test-vulkan-window-restride.c (build time: the real shader and
+draw on the Mac's OpenGL, bit-exact for all three layouts with offsets and
+strides that cross rows; the layout check's boundaries and overflows); the
+Vulkan validation layer on the host harness (work/vulkan-zc/kit/zchost.m: no
+errors with the host allocation handle type); VM: vkcube, vkmark windowed and
+full screen, Xwayland, resize, two windows, gpuOffMainLoop, MoltenVK (copy),
+30-minute soak (track notes vulkan-zero-copy.md section 7, ADR 0047).
+
+diff --git a/meson.build b/meson.build
+index 6d73750..ef02a42 100644
+--- a/meson.build
++++ b/meson.build
+@@ -219,7 +219,7 @@ if cc.has_header('linux/udmabuf.h')
+    conf_data.set('HAVE_LINUX_UDMABUF_H', 1)
+ endif
+ 
+-metal_dep = dependency('appleframeworks', modules : ['Metal', 'CoreFoundation'], required: false)
++metal_dep = dependency('appleframeworks', modules : ['Metal', 'CoreFoundation', 'IOSurface', 'OpenGL'], required: false)
+ if metal_dep.found()
+    conf_data.set('ENABLE_METAL', 1)
+    add_languages('objc', required: true, native: false)
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+index a0b4128..e1b3ce5 100644
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -393,9 +393,13 @@ proxy_context_get_blob(struct virgl_context *base,
+       return -1;
+    }
+ 
+-   if (reply.fd_type == VIRGL_RESOURCE_METAL_HEAP) {
++   if (reply.fd_type == VIRGL_RESOURCE_METAL_HEAP ||
++       reply.fd_type == VIRGL_RESOURCE_IOSURFACE) {
+       blob->type = reply.fd_type;
+-      blob->u.metal_heap = reply.res_ptr;
++      if (reply.fd_type == VIRGL_RESOURCE_IOSURFACE)
++         blob->u.iosurface = reply.res_ptr;
++      else
++         blob->u.metal_heap = reply.res_ptr;
+       blob->map_info = reply.map_info;
+       blob->vulkan_info = reply.vulkan_info;
+       blob->charge = reply.charge;
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index aca760e..9dd8c57 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -8,6 +8,27 @@
+ #include "vkr_buffer_gen.h"
+ #include "vkr_physical_device.h"
+ 
++/* Pingouin (ADR 0047): Mesa's PRIME buffer (a Vulkan window's frames: transfer target
++ * only, exported as a dma-buf, at most an IOSurface's size) gets host memory, the
++ * IOSurface vkr_device_memory.c makes for it, when the device does that. */
++#define VKR_WINDOW_BUFFER_MAX_SIZE (16384ull * 16384ull)
++
++static bool
++vkr_buffer_is_window_buffer(struct vkr_device *dev, VkBufferCreateInfo *pCreateInfo)
++{
++   if (!dev->iosurface_windows || pCreateInfo->flags ||
++       pCreateInfo->usage != VK_BUFFER_USAGE_TRANSFER_DST_BIT ||
++       !pCreateInfo->size || pCreateInfo->size > VKR_WINDOW_BUFFER_MAX_SIZE)
++      return false;
++   VkExternalMemoryBufferCreateInfo *ext_create_info = vkr_find_struct(
++            pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
++   if (!ext_create_info ||
++       ext_create_info->handleTypes != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
++      return false;
++   ext_create_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++   return true;
++}
++
+ static void
+ vkr_buffer_fix_create_info(struct vkr_device *dev,
+                            VkBufferCreateInfo *pCreateInfo)
+@@ -35,7 +56,8 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+ 
+    /* if host does not natively support dmabuf we need to patch create info */
+-   if (dev->physical_device->is_dma_buf_emulated) {
++   const bool window = vkr_buffer_is_window_buffer(dev, (VkBufferCreateInfo *)args->pCreateInfo);
++   if (!window && dev->physical_device->is_dma_buf_emulated) {
+       vkr_buffer_fix_create_info(dev, (VkBufferCreateInfo *)args->pCreateInfo);
+    }
+ 
+@@ -64,7 +86,9 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+     * vkr_physical_device_init_memory_properties as well.
+     */
+ 
+-   vkr_buffer_create_and_add(dispatch->data, args);
++   struct vkr_buffer *buffer = vkr_buffer_create_and_add(dispatch->data, args);
++   if (buffer)
++      buffer->window = window;
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_buffer.h b/src/venus/vkr_buffer.h
+index d1575b5..fa9f7d0 100644
+--- a/src/venus/vkr_buffer.h
++++ b/src/venus/vkr_buffer.h
+@@ -10,6 +10,8 @@
+ 
+ struct vkr_buffer {
+    struct vkr_object base;
++   /* Pingouin (ADR 0047): made for an IOSurface's memory (a Vulkan window buffer) */
++   bool window;
+ };
+ VKR_DEFINE_OBJECT_CAST(buffer, VK_OBJECT_TYPE_BUFFER, VkBuffer)
+ 
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index aab9c7a..c4e9cea 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -198,6 +198,8 @@ vkr_context_free_resource(struct hash_entry *entry)
+       munmap(res->u.data, res->size);
+    else if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP)
+       CFRelease(res->u.metal_heap);
++   else if (res->fd_type == VIRGL_RESOURCE_IOSURFACE)
++      CFRelease(res->u.iosurface);
+    else if (res->u.fd >= 0)
+       close(res->u.fd);
+    virgl_gpu_charge_unref(res->charge);
+@@ -335,7 +337,7 @@ vkr_context_import_resource_metal(struct vkr_context *ctx,
+                                   void *metal_heap)
+ {
+    assert(!vkr_context_get_resource(ctx, res_id));
+-   assert(fd_type == VIRGL_RESOURCE_METAL_HEAP);
++   assert(fd_type == VIRGL_RESOURCE_METAL_HEAP || fd_type == VIRGL_RESOURCE_IOSURFACE);
+ 
+    struct vkr_resource *res = malloc(sizeof(*res));
+    if (!res)
+@@ -374,7 +376,7 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
+       return false;
+ 
+-   if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
++   if (blob.type == VIRGL_RESOURCE_METAL_HEAP || blob.type == VIRGL_RESOURCE_IOSURFACE) {
+       *out_blob = blob;
+       if (!vkr_context_import_resource_metal(ctx, res_id, blob_size, blob.type,
+                                              blob.u.metal_heap))
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index ebc3571..5512b84 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -31,6 +31,7 @@ struct vkr_resource {
+       uint8_t *data;
+       /* valid when fd_type is metal heap */
+       MTLResource_id metal_heap;
++      void *iosurface; /* Pingouin: VIRGL_RESOURCE_IOSURFACE (IOSurfaceRef) */
+    } u;
+ 
+    size_t size;
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 9649f48..def6734 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -77,6 +77,63 @@ vkr_device_init_proc_table(struct vkr_device *dev,
+                                   api_version, &ext_table, &dev->proc_table);
+ }
+ 
++static bool vkr_iosurface_windows_env;
++
++static void
++vkr_iosurface_windows_read_env(void)
++{
++   const char *env = getenv("PINGOUIN_VK_WINDOWS");
++   vkr_iosurface_windows_env = env && !strcmp(env, "iosurface");
++}
++
++bool
++vkr_iosurface_windows_wanted(void)
++{
++   static once_flag once = ONCE_FLAG_INIT;
++   call_once(&once, vkr_iosurface_windows_read_env);
++   return vkr_iosurface_windows_env;
++}
++
++/* Pingouin (ADR 0047): window buffers as IOSurfaces only on KosmicKrisp (MoltenVK has
++ * the extension too, but its window path is not this one), with the host memory
++ * import turned on; said once per process when it was asked for. */
++static void
++vkr_device_init_iosurface_windows(struct vkr_device *dev)
++{
++   struct vkr_physical_device *physical_dev = dev->physical_device;
++   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
++   static atomic_bool told;
++   const char *why = NULL;
++
++   if (!vkr_iosurface_windows_wanted())
++      return;
++   if (!physical_dev->EXT_external_memory_host || !physical_dev->is_metal_export_supported) {
++      why = "the Vulkan driver cannot import host memory";
++   } else {
++      VkPhysicalDeviceDriverProperties driver_props = {
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
++      };
++      VkPhysicalDeviceProperties2 props2 = {
++         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++         .pNext = &driver_props,
++      };
++      vk->GetPhysicalDeviceProperties2(physical_dev->base.handle.physical_device, &props2);
++      dev->GetMemoryHostPointerPropertiesEXT = (PFN_vkGetMemoryHostPointerPropertiesEXT)
++         vk->GetDeviceProcAddr(dev->base.handle.device, "vkGetMemoryHostPointerPropertiesEXT");
++      if (driver_props.driverID != VK_DRIVER_ID_MESA_KOSMICKRISP)
++         why = "the Vulkan driver is not KosmicKrisp";
++      else if (!dev->GetMemoryHostPointerPropertiesEXT)
++         why = "the Vulkan driver has no vkGetMemoryHostPointerPropertiesEXT";
++   }
++   dev->iosurface_windows = !why;
++   if (!atomic_exchange(&told, true)) {
++      if (why)
++         vkr_log("Vulkan windows are copied (no IOSurfaces: %s)", why);
++      else
++         vkr_log("Vulkan windows are IOSurfaces (PINGOUIN_VK_WINDOWS=iosurface)");
++   }
++}
++
+ static void
+ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+                             struct vn_command_vkCreateDevice *args)
+@@ -136,6 +193,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    add_count += physical_dev->KHR_external_fence_fd;
+    add_count += physical_dev->EXT_external_memory_metal;
+    add_count += physical_dev->KHR_portability_subset;
++   add_count += physical_dev->EXT_external_memory_host;
+    exts = malloc(sizeof(*exts) * (ext_count + add_count));
+    if (!exts) {
+       args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+@@ -170,6 +228,14 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+       exts[ext_count++] = VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME;
+    if (physical_dev->KHR_portability_subset)
+       exts[ext_count++] = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
++   /* Pingouin: host memory import for Vulkan window buffers (vkr_device_memory.c) */
++   bool host_memory = physical_dev->EXT_external_memory_host;
++   for (uint32_t i = 0; host_memory && i < ext_count; i++) {
++      if (!strcmp(exts[i], VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
++         host_memory = false; /* the guest asked for it itself */
++   }
++   if (host_memory)
++      exts[ext_count++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+ 
+    ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
+    ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;
+@@ -224,6 +290,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    }
+ 
+    dev->physical_device = physical_dev;
++   vkr_device_init_iosurface_windows(dev);
+ 
+    vkr_device_init_proc_table(dev, physical_dev->api_version,
+                               args->pCreateInfo->ppEnabledExtensionNames,
+diff --git a/src/venus/vkr_device.h b/src/venus/vkr_device.h
+index 189df6f..a9875a8 100644
+--- a/src/venus/vkr_device.h
++++ b/src/venus/vkr_device.h
+@@ -19,6 +19,11 @@ struct vkr_device {
+ 
+    struct vn_device_proc_table proc_table;
+ 
++   /* Pingouin (ADR 0047): Vulkan window buffers are IOSurfaces on this device
++    * (PINGOUIN_VK_WINDOWS=iosurface, KosmicKrisp, VK_EXT_external_memory_host on) */
++   bool iosurface_windows;
++   PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
++
+    struct list_head queues;
+ 
+    mtx_t free_sync_mutex;
+@@ -35,6 +40,16 @@ vkr_context_init_device_dispatch(struct vkr_context *ctx);
+ void
+ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy_vk);
+ 
++/* Pingouin (ADR 0047): true when PINGOUIN_VK_WINDOWS=iosurface (read once) */
++bool
++vkr_iosurface_windows_wanted(void);
++
++/* Pingouin (ADR 0047): takes over one reference on a CoreFoundation object (an IOSurface
++ * whose pages were Vulkan memory) and drops it once every queue of dev has finished the
++ * work submitted before this call, so the GPU never touches freed pages. */
++void
++vkr_device_release_after_queues(struct vkr_device *dev, void *cf_object);
++
+ static inline bool
+ vkr_device_should_track_object(const struct vkr_object *obj)
+ {
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index ba6453e..f7cbebb 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -7,9 +7,184 @@
+ 
+ #include "venus-protocol/vn_protocol_renderer_transport.h"
+ 
++#include "vkr_buffer.h"
++#include "vkr_device.h"
+ #include "vkr_device_memory_gen.h"
+ #include "vkr_physical_device.h"
+ 
++#ifdef __APPLE__
++#include <CoreFoundation/CoreFoundation.h>
++#include <IOSurface/IOSurfaceRef.h>
++#include <unistd.h>
++
++/*
++ * Pingouin (ADR 0047): a Vulkan window's frames reach the compositor through a buffer
++ * Mesa's WSI exports as a dma-buf (the PRIME blit target). Made of a Metal heap, macOS
++ * OpenGL cannot see it, and vrend copied every frame on the CPU. With
++ * PINGOUIN_VK_WINDOWS=iosurface on KosmicKrisp (vkr_device.c) such a buffer's memory is
++ * an IOSurface instead, imported into the driver as host memory: vrend binds the same
++ * pages to OpenGL. Its layout is not known yet (the compositor tells it later), so the
++ * IOSurface is rows of VKR_IOSURFACE_ROW_BYTES and vrend re-strides it on the GPU.
++ * Lifetime: the memory, the vkr resource, the virgl resource and vrend's texture each
++ * hold a reference; the memory's is dropped only after the device's queues passed its
++ * vkFreeMemory (vkr_device_release_after_queues).
++ */
++#define VKR_IOSURFACE_ROW_PIXELS 4096u
++#define VKR_IOSURFACE_ROW_BYTES (VKR_IOSURFACE_ROW_PIXELS * 4u)
++#define VKR_IOSURFACE_MAX_ROWS 16384u
++
++static CFNumberRef
++vkr_cf_number(int64_t value)
++{
++   return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &value);
++}
++
++static IOSurfaceRef
++vkr_iosurface_create(uint64_t size, void **base, const char **why)
++{
++   const uint64_t rows = size / VKR_IOSURFACE_ROW_BYTES;
++   if (!rows || rows > VKR_IOSURFACE_MAX_ROWS || size % VKR_IOSURFACE_ROW_BYTES) {
++      *why = "its size is out of range";
++      return NULL;
++   }
++
++   const void *keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement,
++                          kIOSurfaceBytesPerRow, kIOSurfacePixelFormat, kIOSurfaceAllocSize };
++   const void *values[] = { vkr_cf_number(VKR_IOSURFACE_ROW_PIXELS), vkr_cf_number(rows),
++                            vkr_cf_number(4), vkr_cf_number(VKR_IOSURFACE_ROW_BYTES),
++                            vkr_cf_number('BGRA'), vkr_cf_number(size) };
++   CFDictionaryRef props = CFDictionaryCreate(kCFAllocatorDefault, keys, values, ARRAY_SIZE(keys),
++                                              &kCFTypeDictionaryKeyCallBacks,
++                                              &kCFTypeDictionaryValueCallBacks);
++   for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
++      if (values[i])
++         CFRelease(values[i]);
++   }
++   IOSurfaceRef surface = props ? IOSurfaceCreate(props) : NULL;
++   if (props)
++      CFRelease(props);
++   if (!surface) {
++      *why = "IOSurfaceCreate failed";
++      return NULL;
++   }
++
++   IOSurfaceLock(surface, 0, NULL);
++   *base = IOSurfaceGetBaseAddress(surface);
++   IOSurfaceUnlock(surface, 0, NULL);
++   if (!*base || (uintptr_t)*base % (uintptr_t)getpagesize() ||
++       IOSurfaceGetBytesPerRow(surface) != VKR_IOSURFACE_ROW_BYTES ||
++       IOSurfaceGetAllocSize(surface) < size) {
++      CFRelease(surface);
++      *why = "the IOSurface's layout is not the one asked for";
++      return NULL;
++   }
++   return surface;
++}
++
++/* What Mesa's WSI asks for its PRIME buffer: export as a dma-buf, dedicated to a buffer
++ * vkr_buffer.c made for host memory (a window buffer), nothing else in the chain. */
++static bool
++vkr_device_memory_is_window_buffer(const VkMemoryAllocateInfo *info)
++{
++   bool export_dma_buf = false;
++   const struct vkr_buffer *buffer = NULL;
++   for (const VkBaseInStructure *s = info->pNext; s; s = s->pNext) {
++      if (s->sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO) {
++         export_dma_buf = ((const VkExportMemoryAllocateInfo *)s)->handleTypes ==
++                          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      } else if (s->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
++         const VkMemoryDedicatedAllocateInfo *d = (const VkMemoryDedicatedAllocateInfo *)s;
++         if (d->image == VK_NULL_HANDLE && d->buffer != VK_NULL_HANDLE)
++            buffer = vkr_buffer_from_handle(d->buffer);
++      } else {
++         return false;
++      }
++   }
++   return export_dma_buf && buffer && buffer->window;
++}
++
++/* Allocates the memory as an IOSurface; false leaves everything as it was (the caller
++ * takes the normal path). */
++static bool
++vkr_device_memory_alloc_iosurface(struct vkr_context *ctx,
++                                  struct vn_command_vkAllocateMemory *args,
++                                  struct vkr_device *dev,
++                                  struct virgl_gpu_charge *charge,
++                                  uint32_t property_flags)
++{
++   static atomic_bool told_yes, told_no;
++   const VkMemoryAllocateInfo *info = args->pAllocateInfo;
++   const uint64_t size = align64(info->allocationSize, VKR_IOSURFACE_ROW_BYTES);
++   const char *why = NULL;
++   void *base = NULL;
++
++   IOSurfaceRef surface = vkr_iosurface_create(size, &base, &why);
++   if (!surface)
++      goto refused;
++
++   VkMemoryHostPointerPropertiesEXT props = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
++   };
++   if (dev->GetMemoryHostPointerPropertiesEXT(
++          dev->base.handle.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++          base, &props) != VK_SUCCESS ||
++       !(props.memoryTypeBits & (1u << info->memoryTypeIndex))) {
++      why = "the driver cannot import it into that memory type";
++      goto refused;
++   }
++
++   const VkImportMemoryHostPointerInfoEXT import = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++      .pHostPointer = base,
++   };
++   const VkMemoryAllocateInfo host_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &import,
++      .allocationSize = size,
++      .memoryTypeIndex = info->memoryTypeIndex,
++   };
++   struct vkr_device_memory *mem = vkr_context_alloc_object(
++      ctx, sizeof(*mem), VK_OBJECT_TYPE_DEVICE_MEMORY, args->pMemory);
++   if (!mem) {
++      why = "out of memory";
++      goto refused;
++   }
++   if (dev->proc_table.AllocateMemory(dev->base.handle.device, &host_info, NULL,
++                                      &mem->base.handle.device_memory) != VK_SUCCESS) {
++      free(mem);
++      why = "the driver did not import it";
++      goto refused;
++   }
++   vkr_device_add_object(ctx, dev, &mem->base);
++
++   mem->device = dev;
++   mem->might_export = true;
++   mem->property_flags = property_flags;
++   mem->valid_fd_types = 1 << VIRGL_RESOURCE_IOSURFACE;
++   mem->udmabuf_fd = -1;
++   mem->gbm_bo = NULL;
++   mem->allocation_size = size;
++   mem->memory_type_index = info->memoryTypeIndex;
++   mem->charge = charge;
++   mem->iosurface = (void *)surface;
++   args->ret = VK_SUCCESS;
++   if (!atomic_exchange(&told_yes, true))
++      vkr_log("Vulkan window buffers are IOSurfaces (first: %" PRIu64 " KB)", size >> 10);
++   return true;
++
++refused:
++   if (surface)
++      CFRelease(surface);
++   /* the heap path after this: the buffer was made for host memory, which KosmicKrisp
++    * does not check; only when IOSurfaces themselves fail (memory) */
++   if (!atomic_exchange(&told_no, true))
++      vkr_log("a Vulkan window buffer of %" PRIu64 " KB is a Metal heap (no IOSurface: %s)",
++              size >> 10, why);
++   return false;
++}
++#endif /* __APPLE__ */
++
+ static bool
+ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
+                                    const VkImportMemoryResourceInfoMESA *res_info,
+@@ -307,6 +482,17 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+       return;
+    }
+ 
++#ifdef __APPLE__
++   if (!res_info && dev->iosurface_windows &&
++       (physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags &
++        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++       vkr_device_memory_is_window_buffer(alloc_info) &&
++       vkr_device_memory_alloc_iosurface(
++          ctx, args, dev, charge,
++          physical_dev->memory_properties.memoryTypes[mem_type_index].propertyFlags))
++      return;
++#endif
++
+    VkExportMemoryAllocateInfo *export_info =
+       vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+ 
+@@ -468,8 +654,19 @@ vkr_dispatch_vkFreeMemory(struct vn_dispatch_context *dispatch,
+    if (!mem)
+       return;
+ 
++#ifdef __APPLE__
++   /* Pingouin: the IOSurface's pages outlive the Vulkan memory made of them until the
++    * GPU is done with what the guest submitted before this */
++   struct vkr_device *dev = mem->device;
++   void *iosurface = mem->iosurface;
++   mem->iosurface = NULL;
++#endif
+    vkr_device_memory_release(mem);
+    vkr_device_memory_destroy_and_remove(dispatch->data, args);
++#ifdef __APPLE__
++   if (iosurface)
++      vkr_device_release_after_queues(dev, iosurface);
++#endif
+ }
+ 
+ static void
+@@ -616,6 +813,12 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
+       vkr_gbm_bo_destroy(mem->gbm_bo);
+    if (mem->udmabuf_fd >= 0)
+       close(mem->udmabuf_fd);
++#ifdef __APPLE__
++   if (mem->iosurface) {
++      CFRelease(mem->iosurface);
++      mem->iosurface = NULL;
++   }
++#endif
+ }
+ 
+ bool
+@@ -649,6 +852,30 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+                                       : VIRGL_RENDERER_MAP_CACHE_WC;
+    }
+ 
++#ifdef __APPLE__
++   if (mem->iosurface) {
++      if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE) {
++         vkr_log("mem cannot export to dma_buf for cross device blob sharing");
++         return false;
++      }
++      struct virgl_resource_vulkan_info info = {
++         .allocation_size = mem->allocation_size,
++         .memory_type_index = mem->memory_type_index,
++      };
++      const VkPhysicalDeviceIDProperties *id_props = &mem->device->physical_device->id_properties;
++      memcpy(info.device_uuid, id_props->deviceUUID, VK_UUID_SIZE);
++      memcpy(info.driver_uuid, id_props->driverUUID, VK_UUID_SIZE);
++      mem->exported = true;
++      *out_blob = (struct virgl_context_blob){
++         .type = VIRGL_RESOURCE_IOSURFACE,
++         .u.iosurface = mem->iosurface,
++         .map_info = map_info,
++         .vulkan_info = info,
++      };
++      return true;
++   }
++#endif
++
+    const bool can_export_dma_buf = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_DMABUF);
+    const bool can_export_opaque = mem->valid_fd_types & (1 << VIRGL_RESOURCE_FD_OPAQUE);
+    const bool can_export_metal = mem->valid_fd_types & (1 << VIRGL_RESOURCE_METAL_HEAP);
+diff --git a/src/venus/vkr_device_memory.h b/src/venus/vkr_device_memory.h
+index f5da8d2..b165ea5 100644
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -33,6 +33,10 @@ struct vkr_device_memory {
+    struct virgl_gpu_charge *charge;
+ 
+    bool exported;
++
++   /* Pingouin: the memory is this IOSurface (IOSurfaceRef, retained), imported as host
++    * memory: a Vulkan window's buffer that macOS OpenGL can bind (ADR 0047) */
++   void *iosurface;
+ };
+ VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)
+ 
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index 0630490..381b319 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -285,6 +285,8 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+          physical_dev->EXT_external_memory_dma_buf = true;
+       } else if (!strcmp(props->extensionName, VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME)) {
+          physical_dev->KHR_external_fence_fd = true;
++      } else if (!strcmp(props->extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
++         physical_dev->EXT_external_memory_host = true;
+       } else if (!strcmp(props->extensionName, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME)) {
+          physical_dev->EXT_image_drm_format_modifier = true;
+       } else if (!strcmp(props->extensionName, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
+diff --git a/src/venus/vkr_physical_device.h b/src/venus/vkr_physical_device.h
+index 1b7d2ac..ce2b80c 100644
+--- a/src/venus/vkr_physical_device.h
++++ b/src/venus/vkr_physical_device.h
+@@ -27,6 +27,8 @@ struct vkr_physical_device {
+    bool KHR_portability_subset;
+    bool EXT_image_drm_format_modifier;
+    bool EXT_queue_family_foreign;
++   /* Pingouin: host memory import, for Vulkan window buffers made of IOSurfaces */
++   bool EXT_external_memory_host;
+ 
+    bool KHR_external_fence_fd;
+ 
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index e098430..1be36cc 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -11,6 +11,10 @@
+ #include "vkr_physical_device.h"
+ #include "vkr_queue_gen.h"
+ 
++#ifdef __APPLE__
++#include <CoreFoundation/CoreFoundation.h>
++#endif
++
+ static struct vkr_queue_sync *
+ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+                             uint32_t fence_flags,
+@@ -52,6 +56,7 @@ vkr_device_alloc_queue_sync(struct vkr_device *dev,
+    }
+ 
+    sync->device_lost = false;
++   sync->release = NULL;
+    sync->flags = fence_flags;
+    sync->ring_idx = ring_idx;
+    sync->fence_id = fence_id;
+@@ -71,6 +76,14 @@ static inline void
+ vkr_queue_sync_retire(struct vkr_queue *queue, struct vkr_queue_sync *sync)
+ {
+    TRACE_FUNC();
++#ifdef __APPLE__
++   if (sync->release) {
++      CFRelease(sync->release);
++      sync->release = NULL;
++      vkr_device_free_queue_sync(queue->device, sync);
++      return;
++   }
++#endif
+    queue->context->retire_fence(queue->context->ctx_id, sync->ring_idx, sync->fence_id);
+    vkr_device_free_queue_sync(queue->device, sync);
+ }
+@@ -111,6 +124,48 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
+    return true;
+ }
+ 
++#ifdef __APPLE__
++void
++vkr_device_release_after_queues(struct vkr_device *dev, void *cf_object)
++{
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   static atomic_bool told;
++
++   /* one empty submission per queue: its fence signals after everything submitted
++    * to that queue before it; each holds a reference until then */
++   list_for_each_entry (struct vkr_queue, queue, &dev->queues, base.track_head) {
++      struct vkr_queue_sync *sync = vkr_device_alloc_queue_sync(dev, 0, queue->ring_idx, 0);
++      if (!sync) {
++         /* keep it rather than free pages the GPU may still use */
++         if (!atomic_exchange(&told, true))
++            vkr_log("an IOSurface stays allocated: no queue sync to free it after the GPU");
++         return;
++      }
++      sync->release = (void *)CFRetain(cf_object);
++
++      mtx_lock(&queue->vk_mutex);
++      VkResult result = vk->QueueSubmit(queue->base.handle.queue, 0, NULL, sync->fence);
++      mtx_unlock(&queue->vk_mutex);
++      if (result == VK_ERROR_DEVICE_LOST) {
++         sync->device_lost = true;
++      } else if (result != VK_SUCCESS) {
++         /* the reference stays (see above); the sync goes back */
++         sync->release = NULL;
++         vkr_device_free_queue_sync(dev, sync);
++         if (!atomic_exchange(&told, true))
++            vkr_log("an IOSurface stays allocated: queue submit failed (vk ret %d)", result);
++         return;
++      }
++
++      mtx_lock(&queue->sync_thread.mutex);
++      list_addtail(&sync->head, &queue->sync_thread.syncs);
++      cnd_signal(&queue->sync_thread.cond);
++      mtx_unlock(&queue->sync_thread.mutex);
++   }
++   CFRelease(cf_object);
++}
++#endif
++
+ static void
+ vkr_queue_sync_thread_fini(struct vkr_queue *queue)
+ {
+diff --git a/src/venus/vkr_queue.h b/src/venus/vkr_queue.h
+index 6a3a909..ad4ade3 100644
+--- a/src/venus/vkr_queue.h
++++ b/src/venus/vkr_queue.h
+@@ -11,6 +11,9 @@
+ struct vkr_queue_sync {
+    VkFence fence;
+    bool device_lost;
++   /* Pingouin (ADR 0047): not a guest fence; drops this CoreFoundation reference
++    * when retired (vkr_device_release_after_queues) */
++   void *release;
+ 
+    uint32_t flags;
+    uint32_t ring_idx;
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index a5148cf..0c1b604 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -201,17 +201,21 @@ vkr_renderer_create_resource(uint32_t ctx_id,
+    *out_charge = blob.charge;
+ 
+    assert(blob.type == VIRGL_RESOURCE_FD_SHM || blob.type == VIRGL_RESOURCE_FD_DMABUF ||
+-          blob.type == VIRGL_RESOURCE_FD_OPAQUE || blob.type == VIRGL_RESOURCE_METAL_HEAP);
++          blob.type == VIRGL_RESOURCE_FD_OPAQUE || blob.type == VIRGL_RESOURCE_METAL_HEAP ||
++          blob.type == VIRGL_RESOURCE_IOSURFACE);
+ 
+    *out_fd_type = blob.type;
+    if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
+       *out_res_ptr = blob.u.metal_heap;
++   } else if (blob.type == VIRGL_RESOURCE_IOSURFACE) {
++      *out_res_ptr = blob.u.iosurface;
+    } else {
+       *out_res_fd = blob.u.fd;
+    }
+    *out_map_info = blob.map_info;
+ 
+-   if (blob.type == VIRGL_RESOURCE_FD_OPAQUE || blob.type == VIRGL_RESOURCE_METAL_HEAP) {
++   if (blob.type == VIRGL_RESOURCE_FD_OPAQUE || blob.type == VIRGL_RESOURCE_METAL_HEAP ||
++       blob.type == VIRGL_RESOURCE_IOSURFACE) {
+       assert(out_vulkan_info);
+       *out_vulkan_info = blob.vulkan_info;
+    }
+diff --git a/src/virgl_context.h b/src/virgl_context.h
+index 9c65c3b..de796bd 100644
+--- a/src/virgl_context.h
++++ b/src/virgl_context.h
+@@ -45,6 +45,7 @@ struct virgl_context_blob {
+       uint32_t opaque_handle;
+       struct pipe_resource *pipe_resource;
+       void *metal_heap;
++      void *iosurface; /* Pingouin: VIRGL_RESOURCE_IOSURFACE, a retained IOSurfaceRef */
+    } u;
+ 
+    uint32_t map_info;
+diff --git a/src/virgl_resource.c b/src/virgl_resource.c
+index e767c14..8d7556e 100644
+--- a/src/virgl_resource.c
++++ b/src/virgl_resource.c
+@@ -56,6 +56,8 @@ virgl_resource_destroy_func(void *val)
+       pipe_callbacks.unref(res->pipe_resource, pipe_callbacks.data);
+    if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP)
+       CFRelease(res->metal_heap);
++   else if (res->fd_type == VIRGL_RESOURCE_IOSURFACE)
++      CFRelease(res->iosurface);
+    else if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
+        (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
+       close(res->fd);
+@@ -250,6 +252,25 @@ virgl_resource_create_from_metal_heap(UNUSED struct virgl_context *ctx,
+    return res;
+ }
+ 
++struct virgl_resource *
++virgl_resource_create_from_iosurface(UNUSED struct virgl_context *ctx,
++                                     uint32_t res_id,
++                                     void *iosurface,
++                                     const struct virgl_resource_vulkan_info *vulkan_info)
++{
++   struct virgl_resource *res;
++
++   res = virgl_resource_create(res_id);
++   if (!res)
++      return NULL;
++
++   res->fd_type = VIRGL_RESOURCE_IOSURFACE;
++   res->iosurface = (void *)CFRetain(iosurface);
++   res->vulkan_info = *vulkan_info;
++
++   return res;
++}
++
+ void
+ virgl_resource_remove(uint32_t res_id)
+ {
+@@ -307,7 +328,8 @@ virgl_resource_export_fd(struct virgl_resource *res, int *fd)
+          return VIRGL_RESOURCE_FD_INVALID;
+ 
+       return ctx->export_opaque_handle(ctx, res, fd);
+-   } else if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP) {
++   } else if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP ||
++              res->fd_type == VIRGL_RESOURCE_IOSURFACE) {
+       return VIRGL_RESOURCE_FD_INVALID;
+    } else if (res->fd_type != VIRGL_RESOURCE_FD_INVALID) {
+       *fd = os_dupfd_cloexec(res->fd);
+diff --git a/src/virgl_resource.h b/src/virgl_resource.h
+index c63ea1f..9a3ac43 100644
+--- a/src/virgl_resource.h
++++ b/src/virgl_resource.h
+@@ -57,6 +57,13 @@ enum virgl_resource_fd_type {
+     */
+    VIRGL_RESOURCE_METAL_HEAP,
+ 
++   /**
++    * Pingouin: an IOSurface (IOSurfaceRef) whose memory is the Vulkan memory
++    * itself, imported into the Vulkan driver as host memory. macOS OpenGL can
++    * bind it, so a compositor shows it without a CPU copy.
++    */
++   VIRGL_RESOURCE_IOSURFACE,
++
+    VIRGL_RESOURCE_FD_INVALID = -1,
+ };
+ 
+@@ -103,6 +110,8 @@ struct virgl_resource {
+ 
+    /* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
+    void *metal_heap;
++   /* Pingouin: when fd_type == VIRGL_RESOURCE_IOSURFACE (an IOSurfaceRef, retained) */
++   void *iosurface;
+ 
+    const struct iovec *iov;
+    int iov_count;
+@@ -178,6 +187,12 @@ virgl_resource_create_from_metal_heap(struct virgl_context *ctx,
+                                       void *metal_heap,
+                                       const struct virgl_resource_vulkan_info *vulkan_info);
+ 
++struct virgl_resource *
++virgl_resource_create_from_iosurface(struct virgl_context *ctx,
++                                     uint32_t res_id,
++                                     void *iosurface,
++                                     const struct virgl_resource_vulkan_info *vulkan_info);
++
+ void
+ virgl_resource_remove(uint32_t res_id);
+ 
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 19cc6a8..2e836f7 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1377,6 +1377,8 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
+       res = virgl_resource_create_from_opaque_handle(ctx, args->res_handle, blob.u.opaque_handle);
+    } else if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
+       res = virgl_resource_create_from_metal_heap(ctx, args->res_handle, blob.u.metal_heap, &blob.vulkan_info);
++   } else if (blob.type == VIRGL_RESOURCE_IOSURFACE) {
++      res = virgl_resource_create_from_iosurface(ctx, args->res_handle, blob.u.iosurface, &blob.vulkan_info);
+    } else if (blob.type != VIRGL_RESOURCE_FD_INVALID) {
+       res = virgl_resource_create_from_fd(args->res_handle,
+                                           blob.type,
+@@ -1446,6 +1448,12 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
+       case VIRGL_RESOURCE_METAL_HEAP:
+          ret = vkr_allocator_resource_map(res, &map, &map_size);
+          break;
++      case VIRGL_RESOURCE_IOSURFACE:
++#ifdef ENABLE_METAL
++         /* Pingouin: the IOSurface's own pages (whole host pages, page aligned) */
++         map = virgl_metal_iosurface_memory(res->iosurface, &map_size);
++#endif
++         break;
+       case VIRGL_RESOURCE_OPAQUE_HANDLE:
+          map = ctx->resource_map(ctx, res, NULL, PROT_WRITE | PROT_READ, MAP_SHARED);
+          map_size = res->map_size;
+@@ -1505,6 +1513,7 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
+          break;
+       case VIRGL_RESOURCE_FD_OPAQUE:
+       case VIRGL_RESOURCE_METAL_HEAP:
++      case VIRGL_RESOURCE_IOSURFACE:
+       case VIRGL_RESOURCE_FD_INVALID:
+          /* Avoid a default case so that -Wswitch will tell us at compile time
+           * if a new virgl resource type is added without being handled here.
+@@ -1546,6 +1555,8 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
+       case VIRGL_RESOURCE_METAL_HEAP:
+          ret = vkr_allocator_resource_unmap(res);
+          break;
++      case VIRGL_RESOURCE_IOSURFACE:
++         break; /* the IOSurface keeps its pages */
+       case VIRGL_RESOURCE_FD_INVALID:
+          /* Avoid a default case so that -Wswitch will tell us at compile time
+           * if a new virgl resource type is added without being handled here.
+@@ -1595,6 +1606,7 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
+       break;
+    case VIRGL_RESOURCE_OPAQUE_HANDLE:
+    case VIRGL_RESOURCE_METAL_HEAP:
++   case VIRGL_RESOURCE_IOSURFACE:
+    case VIRGL_RESOURCE_FD_INVALID:
+       /* Avoid a default case so that -Wswitch will tell us at compile time if a
+        * new virgl resource type is added without being handled here.
+diff --git a/src/vrend/vrend_blitter.c b/src/vrend/vrend_blitter.c
+index 45038f9..94ab95f 100644
+--- a/src/vrend/vrend_blitter.c
++++ b/src/vrend/vrend_blitter.c
+@@ -78,6 +78,11 @@ struct vrend_blitter_ctx {
+ 
+    GLuint vbo_id;
+    struct blit_coord vertices[4];
++
++   /* Pingouin: vrend_blitter_restride */
++   GLuint restride_prog, restride_vao, restride_fb;
++   GLint restride_first, restride_stride, restride_row, restride_mode;
++   bool restride_failed;
+ };
+ 
+ static struct vrend_blitter_ctx vrend_blit_ctx;
+@@ -952,3 +957,139 @@ void vrend_blitter_fini(void)
+    memset(&vrend_blit_ctx, 0, sizeof(vrend_blit_ctx));
+ }
+ 
++
++/* Pingouin (ADR 0047): 4-byte unit i of the IOSurface is texel (i % row, i / row) of the
++ * RECTANGLE texture (BGRA8 as GL reads it); the image's row y starts at unit
++ * first + y * stride. mode 0: 4-byte pixels as GL reads BGRA, 1: RGBA-ordered ones,
++ * 2: 8-byte pixels of four half floats (taken apart bit by bit: exact). */
++static const char restride_vs[] =
++   "void main() {\n"
++   "   gl_Position = vec4(float((gl_VertexID & 1) * 4 - 1), float((gl_VertexID >> 1) * 4 - 1), 0.0, 1.0);\n"
++   "}\n";
++static const char restride_fs[] =
++   "uniform sampler2DRect src;\n"
++   "uniform int first;\n"
++   "uniform int stride;\n"
++   "uniform int row;\n"
++   "uniform int mode;\n"
++   "out vec4 color;\n"
++   "vec4 at(int i) { return texelFetch(src, ivec2(i % row, i / row)); }\n"
++   "uvec4 bytes(int i) { vec4 c = round(at(i) * 255.0); return uvec4(c.b, c.g, c.r, c.a); }\n"
++   "float half_float(uint h) {\n"
++   "   uint s = (h >> 15u) << 31u, e = (h >> 10u) & 31u, m = h & 1023u;\n"
++   "   if (e == 0u) return uintBitsToFloat(s) + uintBitsToFloat(s | 0x3f800000u) * float(m) * exp2(-24.0);\n"
++   "   if (e == 31u) return uintBitsToFloat(s | 0x7f800000u | (m << 13u));\n"
++   "   return uintBitsToFloat(s | ((e + 112u) << 23u) | (m << 13u));\n"
++   "}\n"
++   "void main() {\n"
++   "   ivec2 p = ivec2(gl_FragCoord.xy);\n"
++   "   if (mode == 2) {\n"
++   "      int i = first + p.y * stride + p.x * 2;\n"
++   "      uvec4 a = bytes(i), b = bytes(i + 1);\n"
++   "      color = vec4(half_float(a.x | (a.y << 8u)), half_float(a.z | (a.w << 8u)),\n"
++   "                   half_float(b.x | (b.y << 8u)), half_float(b.z | (b.w << 8u)));\n"
++   "   } else {\n"
++   "      vec4 c = at(first + p.y * stride + p.x);\n"
++   "      color = mode == 1 ? c.bgra : c;\n"
++   "   }\n"
++   "}\n";
++
++static bool restride_init(struct vrend_blitter_ctx *blit_ctx)
++{
++   if (blit_ctx->restride_prog)
++      return true;
++   if (blit_ctx->use_gles || blit_ctx->glsl_ver < 400)
++      return false;
++
++   GLuint vs = blit_shader_build_and_check(blit_ctx, GL_VERTEX_SHADER, restride_vs);
++   GLuint fs = blit_shader_build_and_check(blit_ctx, GL_FRAGMENT_SHADER, restride_fs);
++   GLuint prog = (vs && fs) ? glCreateProgram() : 0;
++   if (prog) {
++      glAttachShader(prog, vs);
++      glAttachShader(prog, fs);
++      glBindFragDataLocation(prog, 0, "color");
++      if (!blit_shader_link_and_check(prog))
++         prog = 0;
++   }
++   if (vs)
++      glDeleteShader(vs);
++   if (fs)
++      glDeleteShader(fs);
++   if (!prog)
++      return false;
++
++   glUseProgram(prog);
++   glUniform1i(glGetUniformLocation(prog, "src"), 0);
++   glUseProgram(0);
++   blit_ctx->restride_first = glGetUniformLocation(prog, "first");
++   blit_ctx->restride_stride = glGetUniformLocation(prog, "stride");
++   blit_ctx->restride_row = glGetUniformLocation(prog, "row");
++   blit_ctx->restride_mode = glGetUniformLocation(prog, "mode");
++   glGenVertexArrays(1, &blit_ctx->restride_vao);
++   glGenFramebuffers(1, &blit_ctx->restride_fb);
++   blit_ctx->restride_prog = prog;
++   return true;
++}
++
++/* Draws the re-stride into dst_tex in the current context (the blitter's; the build
++ * test's own); false if dst_tex cannot be drawn into. */
++static bool restride_draw(struct vrend_blitter_ctx *blit_ctx, GLuint dst_tex, unsigned width,
++                          unsigned height, GLuint rect_tex, unsigned row, uint32_t first,
++                          uint32_t stride, int mode)
++{
++   bool ok = false;
++
++   glBindFramebuffer(GL_FRAMEBUFFER, blit_ctx->restride_fb);
++   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dst_tex, 0);
++   const GLenum buffer = GL_COLOR_ATTACHMENT0;
++   glDrawBuffers(1, &buffer);
++   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
++      glViewport(0, 0, width, height);
++      glDisable(GL_SCISSOR_TEST);
++      glDisable(GL_DEPTH_TEST);
++      glDisable(GL_STENCIL_TEST);
++      glDisable(GL_BLEND);
++      glDisable(GL_CULL_FACE);
++      glDisable(GL_RASTERIZER_DISCARD);
++      glDisable(GL_FRAMEBUFFER_SRGB); /* the bytes as they are, also into sRGB textures */
++      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++      glUseProgram(blit_ctx->restride_prog);
++      glUniform1i(blit_ctx->restride_first, (GLint)first);
++      glUniform1i(blit_ctx->restride_stride, (GLint)stride);
++      glUniform1i(blit_ctx->restride_row, (GLint)row);
++      glUniform1i(blit_ctx->restride_mode, mode);
++      glActiveTexture(GL_TEXTURE0);
++      glBindTexture(GL_TEXTURE_RECTANGLE, rect_tex);
++      glBindVertexArray(blit_ctx->restride_vao);
++      glDrawArrays(GL_TRIANGLES, 0, 3);
++      glBindVertexArray(blit_ctx->vaoid);
++      glBindTexture(GL_TEXTURE_RECTANGLE, 0);
++      glUseProgram(0);
++      ok = true;
++   }
++   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
++   glBindFramebuffer(GL_FRAMEBUFFER, 0);
++   return ok;
++}
++
++bool vrend_blitter_restride(virgl_gl_context back, GLuint dst_tex, unsigned width,
++                            unsigned height, GLuint rect_tex, unsigned row, uint32_t first,
++                            uint32_t stride, int mode)
++{
++   struct vrend_blitter_ctx *blit_ctx = &vrend_blit_ctx;
++
++   if (blit_ctx->restride_failed || !row || !width || !height)
++      return false;
++
++   /* the blitter's own context: none of the guest context's state is touched */
++   vrend_renderer_init_blit_ctx(blit_ctx);
++   bool ok = false;
++   if (!restride_init(blit_ctx)) {
++      blit_ctx->restride_failed = true;
++      virgl_error("virglrenderer: the Vulkan window re-stride shader cannot be built\n");
++   } else {
++      ok = restride_draw(blit_ctx, dst_tex, width, height, rect_tex, row, first, stride, mode);
++   }
++   vrend_sync_make_current(back);
++   return ok;
++}
+diff --git a/src/vrend/vrend_blitter.h b/src/vrend/vrend_blitter.h
+index de2b3c5..8c41b23 100644
+--- a/src/vrend/vrend_blitter.h
++++ b/src/vrend/vrend_blitter.h
+@@ -26,6 +26,8 @@
+ 
+ #include "util/os_misc.h"
+ #include "util/macros.h"
++#include <stdbool.h>
++#include <stdint.h>
+ 
+ /* shaders for blitting; desktop GL shaders get their #version line from
+  * the blitter (blit_ctx->glsl_header) */
+@@ -198,4 +200,29 @@ void vrend_renderer_blit_gl(ASSERTED struct vrend_context *ctx,
+                             const struct vrend_blit_info *info);
+ void vrend_blitter_fini(void);
+ 
++/* Pingouin (ADR 0047): a Vulkan window buffer (an IOSurface as a RECTANGLE texture, `row`
++ * texels a row) into the window's 2D texture, re-strided on the GPU in the blitter's
++ * context; `back` is made current again behind a GPU wait. first and stride count
++ * 4-byte units; mode: see vrend_blitter.c. False: nothing was drawn. */
++/* Pingouin (ADR 0047): an image (offset and stride in bytes, width x height pixels of bpp
++ * bytes) lies inside a RECTANGLE texture of rect_width x rect_height 4-byte texels, and
++ * the shader's 32-bit texel numbers cannot overflow. */
++static inline bool
++vrend_iosurface_layout_ok(uint64_t offset, uint64_t stride, uint32_t width, uint32_t height,
++                          uint32_t bpp, uint32_t rect_width, uint32_t rect_height)
++{
++   const uint64_t texels = (uint64_t)rect_width * rect_height;
++   const uint64_t limit = texels * 4;
++   const uint64_t row = (uint64_t)width * bpp;
++   if (!width || !height || !texels || texels > INT32_MAX || (bpp != 4 && bpp != 8) ||
++       offset % 4 || stride % 4 || stride < row || offset > limit || row > limit - offset)
++      return false;
++   /* the rows after the first, without overflowing */
++   return height == 1 || (uint64_t)(height - 1) <= (limit - offset - row) / stride;
++}
++
++bool vrend_blitter_restride(virgl_gl_context back, GLuint dst_tex, unsigned width,
++                            unsigned height, GLuint rect_tex, unsigned row, uint32_t first,
++                            uint32_t stride, int mode);
++
+ #endif
+diff --git a/src/vrend/vrend_metal.h b/src/vrend/vrend_metal.h
+index dce20c6..cc211e4 100644
+--- a/src/vrend/vrend_metal.h
++++ b/src/vrend/vrend_metal.h
+@@ -51,4 +51,14 @@ bool virgl_metal_heap_reader_copies(const struct virgl_metal_heap_reader *reader
+ 
+ void virgl_metal_heap_reader_destroy(struct virgl_metal_heap_reader *reader);
+ 
++/* Pingouin (ADR 0047): a Vulkan window buffer made of an IOSurface (vkr_device_memory.c).
++ * Its memory: base address and size (rows x bytes per row); NULL if it has none. */
++void *virgl_metal_iosurface_memory(void *iosurface, uint64_t *size);
++void *virgl_metal_iosurface_retain(void *iosurface);
++void virgl_metal_iosurface_release(void *iosurface);
++/* Binds it to the GL_TEXTURE_RECTANGLE texture bound in the current CGL context, as
++ * BGRA8 texels (GL_RGBA8 with GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV), and tells its size
++ * in texels. */
++bool virgl_metal_iosurface_bind_rect(void *iosurface, unsigned *width, unsigned *height);
++
+ #endif
+diff --git a/src/vrend/vrend_metal.m b/src/vrend/vrend_metal.m
+index a95693f..f2f7b2f 100644
+--- a/src/vrend/vrend_metal.m
++++ b/src/vrend/vrend_metal.m
+@@ -10,6 +10,10 @@
+ #include "pipe/p_state.h"
+ #include "util/u_math.h"
+ #include <Metal/Metal.h>
++#include <IOSurface/IOSurfaceRef.h>
++#include <OpenGL/OpenGL.h>
++#include <OpenGL/CGLIOSurface.h>
++#include <OpenGL/gl3.h>
+ #include <stdlib.h>
+ 
+ struct metal_format_conversion {
+@@ -305,3 +309,35 @@ void virgl_metal_heap_reader_destroy(struct virgl_metal_heap_reader *reader)
+    [reader->queue release];
+    free(reader);
+ }
++
++void *virgl_metal_iosurface_memory(void *iosurface, uint64_t *size)
++{
++   IOSurfaceRef surface = (IOSurfaceRef)iosurface;
++   /* rows x bytes per row: what the Vulkan memory is (an allocation may round up) */
++   *size = surface ? (uint64_t)IOSurfaceGetHeight(surface) * IOSurfaceGetBytesPerRow(surface) : 0;
++   return surface ? IOSurfaceGetBaseAddress(surface) : NULL;
++}
++
++void *virgl_metal_iosurface_retain(void *iosurface)
++{
++   return iosurface ? (void *)CFRetain(iosurface) : NULL;
++}
++
++void virgl_metal_iosurface_release(void *iosurface)
++{
++   if (iosurface)
++      CFRelease(iosurface);
++}
++
++bool virgl_metal_iosurface_bind_rect(void *iosurface, unsigned *width, unsigned *height)
++{
++   IOSurfaceRef surface = (IOSurfaceRef)iosurface;
++   CGLContextObj cgl = CGLGetCurrentContext();
++
++   *width = (unsigned)IOSurfaceGetWidth(surface);
++   *height = (unsigned)IOSurfaceGetHeight(surface);
++   if (!cgl || IOSurfaceGetPixelFormat(surface) != 'BGRA' || IOSurfaceGetBytesPerElement(surface) != 4)
++      return false;
++   return CGLTexImageIOSurface2D(cgl, GL_TEXTURE_RECTANGLE, GL_RGBA8, *width, *height, GL_BGRA,
++                                 GL_UNSIGNED_INT_8_8_8_8_REV, surface, 0) == kCGLNoError;
++}
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 427c90e..c9b1856 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -6595,16 +6595,42 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
+ 
+ #ifdef ENABLE_METAL
+ /*
+- * Pingouin: copy a Venus image (Metal heap) into the GL texture that stands in for
+- * it. Called when a draw samples it; leaves the GL state as it found it.
++ * Pingouin: copy a Venus image (Metal heap or IOSurface) into the GL texture that stands
++ * in for it. Called when a draw samples it; leaves the GL state as it found it. An
++ * IOSurface is re-strided on the GPU (ADR 0047): no CPU copy, no CPU wait.
+  */
+-static void vrend_resource_heap_refresh(struct vrend_resource *res)
++static void vrend_resource_heap_refresh(struct vrend_sub_context *sub_ctx,
++                                        struct vrend_resource *res)
+ {
+    if (res->heap_serial == vrend_submit_serial)
+       return;
+    res->heap_serial = vrend_submit_serial;
+ 
+-   const void *data = virgl_metal_heap_reader_read(res->heap_reader);
++   /* Ordering (ADR 0047): Venus finished writing the buffer before the guest handed it
++    * to the compositor (its present waits for that). The re-stride reads it in the
++    * blitter's context; vrend_sync_make_current puts a GPU wait for it into the guest's
++    * context, so this command buffer's fence, made in the guest's context after this,
++    * covers the read, and the guest writes the buffer again only after that fence
++    * (its implicit fence on the dma-buf). Nothing may switch GL contexts between the
++    * re-stride and that fence. GL sees Metal's writes to the IOSurface's pages without
++    * a lock or rebind: Apple silicon's memory is one (checked by kit/zchost: exact). */
++   if (res->iosurface_rect) {
++      if (vrend_blitter_restride(sub_ctx->gl_context, res->gl_id, res->base.width0,
++                                 res->base.height0, res->iosurface_rect, res->iosurface_row,
++                                 res->iosurface_first, res->heap_stride / 4,
++                                 res->iosurface_mode))
++         return;
++      static bool told;
++      if (!told) {
++         told = true;
++         virgl_warn("a Vulkan window is copied on the CPU: its GPU re-stride failed\n");
++      }
++      glDeleteTextures(1, &res->iosurface_rect);
++      res->iosurface_rect = 0;
++   }
++
++   const void *data = res->heap_reader ? virgl_metal_heap_reader_read(res->heap_reader)
++                                       : res->iosurface_data;
+    if (!data)
+       return;
+ 
+@@ -6651,8 +6677,9 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+ #ifdef ENABLE_METAL
+    for (uint32_t m = mask; m;) {
+       struct vrend_sampler_view *tview = shader_view->views[u_bit_scan(&m)];
+-      if (tview && tview->texture && tview->texture->heap_reader)
+-         vrend_resource_heap_refresh(tview->texture);
++      if (tview && tview->texture &&
++          (tview->texture->heap_reader || tview->texture->iosurface_data))
++         vrend_resource_heap_refresh(sub_ctx, tview->texture);
+    }
+ #endif
+ 
+@@ -12266,6 +12293,9 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+    if (res->metal_texture)
+       virgl_metal_release_texture(res->metal_texture);
+    virgl_metal_heap_reader_destroy(res->heap_reader);
++   if (res->iosurface_rect)
++      glDeleteTextures(1, &res->iosurface_rect);
++   virgl_metal_iosurface_release(res->iosurface);
+ #endif
+    free(res);
+ }
+@@ -17301,6 +17331,44 @@ void vrend_renderer_borrow_texture_for_scanout(struct pipe_resource *pres)
+  * filled from the Metal heap when a draw samples it, or left blank when the
+  * memory cannot be read. Either way the context goes on.
+  */
++/* Pingouin (ADR 0047): the IOSurface as a RECTANGLE texture for the GPU re-stride, when
++ * the image's texels are 4-byte BGRA- or RGBA-ordered 8-bit values; else the CPU copy. */
++static void
++vrend_resource_iosurface_bind(struct vrend_resource *gr, enum virgl_formats format,
++                              uint64_t offset, uint64_t stride)
++{
++   const GLenum glformat = tex_conv_table[format].glformat;
++   const GLenum gltype = tex_conv_table[format].gltype;
++   int mode;
++   if (offset % 4 || stride % 4 || util_format_is_pure_integer(format))
++      return;
++   if (util_format_get_blocksize(format) == 4 && (glformat == GL_BGRA || glformat == GL_RGBA) &&
++       (gltype == GL_UNSIGNED_BYTE || gltype == GL_UNSIGNED_INT_8_8_8_8_REV))
++      mode = glformat == GL_RGBA ? 1 : 0;
++   else if (util_format_get_blocksize(format) == 8 && glformat == GL_RGBA && gltype == GL_HALF_FLOAT)
++      mode = 2;
++   else
++      return;
++
++   GLint bound = 0;
++   GLuint tex = 0;
++   unsigned width = 0, height = 0;
++   glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &bound);
++   glGenTextures(1, &tex);
++   glBindTexture(GL_TEXTURE_RECTANGLE, tex);
++   const bool ok = virgl_metal_iosurface_bind_rect(gr->iosurface, &width, &height);
++   glBindTexture(GL_TEXTURE_RECTANGLE, bound);
++   if (!ok || !vrend_iosurface_layout_ok(offset, stride, gr->base.width0, gr->base.height0,
++                                         util_format_get_blocksize(format), width, height)) {
++      glDeleteTextures(1, &tex);
++      return;
++   }
++   gr->iosurface_rect = tex;
++   gr->iosurface_row = width;
++   gr->iosurface_first = (uint32_t)(offset / 4);
++   gr->iosurface_mode = mode;
++}
++
+ static int
+ vrend_pipe_resource_set_type_by_copy(struct vrend_context *ctx,
+                                      struct virgl_resource *res,
+@@ -17323,7 +17391,8 @@ vrend_pipe_resource_set_type_by_copy(struct vrend_context *ctx,
+       return ret;
+    }
+ 
+-   if (res->fd_type == VIRGL_RESOURCE_METAL_HEAP && res->metal_heap) {
++   const bool surface = res->fd_type == VIRGL_RESOURCE_IOSURFACE && res->iosurface;
++   if (surface || (res->fd_type == VIRGL_RESOURCE_METAL_HEAP && res->metal_heap)) {
+       const uint64_t bpp = util_format_get_blocksize(args->format);
+       const uint64_t row = (uint64_t)args->width * bpp;
+       const uint64_t stride = args->plane_strides[0];
+@@ -17337,7 +17406,20 @@ vrend_pipe_resource_set_type_by_copy(struct vrend_context *ctx,
+          why = "its row stride does not fit its width";
+       else if (!args->height)
+          why = "it has no rows";
+-      else {
++      else if (surface) {
++         const uint64_t length = stride * (args->height - 1) + row;
++         const uint64_t offset = args->plane_offsets[0];
++         uint64_t size = 0;
++         char *base = virgl_metal_iosurface_memory(res->iosurface, &size);
++         if (!base || offset > size || length > size - offset) {
++            why = "the image lies past the end of its memory";
++         } else {
++            gr->iosurface = virgl_metal_iosurface_retain(res->iosurface);
++            gr->iosurface_data = base + offset;
++            gr->heap_stride = (uint32_t)stride;
++            vrend_resource_iosurface_bind(gr, args->format, offset, stride);
++         }
++      } else {
+          const uint64_t length = stride * (args->height - 1) + row;
+          gr->heap_reader = virgl_metal_heap_reader_create(res->metal_heap, args->plane_offsets[0],
+                                                           length, &why);
+@@ -17355,7 +17437,15 @@ vrend_pipe_resource_set_type_by_copy(struct vrend_context *ctx,
+       }
+    }
+ 
+-   if (gr->heap_reader) {
++   if (gr->iosurface) {
++      static bool told_surface;
++      if (!told_surface) {
++         told_surface = true;
++         virgl_info("context %d (%s) shows a Vulkan image %s\n", ctx->ctx_id, ctx->debug_name,
++                    gr->iosurface_rect ? "without a copy (IOSurface)"
++                                       : "by CPU copy from an IOSurface (its format)");
++      }
++   } else if (gr->heap_reader) {
+       if (!told_copy) {
+          told_copy = true;
+          virgl_info("context %d (%s) shows a Vulkan image by %s copy: macOS OpenGL cannot "
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 8e06a1c..182de5f 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -129,6 +129,15 @@ struct vrend_resource {
+    struct virgl_metal_heap_reader *heap_reader;
+    uint32_t heap_stride;
+    uint64_t heap_serial;
++   /* Pingouin (ADR 0047): a Vulkan window buffer made of an IOSurface (retained): its
++    * image in the IOSurface's memory, and the IOSurface as a RECTANGLE texture that
++    * vrend re-strides into gl_id on the GPU (0: copied on the CPU instead) */
++   void *iosurface;
++   const void *iosurface_data;
++   GLuint iosurface_rect;
++   uint32_t iosurface_row;   /* texels per row of the RECTANGLE texture */
++   uint32_t iosurface_first; /* the image's first texel in it */
++   int iosurface_mode;       /* how its pixels are laid out (vrend_blitter_restride) */
+    /* Pingouin: index ranges of this buffer that indexed draws read back
+     * (virgl-index-range-cache.patch). content_gen counts the writes vrend makes to the
+     * buffer (vrend_resource_contents_changed); a range counts only for the generation it

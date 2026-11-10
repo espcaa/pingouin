@@ -1,0 +1,410 @@
+# macOS's shortcut list, each with its key: id, enabled, Mac key code, modifiers (CGEventFlags: Shift 0x20000,
+# Control 0x40000, Option 0x80000, Command 0x100000, fn/globe 0x800000), name. Read on a MacBook Pro M4 Max,
+# macOS 15 (2026-10-05) from the window server's live table (test-shortcuts.sh reads this Mac's too).
+# Ids from 1000: chords macOS keeps outside that table (app menus, Cmd+Tab's neighbours), and F-keys with
+# every modifier.
+0	1	53	0x180000	Force Quit
+1	1	48	0x100000	App switcher (Cmd+Tab)
+2	1	48	0x120000	App switcher backwards
+4	1	1	0x140000	Lock/sleep chord
+6	1	53	0x1a0000	Force Quit the front app
+7	1	120	0x840000	Focus menu bar
+8	1	99	0x840000	Focus Dock
+9	1	118	0x840000	Focus active or next window
+10	1	96	0x840000	Focus window toolbar
+11	1	97	0x840000	Focus floating window
+12	1	122	0x840000	Keyboard access on/off
+13	1	98	0x840000	Tab moves focus
+14	1	12	0x1e0000	Quick note chord
+15	0	28	0x180000	macOS shortcut 15
+16	0	67	0x180000	macOS shortcut 16
+17	0	24	0x180000	macOS shortcut 17
+18	0	69	0x180000	macOS shortcut 18
+19	0	27	0x180000	macOS shortcut 19
+20	0	78	0x180000	macOS shortcut 20
+21	0	28	0x1c0000	macOS shortcut 21
+22	0	67	0x1c0000	macOS shortcut 22
+23	0	42	0x180000	macOS shortcut 23
+24	0	50	0x180000	macOS shortcut 24
+25	0	47	0x1c0000	macOS shortcut 25
+26	0	43	0x1c0000	macOS shortcut 26
+27	1	50	0x100000	Next window (Cmd+`)
+28	1	20	0x120000	Screenshot to file
+29	1	20	0x160000	Screenshot to clipboard
+30	1	21	0x120000	Selection screenshot to file
+31	1	21	0x160000	Selection screenshot to clipboard
+32	1	126	0x840000	Mission Control
+33	1	125	0x840000	App Expose
+34	1	126	0x860000	Mission Control (slow)
+35	1	125	0x860000	App Expose (slow)
+36	1	103	0x800000	Show Desktop
+37	1	103	0x820000	Show Desktop (slow)
+50	1	49	0x140000	Keyboard viewer / emoji chord
+51	1	50	0x180000	Next window (other)
+52	1	2	0x180000	Dock hiding on/off
+53	1	107	0x800000	Brightness down (F14)
+54	1	113	0x800000	Brightness up (F15)
+55	1	107	0x880000	Brightness down (Option)
+56	1	113	0x880000	Brightness up (Option)
+57	1	100	0x840000	Focus status menus
+58	1	53	0x80000	Esc chord
+59	1	96	0x900000	VoiceOver on/off
+60	1	49	0x40000	Previous input source
+61	1	49	0xc0000	Next input source
+62	1	111	0x800000	Dashboard (F12)
+63	1	111	0x820000	Dashboard (F12, slow)
+64	1	49	0x100000	Spotlight
+65	1	49	0x180000	Finder search window
+70	1	2	0x140000	Look up word
+73	1	53	0x100000	Esc chord (Cmd)
+75	0	100	0x800000	macOS shortcut 75
+76	0	100	0x820000	macOS shortcut 76
+77	0	98	0x800000	macOS shortcut 77
+78	0	98	0x820000	macOS shortcut 78
+79	1	123	0x840000	Space left
+80	1	123	0x860000	Space left (slow)
+81	1	124	0x840000	Space right
+82	1	124	0x860000	Space right (slow)
+83	0	0	0x40000	macOS shortcut 83
+84	0	0	0x60000	macOS shortcut 84
+85	0	0	0x40000	macOS shortcut 85
+86	0	0	0x60000	macOS shortcut 86
+95	1	104	0x0	JIS input (Kana)
+96	1	102	0x0	JIS input (Eisu)
+97	1	114	0x800000	Help (fn)
+98	1	44	0x120000	Help menu
+99	1	122	0x900000	VoiceOver (fn+Cmd+F1)
+100	1	129	0x800000	macOS shortcut 100
+101	1	129	0x880000	macOS shortcut 101
+102	1	130	0x800000	macOS shortcut 102
+103	1	130	0x880000	macOS shortcut 103
+104	1	144	0x800000	macOS shortcut 104
+105	1	144	0x880000	macOS shortcut 105
+106	1	145	0x800000	macOS shortcut 106
+107	1	145	0x880000	macOS shortcut 107
+108	1	160	0x800000	macOS shortcut 108
+109	1	160	0x880000	macOS shortcut 109
+110	1	160	0x900000	macOS shortcut 110
+111	1	160	0x980000	macOS shortcut 111
+112	1	160	0x920000	macOS shortcut 112
+113	1	160	0x820000	macOS shortcut 113
+114	1	130	0x820000	macOS shortcut 114
+115	1	160	0x840000	macOS shortcut 115
+116	1	160	0x8c0000	macOS shortcut 116
+117	1	160	0x860000	macOS shortcut 117
+118	0	18	0x40000	macOS shortcut 118
+119	0	19	0x40000	macOS shortcut 119
+120	0	20	0x40000	macOS shortcut 120
+121	0	21	0x40000	macOS shortcut 121
+122	0	23	0x40000	macOS shortcut 122
+123	0	22	0x40000	macOS shortcut 123
+124	0	26	0x40000	macOS shortcut 124
+125	0	28	0x40000	macOS shortcut 125
+126	0	25	0x40000	macOS shortcut 126
+127	0	29	0x40000	macOS shortcut 127
+128	0	18	0xc0000	macOS shortcut 128
+129	0	19	0xc0000	macOS shortcut 129
+130	0	20	0xc0000	macOS shortcut 130
+131	0	21	0xc0000	macOS shortcut 131
+132	0	23	0xc0000	macOS shortcut 132
+133	0	22	0xc0000	macOS shortcut 133
+134	0	83	0x40000	macOS shortcut 134
+135	0	84	0x40000	macOS shortcut 135
+136	0	85	0x40000	macOS shortcut 136
+137	0	86	0x40000	macOS shortcut 137
+138	0	87	0x40000	macOS shortcut 138
+139	0	88	0x40000	macOS shortcut 139
+140	0	89	0x40000	macOS shortcut 140
+141	0	91	0x40000	macOS shortcut 141
+142	0	92	0x40000	macOS shortcut 142
+143	0	82	0x40000	macOS shortcut 143
+144	0	83	0xc0000	macOS shortcut 144
+145	0	84	0xc0000	macOS shortcut 145
+146	0	85	0xc0000	macOS shortcut 146
+147	0	86	0xc0000	macOS shortcut 147
+148	0	87	0xc0000	macOS shortcut 148
+149	0	88	0xc0000	macOS shortcut 149
+150	1	145	0x900000	macOS shortcut 150
+151	1	144	0x900000	macOS shortcut 151
+152	1	144	0x8a0000	macOS shortcut 152
+153	1	145	0x8a0000	macOS shortcut 153
+154	1	107	0x8a0000	macOS shortcut 154
+155	1	113	0x8a0000	macOS shortcut 155
+156	0	49	0x60000	macOS shortcut 156
+157	1	3	0x120000	Screenshot chord (Cmd+Shift+F)
+158	1	101	0x840000	Ctrl+F9 chord
+159	1	36	0x40000	Ctrl+Return chord
+162	1	96	0x980000	Accessibility controls
+165	1	113	0x840000	Brightness chord (F15)
+166	1	107	0x840000	Brightness chord (F14)
+167	1	144	0x840000	macOS shortcut 167
+168	1	145	0x840000	macOS shortcut 168
+169	1	113	0x8e0000	macOS shortcut 169
+170	1	107	0x8e0000	macOS shortcut 170
+171	1	144	0x8e0000	macOS shortcut 171
+172	1	145	0x8e0000	macOS shortcut 172
+173	1	131	0x800000	Launchpad
+174	1	131	0x820000	Launchpad (slow)
+177	1	53	0x80000	Opt+Esc chord
+178	1	127	0x0	Power key
+181	1	22	0x120000	Touch Bar screenshot
+182	1	22	0x160000	Touch Bar screenshot to clipboard
+184	1	23	0x120000	Screenshot options
+185	1	23	0x160000	Screenshot options (Ctrl)
+186	1	176	0x800000	Dictation
+187	1	177	0x800000	Spotlight key
+188	1	179	0x0	Globe key
+189	1	178	0x800000	Do Not Disturb
+190	1	12	0x800000	Quick Note
+192	1	123	0x800000	macOS shortcut 192
+193	1	124	0x800000	macOS shortcut 193
+194	1	125	0x800000	macOS shortcut 194
+195	1	126	0x800000	macOS shortcut 195
+196	1	4	0x800000	Globe+H
+197	1	3	0x800000	Globe+F
+198	1	125	0x840000	macOS shortcut 198
+199	1	123	0x840000	macOS shortcut 199
+200	1	124	0x840000	macOS shortcut 200
+201	1	50	0x800000	Globe+`
+202	1	50	0x820000	Globe+Shift+`
+203	1	42	0x800000	Globe+\
+204	1	42	0x880000	macOS shortcut 204
+205	1	123	0x880000	macOS shortcut 205
+206	1	124	0x880000	macOS shortcut 206
+207	1	42	0x900000	macOS shortcut 207
+208	1	42	0x920000	macOS shortcut 208
+209	1	1	0x800000	Globe+S
+210	1	0	0x800000	Globe+A (Dock)
+211	1	8	0x800000	Globe+C (Control Centre)
+212	1	45	0x800000	Globe+N (Notifications)
+213	1	46	0x800000	Globe+M
+214	1	0	0x820000	Globe+Shift+A
+220	1	50	0x120000	Cmd+Shift+`
+221	1	118	0x860000	Ctrl+Shift+F4
+233	1	46	0x100000	Cmd+M chord
+234	1	46	0x180000	Cmd+Opt+M chord
+237	1	3	0x840000	Ctrl+Globe+F (full screen)
+238	1	8	0x840000	Ctrl+Globe+C (centre)
+239	1	15	0x840000	Ctrl+Globe+R
+240	1	123	0x840000	macOS shortcut 240
+241	1	124	0x840000	macOS shortcut 241
+242	1	126	0x840000	macOS shortcut 242
+243	1	125	0x840000	macOS shortcut 243
+248	1	123	0x860000	macOS shortcut 248
+249	1	124	0x860000	macOS shortcut 249
+250	1	126	0x860000	macOS shortcut 250
+251	1	125	0x860000	macOS shortcut 251
+252	1	123	0x8e0000	macOS shortcut 252
+253	1	124	0x8e0000	macOS shortcut 253
+254	1	126	0x8e0000	macOS shortcut 254
+255	1	125	0x8e0000	macOS shortcut 255
+1000	1	12	0x100000	Cmd+Q (quit)
+1001	1	4	0x100000	Cmd+H (hide)
+1002	1	4	0x180000	Cmd+Opt+H (hide others)
+1003	1	46	0x100000	Cmd+M (minimise)
+1004	1	13	0x100000	Cmd+W (close)
+1005	1	3	0x140000	Ctrl+Cmd+F (full screen)
+1006	1	12	0x140000	Ctrl+Cmd+Q (lock screen)
+1007	1	49	0x140000	Ctrl+Cmd+Space (characters)
+1008	1	14	0x800000	Globe+E (emoji)
+1009	1	103	0x100000	Cmd+F11
+1010	1	48	0x40000	Ctrl+Tab
+1011	1	160	0x800000	Mission Control key (F3)
+1012	1	160	0x900000	Cmd+Mission Control key
+1013	1	177	0x800000	Spotlight key (F4)
+1014	1	176	0x800000	Dictation key (F5)
+1015	1	178	0x800000	Do Not Disturb key (F6)
+1016	1	131	0x800000	Launchpad key
+1017	1	130	0x800000	Dashboard key
+1018	1	122	0x800000	F1
+1019	1	122	0x820000	Shift+F1
+1020	1	122	0x840000	Ctrl+F1
+1021	1	122	0x860000	Shift+Ctrl+F1
+1022	1	122	0x880000	Opt+F1
+1023	1	122	0x8a0000	Shift+Opt+F1
+1024	1	122	0x8c0000	Ctrl+Opt+F1
+1025	1	122	0x8e0000	Shift+Ctrl+Opt+F1
+1026	1	122	0x900000	Cmd+F1
+1027	1	122	0x920000	Shift+Cmd+F1
+1028	1	122	0x940000	Ctrl+Cmd+F1
+1029	1	122	0x960000	Shift+Ctrl+Cmd+F1
+1030	1	122	0x980000	Opt+Cmd+F1
+1031	1	122	0x9a0000	Shift+Opt+Cmd+F1
+1032	1	122	0x9c0000	Ctrl+Opt+Cmd+F1
+1033	1	122	0x9e0000	Shift+Ctrl+Opt+Cmd+F1
+1034	1	120	0x800000	F2
+1035	1	120	0x820000	Shift+F2
+1036	1	120	0x840000	Ctrl+F2
+1037	1	120	0x860000	Shift+Ctrl+F2
+1038	1	120	0x880000	Opt+F2
+1039	1	120	0x8a0000	Shift+Opt+F2
+1040	1	120	0x8c0000	Ctrl+Opt+F2
+1041	1	120	0x8e0000	Shift+Ctrl+Opt+F2
+1042	1	120	0x900000	Cmd+F2
+1043	1	120	0x920000	Shift+Cmd+F2
+1044	1	120	0x940000	Ctrl+Cmd+F2
+1045	1	120	0x960000	Shift+Ctrl+Cmd+F2
+1046	1	120	0x980000	Opt+Cmd+F2
+1047	1	120	0x9a0000	Shift+Opt+Cmd+F2
+1048	1	120	0x9c0000	Ctrl+Opt+Cmd+F2
+1049	1	120	0x9e0000	Shift+Ctrl+Opt+Cmd+F2
+1050	1	99	0x800000	F3
+1051	1	99	0x820000	Shift+F3
+1052	1	99	0x840000	Ctrl+F3
+1053	1	99	0x860000	Shift+Ctrl+F3
+1054	1	99	0x880000	Opt+F3
+1055	1	99	0x8a0000	Shift+Opt+F3
+1056	1	99	0x8c0000	Ctrl+Opt+F3
+1057	1	99	0x8e0000	Shift+Ctrl+Opt+F3
+1058	1	99	0x900000	Cmd+F3
+1059	1	99	0x920000	Shift+Cmd+F3
+1060	1	99	0x940000	Ctrl+Cmd+F3
+1061	1	99	0x960000	Shift+Ctrl+Cmd+F3
+1062	1	99	0x980000	Opt+Cmd+F3
+1063	1	99	0x9a0000	Shift+Opt+Cmd+F3
+1064	1	99	0x9c0000	Ctrl+Opt+Cmd+F3
+1065	1	99	0x9e0000	Shift+Ctrl+Opt+Cmd+F3
+1066	1	118	0x800000	F4
+1067	1	118	0x820000	Shift+F4
+1068	1	118	0x840000	Ctrl+F4
+1069	1	118	0x860000	Shift+Ctrl+F4
+1070	1	118	0x880000	Opt+F4
+1071	1	118	0x8a0000	Shift+Opt+F4
+1072	1	118	0x8c0000	Ctrl+Opt+F4
+1073	1	118	0x8e0000	Shift+Ctrl+Opt+F4
+1074	1	118	0x900000	Cmd+F4
+1075	1	118	0x920000	Shift+Cmd+F4
+1076	1	118	0x940000	Ctrl+Cmd+F4
+1077	1	118	0x960000	Shift+Ctrl+Cmd+F4
+1078	1	118	0x980000	Opt+Cmd+F4
+1079	1	118	0x9a0000	Shift+Opt+Cmd+F4
+1080	1	118	0x9c0000	Ctrl+Opt+Cmd+F4
+1081	1	118	0x9e0000	Shift+Ctrl+Opt+Cmd+F4
+1082	1	96	0x800000	F5
+1083	1	96	0x820000	Shift+F5
+1084	1	96	0x840000	Ctrl+F5
+1085	1	96	0x860000	Shift+Ctrl+F5
+1086	1	96	0x880000	Opt+F5
+1087	1	96	0x8a0000	Shift+Opt+F5
+1088	1	96	0x8c0000	Ctrl+Opt+F5
+1089	1	96	0x8e0000	Shift+Ctrl+Opt+F5
+1090	1	96	0x900000	Cmd+F5
+1091	1	96	0x920000	Shift+Cmd+F5
+1092	1	96	0x940000	Ctrl+Cmd+F5
+1093	1	96	0x960000	Shift+Ctrl+Cmd+F5
+1094	1	96	0x980000	Opt+Cmd+F5
+1095	1	96	0x9a0000	Shift+Opt+Cmd+F5
+1096	1	96	0x9c0000	Ctrl+Opt+Cmd+F5
+1097	1	96	0x9e0000	Shift+Ctrl+Opt+Cmd+F5
+1098	1	97	0x800000	F6
+1099	1	97	0x820000	Shift+F6
+1100	1	97	0x840000	Ctrl+F6
+1101	1	97	0x860000	Shift+Ctrl+F6
+1102	1	97	0x880000	Opt+F6
+1103	1	97	0x8a0000	Shift+Opt+F6
+1104	1	97	0x8c0000	Ctrl+Opt+F6
+1105	1	97	0x8e0000	Shift+Ctrl+Opt+F6
+1106	1	97	0x900000	Cmd+F6
+1107	1	97	0x920000	Shift+Cmd+F6
+1108	1	97	0x940000	Ctrl+Cmd+F6
+1109	1	97	0x960000	Shift+Ctrl+Cmd+F6
+1110	1	97	0x980000	Opt+Cmd+F6
+1111	1	97	0x9a0000	Shift+Opt+Cmd+F6
+1112	1	97	0x9c0000	Ctrl+Opt+Cmd+F6
+1113	1	97	0x9e0000	Shift+Ctrl+Opt+Cmd+F6
+1114	1	98	0x800000	F7
+1115	1	98	0x820000	Shift+F7
+1116	1	98	0x840000	Ctrl+F7
+1117	1	98	0x860000	Shift+Ctrl+F7
+1118	1	98	0x880000	Opt+F7
+1119	1	98	0x8a0000	Shift+Opt+F7
+1120	1	98	0x8c0000	Ctrl+Opt+F7
+1121	1	98	0x8e0000	Shift+Ctrl+Opt+F7
+1122	1	98	0x900000	Cmd+F7
+1123	1	98	0x920000	Shift+Cmd+F7
+1124	1	98	0x940000	Ctrl+Cmd+F7
+1125	1	98	0x960000	Shift+Ctrl+Cmd+F7
+1126	1	98	0x980000	Opt+Cmd+F7
+1127	1	98	0x9a0000	Shift+Opt+Cmd+F7
+1128	1	98	0x9c0000	Ctrl+Opt+Cmd+F7
+1129	1	98	0x9e0000	Shift+Ctrl+Opt+Cmd+F7
+1130	1	100	0x800000	F8
+1131	1	100	0x820000	Shift+F8
+1132	1	100	0x840000	Ctrl+F8
+1133	1	100	0x860000	Shift+Ctrl+F8
+1134	1	100	0x880000	Opt+F8
+1135	1	100	0x8a0000	Shift+Opt+F8
+1136	1	100	0x8c0000	Ctrl+Opt+F8
+1137	1	100	0x8e0000	Shift+Ctrl+Opt+F8
+1138	1	100	0x900000	Cmd+F8
+1139	1	100	0x920000	Shift+Cmd+F8
+1140	1	100	0x940000	Ctrl+Cmd+F8
+1141	1	100	0x960000	Shift+Ctrl+Cmd+F8
+1142	1	100	0x980000	Opt+Cmd+F8
+1143	1	100	0x9a0000	Shift+Opt+Cmd+F8
+1144	1	100	0x9c0000	Ctrl+Opt+Cmd+F8
+1145	1	100	0x9e0000	Shift+Ctrl+Opt+Cmd+F8
+1146	1	101	0x800000	F9
+1147	1	101	0x820000	Shift+F9
+1148	1	101	0x840000	Ctrl+F9
+1149	1	101	0x860000	Shift+Ctrl+F9
+1150	1	101	0x880000	Opt+F9
+1151	1	101	0x8a0000	Shift+Opt+F9
+1152	1	101	0x8c0000	Ctrl+Opt+F9
+1153	1	101	0x8e0000	Shift+Ctrl+Opt+F9
+1154	1	101	0x900000	Cmd+F9
+1155	1	101	0x920000	Shift+Cmd+F9
+1156	1	101	0x940000	Ctrl+Cmd+F9
+1157	1	101	0x960000	Shift+Ctrl+Cmd+F9
+1158	1	101	0x980000	Opt+Cmd+F9
+1159	1	101	0x9a0000	Shift+Opt+Cmd+F9
+1160	1	101	0x9c0000	Ctrl+Opt+Cmd+F9
+1161	1	101	0x9e0000	Shift+Ctrl+Opt+Cmd+F9
+1162	1	109	0x800000	F10
+1163	1	109	0x820000	Shift+F10
+1164	1	109	0x840000	Ctrl+F10
+1165	1	109	0x860000	Shift+Ctrl+F10
+1166	1	109	0x880000	Opt+F10
+1167	1	109	0x8a0000	Shift+Opt+F10
+1168	1	109	0x8c0000	Ctrl+Opt+F10
+1169	1	109	0x8e0000	Shift+Ctrl+Opt+F10
+1170	1	109	0x900000	Cmd+F10
+1171	1	109	0x920000	Shift+Cmd+F10
+1172	1	109	0x940000	Ctrl+Cmd+F10
+1173	1	109	0x960000	Shift+Ctrl+Cmd+F10
+1174	1	109	0x980000	Opt+Cmd+F10
+1175	1	109	0x9a0000	Shift+Opt+Cmd+F10
+1176	1	109	0x9c0000	Ctrl+Opt+Cmd+F10
+1177	1	109	0x9e0000	Shift+Ctrl+Opt+Cmd+F10
+1178	1	103	0x800000	F11
+1179	1	103	0x820000	Shift+F11
+1180	1	103	0x840000	Ctrl+F11
+1181	1	103	0x860000	Shift+Ctrl+F11
+1182	1	103	0x880000	Opt+F11
+1183	1	103	0x8a0000	Shift+Opt+F11
+1184	1	103	0x8c0000	Ctrl+Opt+F11
+1185	1	103	0x8e0000	Shift+Ctrl+Opt+F11
+1186	1	103	0x900000	Cmd+F11
+1187	1	103	0x920000	Shift+Cmd+F11
+1188	1	103	0x940000	Ctrl+Cmd+F11
+1189	1	103	0x960000	Shift+Ctrl+Cmd+F11
+1190	1	103	0x980000	Opt+Cmd+F11
+1191	1	103	0x9a0000	Shift+Opt+Cmd+F11
+1192	1	103	0x9c0000	Ctrl+Opt+Cmd+F11
+1193	1	103	0x9e0000	Shift+Ctrl+Opt+Cmd+F11
+1194	1	111	0x800000	F12
+1195	1	111	0x820000	Shift+F12
+1196	1	111	0x840000	Ctrl+F12
+1197	1	111	0x860000	Shift+Ctrl+F12
+1198	1	111	0x880000	Opt+F12
+1199	1	111	0x8a0000	Shift+Opt+F12
+1200	1	111	0x8c0000	Ctrl+Opt+F12
+1201	1	111	0x8e0000	Shift+Ctrl+Opt+F12
+1202	1	111	0x900000	Cmd+F12
+1203	1	111	0x920000	Shift+Cmd+F12
+1204	1	111	0x940000	Ctrl+Cmd+F12
+1205	1	111	0x960000	Shift+Ctrl+Cmd+F12
+1206	1	111	0x980000	Opt+Cmd+F12
+1207	1	111	0x9a0000	Shift+Opt+Cmd+F12
+1208	1	111	0x9c0000	Ctrl+Opt+Cmd+F12
+1209	1	111	0x9e0000	Shift+Ctrl+Opt+Cmd+F12

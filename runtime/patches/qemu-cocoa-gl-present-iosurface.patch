@@ -1,0 +1,506 @@
+From: OmacVM
+Subject: [PATCH] cocoa: show GL frames as IOSurfaces
+
+With gl=on the window's CAOpenGLLayer drew the guest's scanout on the
+main thread, inside drawInCGLContext, holding the BQL: every frame the
+main thread waited for QEMU's lock and QEMU waited for the main thread.
+
+Draw the scanout into one of three IOSurfaces instead, on QEMU's thread
+with a context of its own, and show that surface as the layer's contents.
+A serial queue waits for the GPU to finish a surface before Core Animation
+gets it (testing the fence and napping 100 us, as Apple's
+glClientWaitSync would spin a core); a surface is reused only once Core
+Animation no longer uses it (IOSurfaceIsInUse). The main thread no longer
+takes the BQL to draw. Core Animation composites the surface directly. At
+most one surface is drawn per display refresh (a timer catches up with the
+newest frame), so a guest that flushes thousands of times a second costs
+no more than that.
+
+The guest sets the scanout size, so it must not set the Mac's memory use:
+the surfaces are capped at the largest display's pixels (a larger scanout
+is drawn scaled down; no window can show more), and they are made again
+at most twice a second. A guest that switches between two sizes on every
+frame gets its frames scaled into the surfaces it has, instead of three
+new surfaces per frame. Before, the only cap was 16384x16384 (3 x 1 GiB).
+
+PINGOUIN_GL_PRESENT=layer goes back to the CAOpenGLLayer path (GPU safe mode
+sets it); if the IOSurface contexts cannot be made, the window falls back
+to it as well. The log says which path the window took.
+Applies after qemu-cocoa-gl-present-on-flush.
+
+Upstream: not sent (changes how QEMU's Cocoa display draws).
+Test: a capture of the window matches the guest's grim (upright, colours);
+a guest switching between two resolutions in a loop keeps QEMU's memory
+flat; 30-minute soaks; GPU safe mode A/B in the app.
+
+diff --git a/meson.build b/meson.build
+index aa10c44..c23b0c5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1221,7 +1221,7 @@ if get_option('attr').allowed()
+ endif
+ 
+ cocoa = dependency('appleframeworks',
+-                   modules: ['Cocoa', 'Carbon', 'CoreVideo', 'OpenGL', 'QuartzCore'],
++                   modules: ['Cocoa', 'Carbon', 'CoreVideo', 'IOSurface', 'OpenGL', 'QuartzCore'],
+                    required: get_option('cocoa'))
+ 
+ vmnet = dependency('appleframeworks', modules: 'vmnet', required: get_option('vmnet'))
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 2be99eb..ed8fd14 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -56,6 +56,10 @@
+ #include "qemu/error-report.h"
+ #include <Carbon/Carbon.h>
+ #include <AppKit/NSOpenGL.h>
++#ifdef CONFIG_OPENGL
++#import <IOSurface/IOSurface.h>
++#include <OpenGL/CGLIOSurface.h>
++#endif
+ #include "hw/core/cpu.h"
+ 
+ #ifdef CONFIG_EGL
+@@ -139,6 +143,7 @@ @interface QemuCGLLayer : CAOpenGLLayer
+ 
+ static bool gl_dirty;
+ static bool gl_present_pending;
++static bool cocoa_gl_present_iosurface_wanted(void);
+ static uint32_t gl_scanout_id;
+ static DisplayGLTextureBorrower gl_scanout_borrow;
+ static QEMUGLContext gl_view_ctx;
+@@ -447,6 +452,9 @@ - (BOOL) isMouseGrabbed;
+ - (BOOL) isKeyboardCaptured;
+ - (void) reenableEventTap;
+ - (void) raiseAllKeys;
++#ifdef CONFIG_OPENGL
++- (void)useCGLLayer;
++#endif
+ - (void) endPinchLocked;
+ - (void) resetPinchLocked:(bool)running;
+ - (bool) handlePinchLocked:(NSEvent *)event;
+@@ -539,7 +547,15 @@ - (id)initWithFrame:(NSRect)frameRect
+         [self setClipsToBounds:YES];
+ #endif
+         [self setWantsLayer:YES];
+-        if (cgl) {
++        if (cgl && cocoa_gl_present_iosurface_wanted()) {
++            /* Frames arrive as IOSurfaces (cocoa_gl_present). */
++            CALayer *layer = [[CALayer alloc] init];
++            [layer setOpaque:YES];
++            [layer setBackgroundColor:CGColorGetConstantColor(kCGColorBlack)];
++            [layer setContentsGravity:kCAGravityResize];
++            [self setLayer:layer];
++            [layer release];
++        } else if (cgl) {
+             QemuCGLLayer *layer = [[QemuCGLLayer alloc] init];
+             [self setLayer:layer];
+             [layer release];
+@@ -577,6 +593,20 @@ - (BOOL)wantsUpdateLayer
+ {
+     return display_opengl;
+ }
++
++- (void)useCGLLayer
++{
++    QemuCGLLayer *layer = [[QemuCGLLayer alloc] init];
++    [cursorLayer removeFromSuperlayer];
++    [self setLayer:layer];
++    [layer addSublayer:cursorLayer];
++    [layer release];
++}
++
++- (void)updateLayer
++{
++    /* The GL paths set the layer's contents or draw it themselves. */
++}
+ #endif
+ 
+ - (void) viewDidMoveToWindow
+@@ -2841,6 +2871,339 @@ static void cocoa_gl_render(void)
+     gl_dirty = false;
+ }
+ 
++/*
++ * IOSurface present: on QEMU's thread (BQL held) the guest's scanout is
++ * drawn into one of three IOSurfaces with a context of its own, and the
++ * window's layer shows that surface. No GL drawing on the main thread, no
++ * BQL there, and Core Animation composites the surface as it is.
++ *
++ * Threads: cocoa_gl_present() runs with the BQL; present_queue waits for
++ * the GPU to finish a surface, then the main queue sets it as the layer's
++ * contents. A surface is reused only once Core Animation is done with it.
++ * PINGOUIN_GL_PRESENT=layer goes back to the CAOpenGLLayer path.
++ *
++ * The guest picks the scanout size, so it must not pick the Mac's memory:
++ * the surfaces are never larger than the largest display (a bigger
++ * scanout is drawn scaled down; the window could not show more anyway),
++ * and they are made again at most twice a second. A guest that flips
++ * between two sizes gets its frames scaled into the surfaces it has.
++ */
++#define PRESENT_SURFACES 3
++#define PRESENT_REALLOC_NS (500 * SCALE_MS)
++
++static int present_mode = -1;          /* 1: IOSurface, 0: CAOpenGLLayer */
++static CGLContextObj present_ctx;      /* QEMU thread: draws the surfaces */
++static CGLContextObj present_wait_ctx; /* present_queue: waits for the GPU */
++static QemuGLShader *present_gls;
++static GLuint present_fbo;
++static IOSurfaceRef present_surf[PRESENT_SURFACES];
++static GLuint present_tex[PRESENT_SURFACES];
++static uint32_t present_w, present_h;
++static unsigned present_next;
++static dispatch_queue_t present_queue;
++static QEMUTimer *present_timer;
++static int64_t present_last_ns;
++static int64_t present_period_ns;
++static int64_t present_alloc_ns;       /* when the surfaces were made */
++static bool present_realloc_due;       /* surfaces of the wrong size */
++static uint64_t present_cap;           /* largest display: w << 32 | h */
++
++static bool cocoa_gl_present_iosurface_wanted(void)
++{
++    if (present_mode < 0) {
++        const char *m = getenv("PINGOUIN_GL_PRESENT");
++        present_mode = !(m && !strcmp(m, "layer"));
++    }
++    return present_mode == 1;
++}
++
++static void cocoa_gl_present_timer(void *opaque);
++
++/*
++ * Main thread: the largest display in pixels caps the surfaces; the
++ * fastest one sets how often a frame is drawn. Again when displays change.
++ */
++static void cocoa_gl_present_screens(void)
++{
++    uint32_t w = 1, h = 1;
++    NSInteger hz = 60;
++
++    for (NSScreen *screen in [NSScreen screens]) {
++        NSSize size = [screen frame].size;
++        CGFloat scale = [screen backingScaleFactor];
++        w = MAX(w, (uint32_t)MIN(ceil(size.width * scale), 16384));
++        h = MAX(h, (uint32_t)MIN(ceil(size.height * scale), 16384));
++        hz = MAX(hz, [screen maximumFramesPerSecond]);
++    }
++    qatomic_set(&present_cap, (uint64_t)w << 32 | h);
++    qatomic_set(&present_period_ns, NANOSECONDS_PER_SECOND / hz);
++}
++
++static bool cocoa_gl_present_init(void)
++{
++    CGLPixelFormatObj pf = cocoa_gl_create_cgl_pixel_format(32);
++    CGLContextObj prev = CGLGetCurrentContext();
++
++    if (CGLCreateContext(pf, gl_view_ctx, &present_ctx) != kCGLNoError ||
++        CGLCreateContext(pf, gl_view_ctx, &present_wait_ctx) != kCGLNoError) {
++        CGLDestroyPixelFormat(pf);
++        return false;
++    }
++    CGLDestroyPixelFormat(pf);
++
++    CGLSetCurrentContext(present_ctx);
++    present_gls = qemu_gl_init_shader();
++    glGenFramebuffers(1, &present_fbo);
++    CGLSetCurrentContext(prev);
++
++    present_queue = dispatch_queue_create("app.pingouin.present",
++        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
++                                                QOS_CLASS_USER_INTERACTIVE, 0));
++    present_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
++                                 cocoa_gl_present_timer, NULL);
++    /* At most one frame per refresh of the fastest display. */
++    cocoa_gl_present_screens();
++    [[NSNotificationCenter defaultCenter]
++        addObserverForName:NSApplicationDidChangeScreenParametersNotification
++                    object:nil
++                     queue:[NSOperationQueue mainQueue]
++                usingBlock:^(NSNotification *note) {
++        cocoa_gl_present_screens();
++    }];
++    return true;
++}
++
++static void cocoa_gl_present_free(void)
++{
++    for (int i = 0; i < PRESENT_SURFACES; i++) {
++        if (present_tex[i]) {
++            glDeleteTextures(1, &present_tex[i]);
++            present_tex[i] = 0;
++        }
++        if (present_surf[i]) {
++            CFRelease(present_surf[i]);
++            present_surf[i] = NULL;
++        }
++    }
++    present_w = present_h = 0;
++}
++
++/*
++ * present_ctx is current. Surfaces for a w x h frame, capped at the
++ * largest display. Made again at most every PRESENT_REALLOC_NS: until
++ * then the frame is drawn scaled into the surfaces there are, and the
++ * timer comes back to make the right ones.
++ */
++static bool cocoa_gl_present_alloc(uint32_t w, uint32_t h)
++{
++    uint64_t cap = qatomic_read(&present_cap);
++    uint32_t cap_w = cap >> 32, cap_h = (uint32_t)cap;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++    if (!w || !h) {
++        return false;
++    }
++    if (w > cap_w || h > cap_h) {
++        double scale = MIN((double)cap_w / w, (double)cap_h / h);
++        w = MAX(1, (uint32_t)(w * scale));
++        h = MAX(1, (uint32_t)(h * scale));
++    }
++    if (present_surf[0]) {
++        if (w == present_w && h == present_h) {
++            return true;
++        }
++        if (now - present_alloc_ns < PRESENT_REALLOC_NS) {
++            present_realloc_due = true;
++            timer_mod(present_timer, present_alloc_ns + PRESENT_REALLOC_NS);
++            return true;
++        }
++    }
++    cocoa_gl_present_free();
++    present_alloc_ns = now;
++    present_realloc_due = false;
++
++    NSDictionary *props = @{
++        (id)kIOSurfaceWidth: @(w),
++        (id)kIOSurfaceHeight: @(h),
++        (id)kIOSurfaceBytesPerElement: @4,
++        (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
++    };
++    for (int i = 0; i < PRESENT_SURFACES; i++) {
++        present_surf[i] = IOSurfaceCreate((CFDictionaryRef)props);
++        if (!present_surf[i]) {
++            cocoa_gl_present_free();
++            return false;
++        }
++        glGenTextures(1, &present_tex[i]);
++        glBindTexture(GL_TEXTURE_RECTANGLE, present_tex[i]);
++        if (CGLTexImageIOSurface2D(present_ctx, GL_TEXTURE_RECTANGLE,
++                                   GL_RGBA, w, h, GL_BGRA,
++                                   GL_UNSIGNED_INT_8_8_8_8_REV,
++                                   present_surf[i], 0) != kCGLNoError) {
++            cocoa_gl_present_free();
++            return false;
++        }
++    }
++    glBindTexture(GL_TEXTURE_RECTANGLE, 0);
++    present_w = w;
++    present_h = h;
++    present_next = 0;
++    return true;
++}
++
++/* QEMU thread, BQL held. Returns false when nothing could be shown. */
++static bool cocoa_gl_present(void)
++{
++    GLuint src;
++    bool flip;
++    uint32_t w, h;
++    GLint filter = qatomic_read(&zoom_interpolation) ? GL_LINEAR : GL_NEAREST;
++
++    if (gl_scanout_borrow) {
++        DisplayGLTexture texture = gl_scanout_borrow(gl_scanout_id);
++        if (!texture.id) {
++            return false;
++        }
++        src = texture.id;
++        w = texture.width;
++        h = texture.height;
++        /* The surface's first row is the top of the window. */
++        flip = !texture.y_0_top;
++    } else if (surface && surface->texture) {
++        src = surface->texture;
++        w = surface_width(surface);
++        h = surface_height(surface);
++        flip = true;
++    } else {
++        return false;
++    }
++
++    CGLContextObj prev = CGLGetCurrentContext();
++    if (prev) {
++        /* What the guest drew must reach the GPU before we read it. */
++        glFlush();
++    }
++    CGLSetCurrentContext(present_ctx);
++
++    if (!cocoa_gl_present_alloc(w, h)) {
++        CGLSetCurrentContext(prev);
++        return false;
++    }
++
++    /* The next surface Core Animation is not showing or reading. */
++    unsigned i;
++    for (i = 0; i < PRESENT_SURFACES; i++) {
++        unsigned n = (present_next + i) % PRESENT_SURFACES;
++        if (!IOSurfaceIsInUse(present_surf[n])) {
++            break;
++        }
++    }
++    if (i == PRESENT_SURFACES) {
++        /* All busy: try again after the next refresh. */
++        CGLSetCurrentContext(prev);
++        gl_dirty = true;
++        timer_mod(present_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
++                                 qatomic_read(&present_period_ns));
++        return true;
++    }
++    unsigned n = (present_next + i) % PRESENT_SURFACES;
++    present_next = (n + 1) % PRESENT_SURFACES;
++
++    glBindFramebuffer(GL_FRAMEBUFFER, present_fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                           GL_TEXTURE_RECTANGLE, present_tex[n], 0);
++    glViewport(0, 0, present_w, present_h);
++    glDisable(GL_BLEND);
++    glDisable(GL_SCISSOR_TEST);
++    /* The guest's alpha means nothing here: the window is opaque. */
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    glClearColor(0, 0, 0, 1);
++    glClear(GL_COLOR_BUFFER_BIT);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, src);
++    /* Pixel for pixel, unless the frame had to be scaled (see alloc). */
++    GLint blit_filter = (w == present_w && h == present_h) ? GL_NEAREST
++                                                           : GL_LINEAR;
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, blit_filter);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, blit_filter);
++    qemu_gl_run_texture_blit(present_gls, flip);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    glFlush();
++    CGLSetCurrentContext(prev);
++    gl_dirty = false;
++
++    IOSurfaceRef surf = present_surf[n];
++    CFRetain(surf);
++    /* Core Animation must not see the surface before the GPU wrote it. */
++    IOSurfaceIncrementUseCount(surf);
++    dispatch_async(present_queue, ^{
++        CGLSetCurrentContext(present_wait_ctx);
++        if (sync) {
++            /*
++             * Apple's glClientWaitSync spins a core until the fence
++             * signals: test it, and nap 100 us between tests (the queue is
++             * user-interactive, so naps are not stretched). At most 1 s,
++             * as before.
++             */
++            for (int t = 0; t < 10000; t++) {
++                if (glClientWaitSync(sync, 0, 0) != GL_TIMEOUT_EXPIRED) {
++                    break;
++                }
++                g_usleep(100);
++            }
++            glDeleteSync(sync);
++        }
++        CGLSetCurrentContext(NULL);
++        dispatch_async(dispatch_get_main_queue(), ^{
++            CALayer *layer = [cocoaView layer];
++            [CATransaction begin];
++            [CATransaction setDisableActions:YES];
++            NSString *f = filter == GL_LINEAR ? kCAFilterLinear : kCAFilterNearest;
++            [layer setMagnificationFilter:f];
++            [layer setMinificationFilter:f];
++            [layer setContents:(id)surf];
++            [CATransaction commit];
++            IOSurfaceDecrementUseCount(surf);
++            CFRelease(surf);
++        });
++    });
++    present_last_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    return true;
++}
++
++/*
++ * QEMU thread, BQL held. The guest may flush far more often than the
++ * display refreshes (a full-screen app scanned out directly): draw at
++ * most one surface per refresh, the newest, when the period is over.
++ */
++static void cocoa_gl_present_request(void)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    int64_t period = qatomic_read(&present_period_ns);
++
++    gl_dirty = true;
++    if (now - present_last_ns >= period) {
++        timer_del(present_timer);
++        cocoa_gl_present();
++    } else if (!timer_pending(present_timer) ||
++               (int64_t)timer_expire_time_ns(present_timer) >
++                   present_last_ns + period) {
++        timer_mod(present_timer, present_last_ns + period);
++    }
++}
++
++static void cocoa_gl_present_timer(void *opaque)
++{
++    /* A new frame, or the last one drawn into surfaces of the wrong size. */
++    if (gl_dirty || present_realloc_due) {
++        cocoa_gl_present();
++    }
++}
++
+ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
+ {
+     cocoa_refresh(dcl);
+@@ -2865,6 +3228,10 @@ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
+         }
+ #endif
+ 
++        if (present_ctx) {
++            cocoa_gl_present_request();
++            return;
++        }
+         dispatch_async(dispatch_get_main_queue(), ^{
+             [[cocoaView layer] setNeedsDisplay];
+         });
+@@ -2910,9 +3277,15 @@ static void cocoa_gl_scanout_flush(DisplayChangeListener *dcl,
+         on_tick = getenv("PINGOUIN_GL_PRESENT_ON_TICK") != NULL;
+     }
+ #ifdef CONFIG_EGL
+-    if (!egl_surface)
++    if (egl_surface) {
++        on_tick = 1;
++    }
+ #endif
+-    if (!on_tick && !qatomic_xchg(&gl_present_pending, true)) {
++    if (on_tick) {
++        /* cocoa_gl_refresh draws it. */
++    } else if (present_ctx) {
++        cocoa_gl_present_request();
++    } else if (!qatomic_xchg(&gl_present_pending, true)) {
+         dispatch_async(dispatch_get_main_queue(), ^{
+             qatomic_set(&gl_present_pending, false);
+             [[cocoaView layer] setNeedsDisplay];
+@@ -3041,6 +3414,17 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
+ 
+         dgc.gls = qemu_gl_init_shader();
+         dcl.ops = &dcl_gl_ops;
++        if (cocoa_gl_present_iosurface_wanted() &&
++#ifdef CONFIG_EGL
++            !egl_surface &&
++#endif
++            opts->gl != DISPLAY_GL_MODE_ES && !cocoa_gl_present_init()) {
++            error_report("cocoa: IOSurface present failed, drawing with OpenGL");
++            present_mode = 0;
++            [cocoaView useCGLLayer];
++        }
++        info_report("cocoa: GL frames shown %s",
++                    present_ctx ? "as IOSurfaces" : "with a CAOpenGLLayer");
+ 
+         for (unsigned int index = 0; ; index++) {
+             QemuConsole *con = qemu_console_lookup_by_index(index);

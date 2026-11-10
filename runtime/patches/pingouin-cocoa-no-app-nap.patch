@@ -1,0 +1,57 @@
+From: OmacVM
+Subject: [PATCH] cocoa: no App Nap while the VM runs
+
+What: QEMU's window process holds an NSProcessInfo activity
+(NSActivityUserInitiatedAllowingIdleSystemSleep) from the start of its run
+loop; PINGOUIN_APP_NAP=1 leaves it out. QEMU's log says which.
+
+Why: macOS naps an app none of whose windows can be seen: the screen
+locked, the VM's full screen on another Space, the window minimized or
+covered. A napped QEMU runs every thread (vCPUs, main loop) at background
+priority 4 and the guest crawls. Measured on an M4 Max, screen locked,
+4 vCPUs busy in the guest (python loop counter, 40 s): 10-100 million
+loops/s napped, 490-590 with the activity (as with a visible window); all
+QEMU threads at priority 4 napped, 28-31 with it. UTM's QEMU (a helper without
+windows) and Parallels' VM process are never napped. The Mac can still
+sleep when idle (AllowingIdleSystemSleep).
+
+Upstream: not sent (QEMU's cocoa UI is for a desktop window; a policy choice).
+Test: src/tests/app-nap.sh (offline); QEMU's log line; the live check in
+the test's header (vCPU thread priority with the window out of sight).
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -4260,8 +4260,33 @@
+     }
+ }
+ 
++/*
++ * Pingouin: no App Nap. macOS naps an app when none of its windows can be seen
++ * (the screen locked, the VM's full screen on another Space, the window
++ * minimized or covered): every QEMU thread drops to background priority and
++ * the guest runs at 2-20 % of its speed (measured on an M4 Max with the
++ * screen locked: 4 busy vCPUs did 10-100 instead of ~550 million loops/s). A
++ * VM keeps working while nobody looks at it, as in UTM or Parallels. Idle
++ * system sleep stays allowed. PINGOUIN_APP_NAP=1 lets macOS nap it (tests).
++ */
++static void pingouin_no_app_nap(void)
++{
++    static id activity;
++    const char *v = getenv("PINGOUIN_APP_NAP");
++
++    if (v && strcmp(v, "1") == 0) {
++        info_report("Pingouin: App Nap: allowed (PINGOUIN_APP_NAP=1)");
++        return;
++    }
++    activity = [[[NSProcessInfo processInfo]
++        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
++                          reason:@"the virtual machine runs"] retain];
++    info_report("Pingouin: App Nap: off while the VM runs");
++}
++
+ static int cocoa_main(void)
+ {
++    pingouin_no_app_nap();
+     COCOA_DEBUG("Main thread: entering OSX run loop\n");
+     [NSApp run];
+     COCOA_DEBUG("Main thread: left OSX run loop, which should never happen\n");

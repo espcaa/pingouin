@@ -1,0 +1,379 @@
+From: OmacVM
+Subject: [PATCH] audio/sdl: playback buffers the Mac's output takes (#548)
+
+What: the playback open (qemu-sdl-audio-playback-thread.patch) asks SDL
+for the frames audio/pingouin-sdl-out-size.h works out: the voice's own
+(256 on the sound's own thread, 512 on QEMU's main loop and on the own
+thread started with a wireless output), raised to the launcher's size for
+the Mac's output now (PINGOUIN_AUDIO_OUT_FRAMES_FILE: 512 for Bluetooth and
+AirPlay outputs) and to a size that played after a refused one. When
+CoreAudio's queue does not start ("CoreAudio error (AudioQueueStart): N"),
+the same open tries the next size at once (512, then 1024, ...), up to
+what the voice's ring can feed, each with its own 3 s limit; the size
+that played stays while the Mac's output stays, a refused one is not
+tried again; when every size was refused, no new start until the Mac's
+output changes (failed starts in a row may leave coreaudiod silent;
+without the launcher's size file: 30 s). The app writes the size file
+anew at every change of the Mac's
+output, and a new file clears what the last output refused. While a
+device runs, a new launcher
+size (the Mac's output changed to or from AirPods) opens the same device
+again with it: the old device is closed first on the open's thread (SDL3
+shares an open physical device, so the new size would not take; the
+close counts against the open's 3 s limit, so a hung close drops the
+sound and says so as a hung open does), the sound waits in the ring
+meanwhile, and a new size that fails to open is
+tried again every 5 s while the guest plays. The size file is read again
+only when it changed (inode, time, size), with the route check every
+250 ms: a stat() on the sound's thread, about 1 us (3 us at most in
+20000 on the Mac mini; the route file's read beside it takes about 9 us).
+qemu.log:
+  OmacVM: sound: playback buffers: N frames (the sound path's own|the launcher's size for the Mac's output|the Mac's output refused M|the Mac's output refused smaller ones before)
+  OmacVM: sound: the Mac's output did not start with N-frame buffers (<SDL error>); trying M frames
+  OmacVM: sound: the Mac's output refused every buffer size up to N frames; the VM goes on without sound
+  OmacVM: sound: the Mac's output changed: playback buffers N -> M frames
+omacvm check reads the first and third ("sound buffers").
+
+Why: with AirPods (A2DP) as the Mac's output the VM had no sound on the
+sound's own thread (#548, @maxschoenberger): AudioQueueStart -66681
+(kAudioQueueErr_CannotStart) at every stream start. SDL3 opens CoreAudio's
+queue at QEMU's rate (at least 44.1 kHz) with QEMU's frames per callback:
+48 kHz, 6 x 256 frames on the own thread; 44.1 kHz, 4 x 512 on the main
+loop, which played. In AudioToolbox (macOS 27) -66681 comes from
+AudioQueueObject::StartRunning ("last sample time not set": the queue was
+not rendered in the device's first IO cycle) or AQMEIO_Base::StartIO_Sync
+(no IO cycle within 15 s). A start with a wireless output gets the main
+loop's queue from the launcher (AudioPath.threadWirelessOptions); this
+covers a switch while the VM runs and any other output that refuses.
+
+Applies after qemu-sdl-audio-playback-thread.patch and
+qemu-sdl-audio-out-size-logic.patch.
+Upstream: OmacVM only (builds on its own SDL audio patches).
+Test: app/runtime/Tests/audio/test-out-size.sh audio/sdlaudio.c (the
+runtime build runs it), Tests/audio/refuse-small-start.c (an AudioQueueStart
+that refuses small buffers with -66681, injected into a test runtime; the
+lane's runs are in the PR).
+
+--- a/audio/sdlaudio.c
++++ b/audio/sdlaudio.c
+@@ -41,6 +41,7 @@
+ #endif
+ 
+ #include "audio_int.h"
++#include "pingouin-sdl-out-size.h"
+ 
+ #define TYPE_AUDIO_SDL "audio-sdl"
+ OBJECT_DECLARE_SIMPLE_TYPE(AudioSdl, AUDIO_SDL)
+@@ -71,6 +72,13 @@ typedef struct SDLVoiceOut {
+     bool silent;                /* the Mac's audio device does not answer */
+     bool dropping;              /* no device: the sound goes nowhere */
+     RateCtl drop_rate;
++    unsigned open_frames;       /* frames per callback of the open device */
++    unsigned out_floor;         /* a size that played after a refused one */
++    unsigned out_hint;          /* the launcher's size for the Mac's output */
++    unsigned out_logged;        /* the size qemu.log named last */
++    struct stat hint_stat;      /* of the launcher's size file, last read */
++    gint64 refused_until;       /* every size refused: no open before this
++                                 * (until the size file changes, if any) */
+ } SDLVoiceOut;
+ 
+ typedef struct SDLCapture SDLCapture;
+@@ -387,11 +395,22 @@ static void sdl_callback_in(void *opaque, Uint8 *buf, int len)
+  */
+ #define SDL_OUT_OPEN_TIMEOUT_US (3 * G_USEC_PER_SEC)
+ #define SDL_OUT_RETRY_US (5 * G_USEC_PER_SEC)
++/*
++ * After the Mac's output refused every size: no new start until the Mac's
++ * output changes (the launcher's new size file), or for this long when there
++ * is no size file (QEMU not started by the app). Failed starts in a row may
++ * leave coreaudiod itself silent (#548).
++ */
++#define SDL_OUT_REFUSED_US (30 * G_USEC_PER_SEC)
+ 
+ struct SDLOutOpen {
+-    /* Set before the thread starts. */
++    /* Set before the thread starts; the thread may raise spec.samples. */
+     SDL_AudioSpec spec;
+     char *device_name;
++    unsigned ring;              /* the voice's ring: callbacks up to half */
++    SDL_AudioDeviceID close_first;  /* the voice's device, quiesced */
++    unsigned refused;           /* the largest size the output refused */
++    bool refused_all;           /* ... and the ring takes no larger one */
+     /* Under sdl_out_lock. */
+     gint64 started;             /* when SDL got it, 0 while it waits */
+     bool done;
+@@ -438,6 +457,21 @@ static void *sdl_out_open_thread(void *opaque)
+     SDL_AudioDeviceID devid;
+     bool route_matches = false;
+     bool abandoned;
++    const char *err;
++    unsigned next;
++
++    /*
++     * A new size for the same output: SDL3 shares a physical device that is
++     * open, so the old one has to be closed before the new size can take.
++     * The time limit covers the close: a close that hangs (coreaudiod
++     * wedged) makes the voice drop the sound and say so, as a hung open.
++     */
++    if (op->close_first) {
++        qemu_mutex_lock(&sdl_out_lock);
++        op->started = g_get_monotonic_time();
++        qemu_mutex_unlock(&sdl_out_lock);
++        SDL_CloseAudioDevice(op->close_first);
++    }
+ 
+     /*
+      * A recording open may hold sdl_open_lock for minutes (a pending
+@@ -447,15 +481,52 @@ static void *sdl_out_open_thread(void *opaque)
+     qemu_mutex_lock(&sdl_open_lock);
+     qemu_mutex_unlock(&sdl_open_lock);
+     qemu_mutex_lock(&sdl_out_lock);
+-    op->started = g_get_monotonic_time();
++    if (!op->late) {
++        op->started = g_get_monotonic_time();
++    }
+     qemu_mutex_unlock(&sdl_out_lock);
+ 
+-    devid = sdl_open(&op->spec, &obtained, 0, op->device_name,
+-                     &route_matches, NULL);
+-    if (devid && !sdl_audio_specs_match(&op->spec, &obtained)) {
+-        warn_report("Requested SDL playback route has an incompatible format");
+-        SDL_CloseAudioDevice(devid);
+-        devid = 0;
++    /*
++     * Some outputs refuse to start a queue of small buffers (AirPods over
++     * A2DP: AudioQueueStart -66681 with 256-frame buffers at 48 kHz, #548;
++     * the main loop path's 512 at 44.1 kHz played). Then the next size at
++     * once, up to what the ring can feed.
++     */
++    for (;;) {
++        devid = sdl_open(&op->spec, &obtained, 0, op->device_name,
++                         &route_matches, NULL);
++        if (devid && !sdl_audio_specs_match(&op->spec, &obtained)) {
++            warn_report("Requested SDL playback route has an incompatible format");
++            SDL_CloseAudioDevice(devid);
++            devid = 0;
++            break;
++        }
++        if (devid) {
++            break;
++        }
++        err = SDL_GetError();
++        if (!pingouin_sdl_out_start_refused(err)) {
++            break;
++        }
++        op->refused = op->spec.samples;
++        next = pingouin_sdl_out_next(op->spec.samples, op->ring);
++        if (!next) {
++            op->refused_all = true;
++            error_report("Pingouin: sound: the Mac's output refused every buffer "
++                         "size up to %u frames; the VM goes on without sound",
++                         op->refused);
++            break;
++        }
++        error_report("Pingouin: sound: the Mac's output did not start with "
++                     "%u-frame buffers (%s); trying %u frames",
++                     op->refused, err, next);
++        op->spec.samples = next;
++        /* Each size has its own time limit: a slow refusal is no hang. */
++        qemu_mutex_lock(&sdl_out_lock);
++        if (!op->late) {
++            op->started = g_get_monotonic_time();
++        }
++        qemu_mutex_unlock(&sdl_out_lock);
+     }
+     if (devid) {
+         SDL_PauseAudioDevice(devid, 1);
+@@ -482,23 +553,83 @@ static void *sdl_out_open_thread(void *opaque)
+     return NULL;
+ }
+ 
+-/* Starts opening DEVICE_NAME (NULL: the Mac's default), taking it. */
+-static void sdl_out_start_open(SDLVoiceOut *sdl, char *device_name)
++/*
++ * The launcher's size for the Mac's output (PINGOUIN_AUDIO_OUT_FRAMES_FILE,
++ * written anew whenever the Mac's output changes), read again only when the
++ * file did: this runs on the sound's thread. A new file is another output:
++ * what an earlier one refused no longer counts.
++ */
++static void sdl_out_hint_read(SDLVoiceOut *sdl)
++{
++    const char *path = g_getenv("PINGOUIN_AUDIO_OUT_FRAMES_FILE");
++    g_autofree char *text = NULL;
++    struct stat st;
++
++    if (!path || !*path || stat(path, &st) != 0) {
++        memset(&sdl->hint_stat, 0, sizeof(sdl->hint_stat));
++        sdl->out_hint = 0;
++        return;
++    }
++    if (st.st_ino == sdl->hint_stat.st_ino &&
++        st.st_mtime == sdl->hint_stat.st_mtime &&
++        st.st_size == sdl->hint_stat.st_size) {
++        return;
++    }
++    sdl->hint_stat = st;
++    sdl->out_hint = 0;
++    sdl->out_floor = 0;
++    sdl->refused_until = 0;
++    if (st.st_size <= 16 && g_file_get_contents(path, &text, NULL, NULL)) {
++        sdl->out_hint = pingouin_sdl_out_parse_hint(text);
++    }
++}
++
++/* The frames per callback to open the Mac's output with now. */
++static unsigned sdl_out_want(SDLVoiceOut *sdl)
++{
++    return pingouin_sdl_out_frames(sdl->reopen_spec.samples,
++                                 MAX(sdl->out_floor, sdl->out_hint),
++                                 sdl->hw.samples);
++}
++
++static bool sdl_out_open_blocked(SDLVoiceOut *sdl)
+ {
+-    SDLOutOpen *op;
+-    QemuThread thread;
+     bool stuck;
+ 
+     qemu_mutex_lock(&sdl_out_lock);
+     stuck = sdl_out_stuck;
+     qemu_mutex_unlock(&sdl_out_lock);
+-    if (sdl->opening || stuck) {
++    return sdl->opening || stuck;
++}
++
++/*
++ * Starts opening DEVICE_NAME (NULL: the Mac's default), taking it; CLOSE_FIRST
++ * (quiesced) is closed on the way, before the open.
++ */
++static void sdl_out_start_open_closing(SDLVoiceOut *sdl, char *device_name,
++                                       SDL_AudioDeviceID close_first)
++{
++    SDLOutOpen *op;
++    QemuThread thread;
++
++    if (sdl_out_open_blocked(sdl)) {
+         g_free(device_name);
++        if (close_first) {
++            sdl_out_close_later(close_first);
++        }
+         return;
+     }
+ 
++    sdl_out_hint_read(sdl);
++    if (!close_first && g_get_monotonic_time() < sdl->refused_until) {
++        g_free(device_name);
++        return;
++    }
+     op = g_new0(SDLOutOpen, 1);
+     op->spec = sdl->reopen_spec;
++    op->spec.samples = sdl_out_want(sdl);
++    op->ring = sdl->hw.samples;
++    op->close_first = close_first;
+     op->device_name = device_name;
+     sdl->opening = op;
+     sdl->opening_late = false;
+@@ -507,6 +638,11 @@ static void sdl_out_start_open(SDLVoiceOut *sdl, char *device_name)
+                        QEMU_THREAD_DETACHED);
+ }
+ 
++static void sdl_out_start_open(SDLVoiceOut *sdl, char *device_name)
++{
++    sdl_out_start_open_closing(sdl, device_name, 0);
++}
++
+ /* The device the route file names, else the one last used. */
+ static void sdl_out_open_route(SDLVoiceOut *sdl)
+ {
+@@ -563,13 +699,28 @@ static void sdl_out_poll(SDLVoiceOut *sdl)
+ 
+     sdl->opening = NULL;
+     devid = op->devid;
++    if (op->refused) {
++        /* Not that size again this run: the larger one, or the last tried. */
++        sdl->out_floor = MAX(sdl->out_floor, op->refused_all ?
++                             op->refused : op->spec.samples);
++    }
++    if (op->refused_all) {
++        sdl->refused_until = pingouin_sdl_out_hold_until(sdl->hint_stat.st_ino != 0,
++                                                       now, SDL_OUT_REFUSED_US);
++        sdl->out_logged = 0;    /* the next size that plays is logged again */
++    }
+     if (!devid) {
+         /*
+          * sdl_open() said why. A device that failed fast is tried again when
+          * the guest starts its next stream; one that hung before it failed
+-         * (coreaudiod restarted) right away.
++         * (coreaudiod restarted) right away; one that refused every size
++         * every few seconds while the guest plays, which opens it only once
++         * the Mac's output changed (or, with no size file, the wait ran out:
++         * refused_until); a
++         * new size for a device that played (its old one is closed) too.
+          */
+-        sdl->next_open = sdl->opening_late ? now + SDL_OUT_RETRY_US : INT64_MAX;
++        sdl->next_open = sdl->opening_late || op->refused_all ||
++                         op->close_first ? now + SDL_OUT_RETRY_US : INT64_MAX;
+         sdl_out_free_open(op);
+         return;
+     }
+@@ -588,6 +739,23 @@ static void sdl_out_poll(SDLVoiceOut *sdl)
+         sdl->silent = false;
+         info_report("Pingouin: sound: the Mac's audio device works again");
+     }
++    sdl->open_frames = op->spec.samples;
++    if (sdl->open_frames != sdl->out_logged) {
++        sdl->out_logged = sdl->open_frames;
++        if (op->refused) {
++            info_report("Pingouin: sound: playback buffers: %u frames (the "
++                        "Mac's output refused %u)", sdl->open_frames,
++                        op->refused);
++        } else {
++            info_report("Pingouin: sound: playback buffers: %u frames (%s)",
++                        sdl->open_frames,
++                        sdl->open_frames == (unsigned)sdl->reopen_spec.samples ?
++                        "the sound path's own" :
++                        sdl->out_floor > sdl->out_hint ?
++                        "the Mac's output refused smaller ones before" :
++                        "the launcher's size for the Mac's output");
++        }
++    }
+     SDL_PauseAudioDevice(devid, 0);
+     if (old) {
+         sdl_out_close_later(old);
+@@ -605,10 +773,17 @@ static void sdl_release_out(SDLVoiceOut *sdl)
+     sdl->devid = 0;
+ }
+ 
+-/* Follow the route file: the new device runs before the old one closes. */
++/*
++ * Follow the route file: the new device runs before the old one closes.
++ * Follow the launcher's size for the Mac's output (it changed to or from
++ * AirPods): the same device again with the new size, the old one closed
++ * first; the sound waits in the ring meanwhile.
++ */
+ static void sdl_refresh_route_Out(SDLVoiceOut *sdl)
+ {
+     g_autofree char *requested = NULL;
++    SDL_AudioDeviceID old;
++    unsigned want;
+     bool present;
+ 
+     if (!sdl->devid || sdl->opening) {
+@@ -617,6 +792,17 @@ static void sdl_refresh_route_Out(SDLVoiceOut *sdl)
+     if (!sdl_route_check_due(&sdl->next_route_check)) {
+         return;
+     }
++    sdl_out_hint_read(sdl);
++    want = sdl_out_want(sdl);
++    if (want != sdl->open_frames && !sdl_out_open_blocked(sdl)) {
++        info_report("Pingouin: sound: the Mac's output changed: playback "
++                    "buffers %u -> %u frames", sdl->open_frames, want);
++        old = sdl->devid;
++        sdl_out_quiesce(old);
++        sdl->devid = 0;
++        sdl_out_start_open_closing(sdl, g_strdup(sdl->device_name), old);
++        return;
++    }
+     requested = sdl_route_file_device_name(0, &present);
+     if (!present || (sdl->route_matches &&
+                      g_strcmp0(requested, sdl->device_name) == 0)) {

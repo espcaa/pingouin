@@ -1,0 +1,51 @@
+From: OmacVM
+Subject: [PATCH] cocoa: hidden or background windows for tests
+
+PINGOUIN_COCOA_HIDDEN=1 keeps the VM out of sight (no window, no Dock icon)
+for tests that need the GPU but not the screen (video decode checks).
+PINGOUIN_BACKGROUND=1 opens the window behind the others and never takes the
+focus, for test runs while someone works at the Mac (Venus, GPU tests).
+Neither is set by OmacVM.app.
+
+Applies after pingouin-cocoa-displays.patch, which has its own test mode
+(PINGOUIN_TEST_SKIP_DISPLAYS) at the same two places; this patch merges the
+former qemu-cocoa-hidden-for-tests.patch and pingouin-cocoa-background.patch.
+Upstream: not applicable (test switches).
+Test: a VM started with each switch: no window / window behind, the
+front app keeps the focus.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -1942,7 +1942,11 @@ - (id) init
+             ? [NSString stringWithUTF8String:qemu_name]
+             : @"QEMU"];
+         [window setContentView:cocoaView];
+-        if (pingouin_test_mode()) {
++        if (getenv("PINGOUIN_COCOA_HIDDEN")) {
++            [window orderOut:self];
++        } else if (getenv("PINGOUIN_BACKGROUND")) {
++            [window orderBack:self];
++        } else if (pingouin_test_mode()) {
+             [window orderFront:self];   /* Pingouin test: never take the focus */
+         } else {
+             [window makeKeyAndOrderFront:self];
+@@ -4298,13 +4302,17 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
+     // Pull this console process up to being a fully-fledged graphical
+     // app with a menubar and Dock icon
+     ProcessSerialNumber psn = { 0, kCurrentProcess };
+-    if (!pingouin_test_mode()) {
++    /* Pingouin tests: PINGOUIN_COCOA_HIDDEN=1 keeps the VM out of sight (no
++     * window, no Dock icon) for tests that need the GPU but not the screen;
++     * PINGOUIN_BACKGROUND=1 opens the window behind the others, never active. */
++    bool background = getenv("PINGOUIN_COCOA_HIDDEN") || getenv("PINGOUIN_BACKGROUND");
++    if (!pingouin_test_mode() && !background) {
+         TransformProcessType(&psn, kProcessTransformToForegroundApplication);
+     }
+ 
+     [[NSProcessInfo processInfo] setProcessName:pingouin_product_name()];
+     [QemuApplication sharedApplication];
+-    if (pingouin_test_mode()) {
++    if (pingouin_test_mode() || background) {
+         /* Pingouin test: windows, but never the focus (the user works meanwhile). */
+         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+     }

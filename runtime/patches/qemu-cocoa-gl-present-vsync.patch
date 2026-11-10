@@ -1,0 +1,840 @@
+From: OmacVM
+Subject: [PATCH] cocoa: show GL frames on the display's refresh, at the guest's rate
+
+The guest's vblank timer runs at the Mac display's rate (the EDID carries
+it) but at its own phase. Shown as soon as the GPU finished them, two
+guest frames sometimes landed in one refresh of the Mac and none in the
+next: at a steady 120 frames a second from the guest only 107-109 distinct
+frames a second reached the 120 Hz MacBook panel (ScreenCaptureKit count,
+bench lock), 15-20 % of frames were never seen and 5-10 % of refreshes
+repeated one. The guest looked smooth from the inside (Chrome's rAF:
+120.01 fps, p99 8.4 ms) and juddered on the Mac.
+
+Finished frames now wait in a short queue (a jitter buffer, at most three)
+and once per tick, 3 ms before the vsync, the oldest one is put on the
+layer. A display link on the window's screen (on a thread of its own: the
+main thread ran ticks milliseconds late now and then) times it and follows
+the window to other screens (60, 120, 144 Hz). While the guest draws
+clearly faster than the link, a frame that comes less than half a tick
+after the previous one replaces it, and QEMU blits at most one frame per
+refresh of the window's screen (the newest), as when frames are shown
+when drawn, not one per flush; at the link's own rate two close frames
+are jitter, both are shown at once. Once a second, if a frame was left over
+after every tick and none came late, one frame is skipped, so the queue
+never holds more delay than the guest's timing needs (the guest's EDID
+rate is a hair faster than the display's: 120.006 vs 120.000 Hz). Five
+present surfaces instead of three: one on screen, one committed but not
+latched yet, up to three queued (three stay with PINGOUIN_GL_VSYNC=0).
+
+The refresh rate follows the guest, like a native app on ProMotion. The
+link runs only while frames come close together (under 52 ms apart:
+animations, scrolling, video); frames that come one at a time (typing, a
+cursor, a clock) go on the layer as soon as they are ready and nothing
+ticks. An idle Omarchy desktop sends no frames at all. On a
+variable-refresh screen (NSScreen's longest refresh interval above its
+shortest: the MacBook panel, 24-120 Hz) the link asks for the slowest
+whole fraction of the full rate that is a whole multiple of the guest's
+frame rate, measured over a second: 24 frames a second get 24 Hz, 30 get
+30, 60 get 60, 20 get 40; 25, irregular frames and 120 get the full rate.
+A lower rate needs two seconds in a row; two extra frames in a row (or a
+full queue) bring the full rate back at once. Screens with one rate (60 Hz
+externals, virtual displays) keep it.
+
+Results, final build (bench lock, virtual 120 Hz display, 3 x 12 s):
+testufo.com 119.6-119.9 new frames a second, 1-5 skipped refreshes in
+12 s; gpu-native's present 92.0-100.5 with 220-251 (measured beside an
+earlier build of this patch). With the MacBook's 24 Hz floor faked (dev
+build) 116.2-119.2 with 3-4 skips, and the link stayed at 120 Hz with no
+rate change. Round 1 on the MacBook panel: 99.0-99.6 % of a 120 fps
+page's frames shown exactly once (74-82 %), 119.3-119.9 in testufo full
+screen; external 60 Hz 99.7 % (82 %). Flush to screen about one refresh
+more than showing frames when drawn (12.6-14.2 ms median vs 5-7 ms).
+Frames of a fixed-rate page held on screen exactly as long as they should,
+with the rate following the guest (24 Hz floor): 24 fps 97.9 % (link at
+24 Hz), 30 fps 97.7 %, 60 fps 99.8 %; at the full rate 55.8 %, 98.3 %,
+99.0 %. The link ticks 24, 30 or 60 times a second instead of 120, not at
+all for a page that changes 5 times a second; QEMU's CPU 0-4 points lower.
+glmark2 quick, 3 runs: median 2518 (2488 with PINGOUIN_GL_VSYNC=0).
+30-minute soak (dev build with the 24 Hz floor, one VM run, 20 cycles of
+pacing page, testufo, glmark2 and mpv): guest up throughout, no QEMU
+errors, testufo 119.1-120.0 in 18 of 20 cycles (105.9 and 115.2 while
+other VMs loaded the Mac and the guest itself drew 111-114 a second).
+
+PINGOUIN_GL_VSYNC=0 goes back to showing frames when drawn.
+PINGOUIN_GL_REFRESH=fixed keeps the link at the screen's full rate while
+frames come (round 1's behaviour).
+PINGOUIN_GL_LEAD_MS sets how long before the vsync a frame goes on the layer.
+Trace events (-trace 'cocoa_present_*'): the link's rate, ticks, frames,
+repeats, merged and dropped frames once a second, and each frame.
+
+Upstream: not sent (depends on the IOSurface present, an OmacVM patch).
+Tests: tests/graphics/pacing (pacing page + sckpace, testufo + ufopace,
+pacing.html?fps=N + cadence.py for the rate, vdisplay for 144 Hz);
+glmark2 quick for throughput. Applies after qemu-cocoa-gl-present-iosurface.patch.
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -54,11 +54,13 @@
+ #include "qemu/main-loop.h"
+ #include "qemu/module.h"
+ #include "qemu/error-report.h"
++#include "trace.h"
+ #include <Carbon/Carbon.h>
+ #include <AppKit/NSOpenGL.h>
+ #ifdef CONFIG_OPENGL
+ #import <IOSurface/IOSurface.h>
+ #include <OpenGL/CGLIOSurface.h>
++#include <os/lock.h>
+ #endif
+ #include "hw/core/cpu.h"
+ 
+@@ -144,6 +146,7 @@
+ static bool gl_dirty;
+ static bool gl_present_pending;
+ static bool cocoa_gl_present_iosurface_wanted(void);
++static void cocoa_gl_present_screen_changed(void);
+ static uint32_t gl_scanout_id;
+ static DisplayGLTextureBorrower gl_scanout_borrow;
+ static QEMUGLContext gl_view_ctx;
+@@ -1930,6 +1933,9 @@
+ {
+     [cocoaView updateScale];
+     [cocoaView updateUIInfo];
++#ifdef CONFIG_OPENGL
++    cocoa_gl_present_screen_changed();
++#endif
+ }
+ 
+ - (void)windowDidChangeBackingProperties:(NSNotification *)notification
+@@ -2892,7 +2898,13 @@
+  * and they are made again at most twice a second. A guest that flips
+  * between two sizes gets its frames scaled into the surfaces it has.
+  */
+-#define PRESENT_SURFACES 3
++/*
++ * With vsync: one on screen, one committed but not latched yet, up to three
++ * queued for the display's refresh (qemu-cocoa-gl-present-vsync). Frames
++ * shown when drawn (PINGOUIN_GL_VSYNC=0) need three, as before.
++ */
++#define PRESENT_SURFACES 5
++static unsigned present_nsurf = 3;     /* surfaces in use */
+ #define PRESENT_REALLOC_NS (500 * SCALE_MS)
+ 
+ static int present_mode = -1;          /* 1: IOSurface, 0: CAOpenGLLayer */
+@@ -2911,7 +2923,95 @@
+ static int64_t present_alloc_ns;       /* when the surfaces were made */
+ static bool present_realloc_due;       /* surfaces of the wrong size */
+ static uint64_t present_cap;           /* largest display: w << 32 | h */
++
++/*
++ * Vsync present (default; PINGOUIN_GL_VSYNC=0 shows each frame as soon as the
++ * GPU is done, like before). The guest's vblank timer runs at the display's
++ * rate but at its own phase. Shown as soon as they are done, two guest
++ * frames sometimes land in one refresh of the Mac (one is never seen) and
++ * none in the next (a repeat): judder at a steady 120 frames a second.
++ *
++ * Here finished frames wait in a short queue, and once per refresh of the
++ * window's screen, shortly before the vsync, the oldest one goes on the
++ * layer. A frame that arrives late waits for the next refresh instead of
++ * pushing out its neighbour. The queue is a jitter buffer: it keeps the
++ * delay that the guest's timing needs, no more.
++ *
++ * Refresh rate. The display link runs only while frames come close
++ * together (an animation, scrolling, video). Frames that come one at a
++ * time (typing, a blinking cursor) go on the layer as soon as they are
++ * ready, with no link: nothing ticks and the panel can idle. On a
++ * variable-refresh screen (ProMotion) the link asks for the rate the guest
++ * draws at: the full rate, or a whole fraction of it for regular slower
++ * frames (60, 30, 24 frames a second video), so the panel slows down with
++ * it and each frame is still shown for the same time. Faster frames bring
++ * the full rate back at once; a lower rate needs two seconds in a row.
++ * A screen with one rate (a 60 Hz external) always gets that rate.
++ * PINGOUIN_GL_REFRESH=fixed keeps the link at the screen's full rate while
++ * frames come, also for single frames.
++ *
++ * The display link runs on a thread of its own and the commits on a
++ * high-priority queue: the main thread handles events and sometimes ran a
++ * tick milliseconds late, which put two frames into one refresh.
++ *
++ * present_lock guards present_sync; queued frames hold one use count and
++ * one retain each. Times are CACurrentMediaTime() seconds. The trace
++ * events cocoa_present_* give the counters once a second.
++ */
++#define PRESENT_QUEUE 3
++#define PRESENT_IDLE_S 0.25            /* no frame for this long: link stops */
++#define PRESENT_CLOSE_S (1.25 / 24)    /* frames closer than this are paced */
++
++@interface QemuPresentLink : NSObject
++- (void)tick:(CADisplayLink *)link;
++@end
++
++typedef struct PresentFrame {
++    IOSurfaceRef surf;
++    GLint filter;
++    double flushed;                     /* reached QEMU's present */
++} PresentFrame;
++
++static struct {
++    PresentFrame queue[PRESENT_QUEUE];  /* oldest first */
++    int queued;
++    int inflight;                       /* drawn, GPU not done yet */
++    bool linked;                        /* frames wait for the link's tick */
++    bool missed;                        /* the last tick had no frame */
++    int close_frames;                   /* unlinked: close frames in a row */
++    int extra;                          /* frames in a row that replaced
++                                           the one before (slowed link) */
++    double last_ready;                  /* the last frame the GPU finished */
++    double period;                      /* the link's tick period */
++    int max_hz, min_hz;                 /* the window's screen */
++    double hz;                          /* the rate asked of the link */
++    int slower;                         /* windows in a row that wanted less */
++    double win_start;                   /* one-second window: start, */
++    int win_ticks;                      /* ticks, */
++    int win_min;                        /* fewest frames left after a tick, */
++    int win_late;                       /* refreshes that had no frame, */
++    int win_frames;                     /* frames that came, */
++    int win_extra;                      /* extra flushes that replaced one, */
++    int win_flushes;                    /* the guest's flushes, */
++    double win_first, win_last;         /* the first and the last, */
++    double win_gap, win_gap2;           /* the two shortest gaps */
++    bool merge;                         /* the guest draws faster than the link */
++    unsigned ticks, shown, direct, repeats, merged, dropped, busy; /* trace */
++    double wait_sum;
++} present_sync = {
++    .win_min = INT_MAX, .win_gap = INFINITY, .win_gap2 = INFINITY,
++};
++static os_unfair_lock present_lock = OS_UNFAIR_LOCK_INIT;
++static bool present_vsync;
++static bool present_fixed;              /* PINGOUIN_GL_REFRESH=fixed */
++static QEMUBH *present_bh;
++static CADisplayLink *present_link;     /* created on the main thread */
++static QemuPresentLink *present_link_target;
+ 
++static void cocoa_gl_present_bh(void *opaque);
++static void cocoa_gl_present_queue_frame(IOSurfaceRef surf, GLint filter,
++                                         double flushed);
++
+ static bool cocoa_gl_present_iosurface_wanted(void)
+ {
+     if (present_mode < 0) {
+@@ -2974,12 +3074,25 @@
+                 usingBlock:^(NSNotification *note) {
+         cocoa_gl_present_screens();
+     }];
++
++    const char *v = getenv("PINGOUIN_GL_VSYNC");
++    const char *r = getenv("PINGOUIN_GL_REFRESH");
++    present_vsync = !(v && !strcmp(v, "0"));
++    present_fixed = r && !strcmp(r, "fixed");
++    present_nsurf = present_vsync ? PRESENT_SURFACES : 3;
++    if (present_vsync) {
++        present_bh = qemu_bh_new(cocoa_gl_present_bh, NULL);
++    }
++    info_report("cocoa: frames shown %s",
++                !present_vsync ? "when drawn" :
++                present_fixed ? "on the display's refresh, full rate" :
++                "on the display's refresh, rate follows the guest");
+     return true;
+ }
+ 
+ static void cocoa_gl_present_free(void)
+ {
+-    for (int i = 0; i < PRESENT_SURFACES; i++) {
++    for (int i = 0; i < present_nsurf; i++) {
+         if (present_tex[i]) {
+             glDeleteTextures(1, &present_tex[i]);
+             present_tex[i] = 0;
+@@ -3032,7 +3145,7 @@
+         (id)kIOSurfaceBytesPerElement: @4,
+         (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+     };
+-    for (int i = 0; i < PRESENT_SURFACES; i++) {
++    for (int i = 0; i < present_nsurf; i++) {
+         present_surf[i] = IOSurfaceCreate((CFDictionaryRef)props);
+         if (!present_surf[i]) {
+             cocoa_gl_present_free();
+@@ -3096,22 +3209,27 @@
+ 
+     /* The next surface Core Animation is not showing or reading. */
+     unsigned i;
+-    for (i = 0; i < PRESENT_SURFACES; i++) {
+-        unsigned n = (present_next + i) % PRESENT_SURFACES;
++    for (i = 0; i < present_nsurf; i++) {
++        unsigned n = (present_next + i) % present_nsurf;
+         if (!IOSurfaceIsInUse(present_surf[n])) {
+             break;
+         }
+     }
+-    if (i == PRESENT_SURFACES) {
++    if (i == present_nsurf) {
+         /* All busy: try again after the next refresh. */
+         CGLSetCurrentContext(prev);
+         gl_dirty = true;
++        if (present_vsync) {
++            os_unfair_lock_lock(&present_lock);
++            present_sync.busy++;
++            os_unfair_lock_unlock(&present_lock);
++        }
+         timer_mod(present_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                                  qatomic_read(&present_period_ns));
+         return true;
+     }
+-    unsigned n = (present_next + i) % PRESENT_SURFACES;
+-    present_next = (n + 1) % PRESENT_SURFACES;
++    unsigned n = (present_next + i) % present_nsurf;
++    present_next = (n + 1) % present_nsurf;
+ 
+     glBindFramebuffer(GL_FRAMEBUFFER, present_fbo);
+     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+@@ -3141,7 +3259,13 @@
+     gl_dirty = false;
+ 
+     IOSurfaceRef surf = present_surf[n];
++    double flushed = CACurrentMediaTime();
+     CFRetain(surf);
++    if (present_vsync) {
++        os_unfair_lock_lock(&present_lock);
++        present_sync.inflight++;
++        os_unfair_lock_unlock(&present_lock);
++    }
+     /* Core Animation must not see the surface before the GPU wrote it. */
+     IOSurfaceIncrementUseCount(surf);
+     dispatch_async(present_queue, ^{
+@@ -3162,6 +3286,10 @@
+             glDeleteSync(sync);
+         }
+         CGLSetCurrentContext(NULL);
++        if (present_vsync) {
++            cocoa_gl_present_queue_frame(surf, filter, flushed);
++            return;
++        }
+         dispatch_async(dispatch_get_main_queue(), ^{
+             CALayer *layer = [cocoaView layer];
+             [CATransaction begin];
+@@ -3190,6 +3318,41 @@
+     int64_t period = qatomic_read(&present_period_ns);
+ 
+     gl_dirty = true;
++    if (present_vsync) {
++        int waiting, max_hz;
++        bool merge;
++        os_unfair_lock_lock(&present_lock);
++        waiting = present_sync.queued + present_sync.inflight;
++        merge = present_sync.merge;
++        max_hz = present_sync.max_hz;
++        os_unfair_lock_unlock(&present_lock);
++        /*
++         * A guest that flushes faster than the display refreshes: once the
++         * queue is full, the next tick draws the newest frame (present_bh).
++         */
++        if (waiting >= PRESENT_QUEUE) {
++            return;
++        }
++        /*
++         * While the guest draws faster than the link, a frame that comes
++         * within half a tick replaces the one before: draw at most one per
++         * refresh of the window's screen, the newest, as when frames are
++         * shown when drawn. At the link's own rate close frames are jitter
++         * and both are drawn at once.
++         */
++        period = merge && max_hz > 0 ? NANOSECONDS_PER_SECOND / max_hz : 0;
++        if (period && now - present_last_ns < period) {
++            if (!timer_pending(present_timer) ||
++                (int64_t)timer_expire_time_ns(present_timer) >
++                    present_last_ns + period) {
++                timer_mod(present_timer, present_last_ns + period);
++            }
++            return;
++        }
++        timer_del(present_timer);
++        cocoa_gl_present();
++        return;
++    }
+     if (now - present_last_ns >= period) {
+         timer_del(present_timer);
+         cocoa_gl_present();
+@@ -3204,9 +3367,457 @@
+ {
+     /* A new frame, or the last one drawn into surfaces of the wrong size. */
+     if (gl_dirty || present_realloc_due) {
+-        cocoa_gl_present();
++        if (present_vsync) {
++            cocoa_gl_present_request();
++        } else {
++            cocoa_gl_present();
++        }
++    }
++}
++
++/* QEMU thread, BQL held: a tick took a frame off the queue. */
++static void cocoa_gl_present_bh(void *opaque)
++{
++    if (gl_dirty) {
++        cocoa_gl_present_request();
++    }
++}
++
++static void surface_put(IOSurfaceRef surf)
++{
++    IOSurfaceDecrementUseCount(surf);
++    CFRelease(surf);
++}
++
++/* Any thread: put a finished frame on the layer. */
++static void cocoa_gl_present_show(IOSurfaceRef surf, GLint filter)
++{
++    CALayer *layer = [cocoaView layer];
++    NSString *f = filter == GL_LINEAR ? kCAFilterLinear : kCAFilterNearest;
++
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    [layer setMagnificationFilter:f];
++    [layer setMinificationFilter:f];
++    [layer setContents:(id)surf];
++    [CATransaction commit];
++}
++
++/* Main thread: give the link the rate present_sync.hz names. */
++static void cocoa_gl_present_link_rate(void)
++{
++    os_unfair_lock_lock(&present_lock);
++    float hz = present_sync.hz;
++    os_unfair_lock_unlock(&present_lock);
++    if (present_link && hz > 0) {
++        [present_link setPreferredFrameRateRange:CAFrameRateRangeMake(hz, hz, hz)];
++        trace_cocoa_present_rate((int)lround(hz));
++    }
++}
++
++/*
++ * Main thread: the window is on a new screen (or the link is new). The link
++ * follows the view's screen by itself; it starts at that screen's full rate
++ * (60, 120, 144 Hz). A ProMotion screen can go down to its slowest rate
++ * (maximumRefreshInterval, 24 Hz on a MacBook Pro); one with a single rate
++ * keeps it.
++ */
++static void cocoa_gl_present_screen_changed(void)
++{
++    if (!present_vsync) {
++        return;
++    }
++    NSScreen *screen = [[cocoaView window] screen];
++    NSInteger max_hz = screen ? [screen maximumFramesPerSecond] : 0;
++    NSTimeInterval longest = screen ? [screen maximumRefreshInterval] : 0;
++    if (max_hz <= 0) {
++        max_hz = 60;
++    }
++    int min_hz = longest > 0 ? (int)lround(1 / longest) : (int)max_hz;
++    min_hz = present_fixed ? (int)max_hz : MAX(1, MIN(min_hz, (int)max_hz));
++
++    os_unfair_lock_lock(&present_lock);
++    bool changed = present_sync.max_hz != max_hz ||
++                   present_sync.min_hz != min_hz;
++    present_sync.max_hz = max_hz;
++    present_sync.min_hz = min_hz;
++    present_sync.hz = max_hz;
++    present_sync.slower = 0;
++    os_unfair_lock_unlock(&present_lock);
++    cocoa_gl_present_link_rate();
++    if (changed) {
++        if (min_hz < max_hz) {
++            info_report("cocoa: frames paced to the window's display, "
++                        "%d-%ld Hz (variable)", min_hz, (long)max_hz);
++        } else {
++            info_report("cocoa: frames paced to the window's display, %ld Hz",
++                        (long)max_hz);
++        }
++    }
++}
++
++/* Main thread: create the display link and its thread once, then run it. */
++static void cocoa_gl_present_link_start(void)
++{
++    if (!present_link) {
++        present_link_target = [[QemuPresentLink alloc] init];
++        present_link = [[cocoaView displayLinkWithTarget:present_link_target
++                                                selector:@selector(tick:)] retain];
++        cocoa_gl_present_screen_changed();
++
++        __block NSRunLoop *loop = nil;
++        dispatch_semaphore_t started = dispatch_semaphore_create(0);
++        NSThread *thread = [[NSThread alloc] initWithBlock:^{
++            loop = [NSRunLoop currentRunLoop];
++            [loop addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
++            dispatch_semaphore_signal(started);
++            [loop run];
++        }];
++        [thread setName:@"app.pingouin.vsync"];
++        [thread setQualityOfService:NSQualityOfServiceUserInteractive];
++        [thread start];
++        dispatch_semaphore_wait(started, DISPATCH_TIME_FOREVER);
++        dispatch_release(started);
++        [present_link addToRunLoop:loop forMode:NSDefaultRunLoopMode];
++    } else {
++        cocoa_gl_present_link_rate();
++    }
++    [present_link setPaused:NO];
++}
++
++/* present_lock held: a new one-second window. */
++static void present_window_reset(double now)
++{
++    present_sync.win_start = now;
++    present_sync.win_ticks = 0;
++    present_sync.win_min = INT_MAX;
++    present_sync.win_late = 0;
++    present_sync.win_frames = 0;
++    present_sync.win_extra = 0;
++    present_sync.win_flushes = 0;
++    present_sync.win_first = present_sync.win_last = 0;
++    present_sync.win_gap = present_sync.win_gap2 = INFINITY;
++}
++
++/*
++ * present_queue: the GPU finished surf. Unlinked, a frame that comes on its
++ * own is shown now; the third close one in a row starts the link at the
++ * screen's full rate. Linked, the frame waits in the queue for a tick; a
++ * frame that comes less than half a tick after the last queued one
++ * replaces it while the guest draws faster than the link, or while the
++ * link runs slower than the screen.
++ */
++static void cocoa_gl_present_queue_frame(IOSurfaceRef surf, GLint filter,
++                                         double flushed)
++{
++    double now = CACurrentMediaTime();
++    PresentFrame drop = { 0 };
++    bool show = false, wake = false, faster = false;
++
++    os_unfair_lock_lock(&present_lock);
++    present_sync.inflight--;
++    double gap = present_sync.last_ready > 0 ?
++                 now - present_sync.last_ready : INFINITY;
++    present_sync.last_ready = now;
++    if (!present_sync.linked) {
++        present_sync.close_frames =
++            gap < PRESENT_CLOSE_S ? present_sync.close_frames + 1 : 0;
++        if (present_fixed || present_sync.close_frames >= 2) {
++            present_sync.linked = true;
++            present_sync.missed = false;
++            present_sync.hz = present_sync.max_hz;
++            present_sync.slower = 0;
++            present_sync.merge = false;
++            present_window_reset(now);
++            wake = true;
++        } else {
++            show = true;
++            present_sync.direct++;
++            trace_cocoa_present_direct(isfinite(gap) ? (int)(gap * 1000) : -1);
++        }
++    }
++    if (present_sync.win_frames++) {
++        if (gap < present_sync.win_gap) {
++            present_sync.win_gap2 = present_sync.win_gap;
++            present_sync.win_gap = gap;
++        } else if (gap < present_sync.win_gap2) {
++            present_sync.win_gap2 = gap;
++        }
++    } else {
++        present_sync.win_first = now;
++    }
++    present_sync.win_last = now;
++    if (!show) {
++        PresentFrame *last = present_sync.queued ?
++                             &present_sync.queue[present_sync.queued - 1] : NULL;
++        /*
++         * A link slower than the screen runs at the guest's measured rate:
++         * a frame within half a tick of the last is an extra flush, not a
++         * frame of its own, and replaces it (else it would push every
++         * later frame back by a tick, or fill the queue).
++         */
++        bool slowed = present_sync.hz < present_sync.max_hz;
++        if ((present_sync.merge || slowed) && last &&
++            gap < present_sync.period / 2) {
++            drop = *last;
++            present_sync.queued--;
++            present_sync.merged++;
++            present_sync.extra++;
++            present_sync.win_extra += slowed;
++        } else {
++            present_sync.extra = 0;
++            if (present_sync.queued == PRESENT_QUEUE) {
++                drop = present_sync.queue[0];
++                memmove(&present_sync.queue[0], &present_sync.queue[1],
++                        sizeof(PresentFrame) * (PRESENT_QUEUE - 1));
++                present_sync.queued--;
++                present_sync.dropped++;
++            }
++        }
++        present_sync.queue[present_sync.queued++] = (PresentFrame){
++            .surf = surf, .filter = filter, .flushed = flushed,
++        };
++        /*
++         * The guest draws faster than a slowed link (two extra frames in a
++         * row, or a full queue): the full rate at once.
++         */
++        if (slowed && (present_sync.extra >= 2 ||
++                       present_sync.queued == PRESENT_QUEUE)) {
++            present_sync.hz = present_sync.max_hz;
++            present_sync.slower = 0;
++            present_sync.extra = 0;
++            faster = true;
++        }
++    }
++    trace_cocoa_present_frame(isfinite(gap) ? (int)(gap * 1e6) : -1,
++                              present_sync.queued, present_sync.linked);
++    os_unfair_lock_unlock(&present_lock);
++
++    if (drop.surf) {
++        surface_put(drop.surf);
++    }
++    if (show) {
++        cocoa_gl_present_show(surf, filter);
++        surface_put(surf);
++    }
++    if (wake) {
++        dispatch_async(dispatch_get_main_queue(), ^{
++            cocoa_gl_present_link_start();
++        });
++    } else if (faster) {
++        dispatch_async(dispatch_get_main_queue(), ^{
++            cocoa_gl_present_link_rate();
++        });
++    }
++}
++
++/*
++ * present_lock held, once a second while linked: the slowest rate that
++ * shows the guest's frames evenly. Candidates are whole fractions of the
++ * screen's full rate (120: 60, 40, 30, 24) down to the screen's slowest;
++ * the rate must be a whole multiple of the guest's frame rate (24 frames a
++ * second: 24 Hz; 20: 40 Hz; 25: none, so 120), and no two frames may come
++ * closer than half a tick, but for one a second (an extra flush now and
++ * then). Arrival jitter below that is what the queue absorbs, and a slow
++ * link absorbs more of it than a fast one; a burst of faster frames brings
++ * the full rate back at once (cocoa_gl_present_queue_frame). The frame
++ * rate is measured from the first to the last frame of the window, not by
++ * counting, so a window's edges do not matter.
++ */
++static double present_wanted_hz(void)
++{
++    double max_hz = present_sync.max_hz;
++
++    if (present_sync.win_frames < 3 ||
++        present_sync.win_last <= present_sync.win_first) {
++        return max_hz;
++    }
++    /* Extra flushes that replaced a frame are not frames of their own. */
++    double fps = (present_sync.win_frames - 1 - present_sync.win_extra) /
++                 (present_sync.win_last - present_sync.win_first);
++    for (int k = 8; k >= 2; k--) {
++        double r = max_hz / k;
++        double m = r / fps;
++        double whole = round(m);
++        if (r < present_sync.min_hz || whole < 1 ||
++            fabs(m - whole) > 0.03 * whole ||
++            present_sync.win_gap2 < 0.5 / r) {
++            continue;
++        }
++        return r;
++    }
++    return max_hz;
++}
++
++/*
++ * Commit queue, once per tick, a little before the vsync: put the oldest
++ * queued frame on the layer. Returns false once no frame has come for
++ * PRESENT_IDLE_S (the link may pause).
++ */
++static bool cocoa_gl_present_vsync(double T)
++{
++    PresentFrame show = { 0 }, drop = { 0 };
++    double now = CACurrentMediaTime();
++    bool rate = false, idle = false;
++
++    os_unfair_lock_lock(&present_lock);
++    if (T > 0 && T < 0.1) {
++        present_sync.period = T;
++    }
++    present_sync.win_ticks++;
++    present_sync.ticks++;
++    if (present_sync.queued) {
++        show = present_sync.queue[0];
++        present_sync.queued--;
++        memmove(&present_sync.queue[0], &present_sync.queue[1],
++                sizeof(PresentFrame) * present_sync.queued);
++        present_sync.shown++;
++        present_sync.wait_sum += now - show.flushed;
++        present_sync.win_min = MIN(present_sync.win_min, present_sync.queued);
++        present_sync.missed = false;
++    } else {
++        if (!present_sync.missed) {
++            /* A refresh without a new frame right after one with. */
++            present_sync.repeats++;
++            present_sync.win_late++;
++            present_sync.missed = true;
++        }
++        if (!present_sync.inflight &&
++            now - present_sync.last_ready > PRESENT_IDLE_S) {
++            present_sync.linked = false;
++            present_sync.close_frames = 0;
++            present_sync.merge = false;
++            idle = true;
++        }
+     }
++    double secs = now - present_sync.win_start;
++    if (!idle && secs >= 1.0) {
++        /*
++         * If a frame was left over after every tick and none came late, the
++         * queue holds a refresh of delay the guest's timing does not need
++         * (the guest runs a little faster than the display, or a hiccup
++         * filled it). Skip one frame to get the delay back down.
++         */
++        if (present_sync.win_min >= 1 && present_sync.win_min < INT_MAX &&
++            !present_sync.win_late && present_sync.queued) {
++            drop = present_sync.queue[0];
++            present_sync.queued--;
++            memmove(&present_sync.queue[0], &present_sync.queue[1],
++                    sizeof(PresentFrame) * present_sync.queued);
++            present_sync.dropped++;
++        }
++        /*
++         * Merge close frames only while the guest draws clearly faster than
++         * the link (e.g. 120 Hz guest, window just moved to a 60 Hz
++         * screen). At the link's own rate two close frames are jitter: both
++         * are real frames, and merging them would skip one.
++         */
++        present_sync.merge =
++            present_sync.win_flushes > present_sync.win_ticks * 5 / 4;
++        if (!present_fixed && present_sync.win_gap2 >= PRESENT_CLOSE_S &&
++            !present_sync.queued && !present_sync.inflight) {
++            /* Frames came one at a time for a second: no link. */
++            present_sync.linked = false;
++            present_sync.close_frames = 0;
++            present_sync.merge = false;
++            idle = true;
++        } else if (present_sync.min_hz < present_sync.max_hz) {
++            double want = present_wanted_hz();
++            if (want < present_sync.hz - 0.5) {
++                if (++present_sync.slower >= 2) {
++                    present_sync.hz = want;
++                    present_sync.slower = 0;
++                    rate = true;
++                }
++            } else {
++                present_sync.slower = 0;
++                if (want > present_sync.hz + 0.5) {
++                    present_sync.hz = want;
++                    rate = true;
++                }
++            }
++        }
++        trace_cocoa_present_second((int)lround(present_sync.hz),
++            T > 0 ? (int)lround(1 / T) : 0, present_sync.ticks,
++            present_sync.win_frames, present_sync.shown, present_sync.direct,
++            present_sync.shown ?
++            (int)(present_sync.wait_sum * 1e6 / present_sync.shown) : 0);
++        trace_cocoa_present_skips(present_sync.repeats, present_sync.merged,
++                                  present_sync.dropped, present_sync.busy);
++        present_sync.ticks = present_sync.shown = present_sync.direct = 0;
++        present_sync.repeats = 0;
++        present_sync.merged = present_sync.dropped = present_sync.busy = 0;
++        present_sync.wait_sum = 0;
++        present_window_reset(now);
++    }
++    os_unfair_lock_unlock(&present_lock);
++
++    if (drop.surf) {
++        surface_put(drop.surf);
++    }
++    if (show.surf) {
++        cocoa_gl_present_show(show.surf, show.filter);
++        surface_put(show.surf);
++        /* The guest may have drawn while the queue was full. */
++        qemu_bh_schedule(present_bh);
++    }
++    if (rate) {
++        dispatch_async(dispatch_get_main_queue(), ^{
++            cocoa_gl_present_link_rate();
++        });
++    }
++    return !idle;
++}
++
++@implementation QemuPresentLink
++/*
++ * Display link thread, once per tick. Core Animation picks up the layer at
++ * about the vsync: a frame put on the layer right at the tick sometimes
++ * missed it, so the commit happens a little before the next vsync instead
++ * (PINGOUIN_GL_LEAD_MS, default 3 ms).
++ */
++- (void)tick:(CADisplayLink *)link
++{
++    static dispatch_queue_t commit_queue;
++    static double lead = -1;
++    static bool idle;
++    double target = [link targetTimestamp];
++    double T = target - [link timestamp];
++
++    if (qatomic_read(&idle)) {
++        /*
++         * Nothing new for a while: stop ticking until the next close frames.
++         * On the main thread, like the start in cocoa_gl_present_queue_frame,
++         * so a frame that just came in is never left behind a paused link.
++         */
++        qatomic_set(&idle, false);
++        dispatch_async(dispatch_get_main_queue(), ^{
++            os_unfair_lock_lock(&present_lock);
++            bool linked = present_sync.linked;
++            os_unfair_lock_unlock(&present_lock);
++            /* A frame that links again after this queues its start behind. */
++            if (!linked) {
++                [link setPaused:YES];
++            }
++        });
++        return;
++    }
++    if (!commit_queue) {
++        dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
++            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
++        commit_queue = dispatch_queue_create("app.pingouin.present.commit", attr);
++        const char *e = getenv("PINGOUIN_GL_LEAD_MS");
++        lead = (e ? atof(e) : 3.0) / 1000;
++    }
++    double wait = MAX(0, target - MIN(lead, T * 0.75) - CACurrentMediaTime());
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * 1e9)),
++                   commit_queue, ^{
++        if (!cocoa_gl_present_vsync(T)) {
++            qatomic_set(&idle, true);
++        }
++    });
+ }
++@end
+ 
+ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
+ {
+@@ -3288,6 +3899,11 @@
+     if (on_tick) {
+         /* cocoa_gl_refresh draws it. */
+     } else if (present_ctx) {
++        if (present_vsync) {
++            os_unfair_lock_lock(&present_lock);
++            present_sync.win_flushes++;
++            os_unfair_lock_unlock(&present_lock);
++        }
+         cocoa_gl_present_request();
+     } else if (!qatomic_xchg(&gl_present_pending, true)) {
+         dispatch_async(dispatch_get_main_queue(), ^{
+--- a/ui/trace-events
++++ b/ui/trace-events
+@@ -208,5 +208,12 @@
+ dbus_filter(unsigned int serial, unsigned int filter) "serial=%u (<= %u)"
+ dbus_can_share_map(bool share) "can_share_map: %d"
+ 
++# cocoa.m
++cocoa_present_rate(int hz) "display link asks for %d Hz"
++cocoa_present_second(int hz, int tick_hz, int ticks, int frames, unsigned shown, unsigned direct, int wait_us) "link %d Hz (ticks at %d Hz): %d ticks, %d frames came in the window, %u shown on ticks, %u shown when ready, flush to tick %d us"
++cocoa_present_frame(int gap_us, int queued, bool linked) "frame ready %d us after the last, %d queued, linked %d"
++cocoa_present_direct(int gap_ms) "frame shown when ready, %d ms after the last"
++cocoa_present_skips(unsigned repeats, unsigned merged, unsigned dropped, unsigned busy) "%u repeats, %u merged, %u dropped, %u no free surface"
++
+ # egl-helpers.c
+ egl_init_d3d11_device(void *p) "d3d device: %p"

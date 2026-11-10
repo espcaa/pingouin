@@ -1,0 +1,449 @@
+From: OmacVM
+Subject: [PATCH] ui: the VM's window takes the pointer without a click
+
+What: the main view takes an absolute pointer (virtio-tablet) on the first
+motion over it, and when its window becomes key, the app active, the window
+full screen, the pointer mode absolute or the guest's pointer comes up,
+whenever the pointer is on the VM's picture and nothing is above it
+(ui/pingouin-pointer-start.h decides). The Mac's cursor over the VM is hidden
+only once the guest draws its own pointer (show-cursor=off and Omarchy's
+display agent said hello since the last guest reset), from one place, once.
+PINGOUIN_POINTER_START=0 keeps upstream's way (on enter or a click; hidden
+with every grab). The log says which ("cocoa: pointer: ...").
+
+Why: after every VM start, and after a guest reboot, the guest's pointer
+sat in the middle and did not move until the user clicked once into the
+window (user, 2026-10-05 15:00). Upstream takes an absolute pointer only on
+mouseEntered or a click. The window opens under the pointer, comes back key
+with the pointer on it (OmacVM.app hands it the focus after a start; the
+escape combo; Command-Tab), or loses the grab without the pointer moving (a
+key change during the start, the guest's screen changing at a reboot):
+nothing enters, so nothing took it. Full screen grabbed at once, before the
+app was in front and while the guest still booted: the Mac's cursor was
+hidden with no guest pointer drawn, and a second grab (full screen after a
+click) hid it twice, so one let-go left it hidden.
+
+Test hook (test mode only, PINGOUIN_TEST_SKIP_DISPLAYS): PINGOUIN_TEST_POINTER=
+<seconds> sends made-up motion over the main view through mouseMoved: four
+times a second from the start, as if the user moved the mouse and never
+clicked; the window counts as key and in front, the full-screen guard is
+skipped for it and the Mac's cursor is only logged (never the real one).
+PINGOUIN_POINTER_DEBUG=1 logs each take and the cursor's state.
+
+Upstream: not proposed (OmacVM's pointer policy and display agent).
+Test: app/runtime/Tests/display/test-pointer-start.c (the decisions, with a
+model of the view; also shows upstream's static pointer);
+src/tests/pointer-start-vm.sh (a throwaway VM on a virtual display: the
+guest gets motion right after the start and after a reboot, no click).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index f7f7a85..9105a9a 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -41,10 +41,12 @@
+ #include "ui/cocoa-scroll.h"
+ #include "ui/kbd-state.h"
+ #include "ui/pingouin-pointer-guard.h"
++#include "ui/pingouin-pointer-start.h"
+ #include "ui/pingouin-shortcuts.h"
+ #include "system/system.h"
+ #include "system/runstate.h"
+ #include "system/runstate-action.h"
++#include "system/reset.h"
+ #include "system/cpu-throttle.h"
+ #include "qapi/error.h"
+ #include "qapi/qapi-commands-block.h"
+@@ -454,6 +456,9 @@ @interface QemuCocoaView : NSView
+ }
+ - (void) grabMouse;
+ - (void) ungrabMouse;
++- (void) pingouinTakePointer:(NSEvent *)event why:(const char *)why;
++- (void) pingouinUpdateMacCursor;
++- (void) pingouinFullScreenTake;
+ - (void) setFullGrab:(id)sender;
+ - (void) handleMonitorInput:(NSEvent *)event;
+ - (bool) handleEvent:(NSEvent *)event;
+@@ -630,6 +635,11 @@ static bool pingouin_map_pointer(int output, double u, double v,
+ static void pingouin_guard_corners(NSEvent *event);
+ static int pingouin_guarded_target(NSView **view, int *output, NSPoint *p);
+ static PingouinGuard pingouin_guard;         /* the full-screen pointer guard */
++/* When the VM takes the pointer by itself; the Mac's cursor (main thread). */
++static PingouinPointerStart pingouin_ptr;
++static bool pingouin_mac_cursor_hidden;    /* by us, once ([NSCursor hide] counts) */
++static bool pingouin_test_pointer;         /* PINGOUIN_TEST_POINTER (test mode only) */
++static bool pingouin_pointer_debug;        /* PINGOUIN_POINTER_DEBUG=1 or the test */
+ static bool pingouin_guard_place;          /* this event's place is the guard's */
+ /* The displays and our windows the guard last saw (main thread). */
+ static PingouinGuardScreens pingouin_guard_scr;
+@@ -642,6 +652,7 @@ static bool pingouin_map_pointer(int output, double u, double v,
+ static bool pingouin_is_head_console(unsigned int index);
+ static bool pingouin_test_mode(void);
+ static void pingouin_displays_update(void);
++static void pingouin_pointer_init(void);
+ 
+ /* VM state callbacks hold the BQL; this method only touches input state. */
+ static void cocoa_pinch_vm_change(void *opaque, bool running, RunState state)
+@@ -829,20 +840,103 @@ - (void) selectConsoleLocked:(unsigned int)index
+     [self updateUIInfo];
+ }
+ 
+-- (void) hideCursor
++/*
++ * Pingouin: the Mac's cursor over the VM, hidden or shown from one place
++ * (ui/pingouin-pointer-start.h says when). [NSCursor hide] counts: a second
++ * grab without a let-go between (full screen) hid it twice, and one unhide
++ * then left it hidden.
++ */
++- (void) pingouinUpdateMacCursor
+ {
+-    if (!cursor_hide) {
++    bool hide = pingouin_pointer_hide_mac(&pingouin_ptr, cursor_hide, isMouseGrabbed,
++                                        isAbsoluteEnabled);
++
++    if (hide == pingouin_mac_cursor_hidden) {
+         return;
+     }
+-    [NSCursor hide];
++    pingouin_mac_cursor_hidden = hide;
++    if (pingouin_pointer_debug) {
++        info_report("pingouin-pointer: Mac cursor %s", hide ? "hidden" : "shown");
++    }
++    if (pingouin_test_pointer) {
++        return;     /* test: never the real cursor (the user works meanwhile) */
++    }
++    if (hide) {
++        [NSCursor hide];
++    } else {
++        [NSCursor unhide];
++    }
+ }
+ 
+-- (void) unhideCursor
++/* Pingouin: the pointer is on the VM's picture (this view), nothing above it. */
++- (bool) pingouinPointerOver:(NSEvent *)event
+ {
+-    if (!cursor_hide) {
++    NSWindow *w = [self window];
++    NSPoint p;
++
++    if (!w || ![w isVisible] ||
++        !([w occlusionState] & NSWindowOcclusionStateVisible)) {
++        return false;
++    }
++    if (event && [event window] == w) {
++        p = [self convertPoint:[event locationInWindow] fromView:nil];
++    } else {
++        p = [self convertPoint:[w convertPointFromScreen:[NSEvent mouseLocation]]
++                      fromView:nil];
++    }
++    if (!NSPointInRect(p, [self visibleRect])) {
++        return false;
++    }
++    /* Test: the motion is made up; the real cursor is elsewhere. */
++    return pingouin_test_pointer ||
++           [NSWindow windowNumberAtPoint:[NSEvent mouseLocation]
++             belowWindowWithWindowNumber:0] == [w windowNumber];
++}
++
++/*
++ * Pingouin: take the pointer without a click (ui/pingouin-pointer-start.h): on
++ * the first motion over the VM, or event nil: now (the window became key,
++ * the app active, full screen, the guest's pointer came up), when the
++ * pointer is on the VM.
++ */
++- (void) pingouinTakePointer:(NSEvent *)event why:(const char *)why
++{
++    PingouinPointerIn in = {
++        .absolute = isAbsoluteEnabled,
++        .grabbed = isMouseGrabbed,
++        .active = pingouin_test_pointer || [NSApp isActive],
++        .key = pingouin_test_pointer || pingouin_is_our_window([NSApp keyWindow]),
++        .over = [self pingouinPointerOver:event],
++        .buttons = !pingouin_test_pointer && [NSEvent pressedMouseButtons] != 0,
++    };
++
++    if (pingouin_pointer_take(&pingouin_ptr, &in)) {
++        if (pingouin_pointer_debug) {
++            info_report("pingouin-pointer: taken (%s)", why);
++        }
++        [self grabMouse];
++    }
++}
++
++- (void) pingouinFullScreenTake
++{
++    if (isMouseGrabbed) {
++        return;
++    }
++    /*
++     * full-screen=on comes before the first look at the pointer's mode: a
++     * relative grab then (the Mac's cursor held and hidden) until it
++     * turned out absolute a moment later.
++     */
++    [self notifyMouseModeChange];
++    if (isMouseGrabbed) {
+         return;
+     }
+-    [NSCursor unhide];
++    if (pingouin_ptr.off || !isAbsoluteEnabled) {
++        [self grabMouse];       /* as upstream */
++        return;
++    }
++    [self pingouinTakePointer:nil why:"full screen"];
+ }
+ 
+ - (void)updateCursorLayout
+@@ -1686,6 +1780,7 @@ - (bool) handleEventLocked:(NSEvent *)event
+ 
+                         // release the mouse grab
+                         case 'g':
++                            pingouin_pointer_let_go(&pingouin_ptr);
+                             [self ungrabMouse];
+                             return true;
+                     }
+@@ -1789,7 +1884,7 @@ - (void) handleMouseEvent:(NSEvent *)event
+     if (!isMouseGrabbed) {
+         return;
+     }
+-    if (isAbsoluteEnabled) {
++    if (isAbsoluteEnabled && !pingouin_test_pointer) {
+         pingouin_guard_corners(event);
+     }
+ 
+@@ -1829,6 +1924,7 @@ - (void) handleMouseEvent:(NSEvent *)event
+ 
+ - (void) mouseExited:(NSEvent *)event
+ {
++    pingouin_pointer_left(&pingouin_ptr);
+     /*
+      * Pingouin: with several outputs the pointer may just be on the next one,
+      * or crossing the strip between them in the middle of a drag (the
+@@ -1859,6 +1955,9 @@ - (void) mouseEntered:(NSEvent *)event
+ 
+ - (void) mouseMoved:(NSEvent *)event
+ {
++    if (!isMouseGrabbed) {
++        [self pingouinTakePointer:event why:"motion over the VM"];
++    }
+     [self handleMouseEvent:event];
+ }
+ 
+@@ -1922,10 +2021,11 @@ - (void) grabMouse
+         [[self window] setTitle:[NSString stringWithFormat:@"%s - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)", qemu_name]];
+     else
+         [[self window] setTitle:@"QEMU - (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)"];
+-    [self hideCursor];
+     pingouin_corner_release();
+     CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
+     isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
++    pingouin_pointer_left(&pingouin_ptr);
++    [self pingouinUpdateMacCursor];
+ }
+ 
+ - (void) ungrabMouse
+@@ -1936,10 +2036,10 @@ - (void) ungrabMouse
+         [[self window] setTitle:[NSString stringWithUTF8String:qemu_name]];
+     else
+         [[self window] setTitle:@"QEMU"];
+-    [self unhideCursor];
+     pingouin_corner_release();
+     CGAssociateMouseAndMouseCursorPosition(TRUE);
+     isMouseGrabbed = FALSE;
++    [self pingouinUpdateMacCursor];
+     [self raiseAllButtons];
+ }
+ 
+@@ -1960,8 +2060,11 @@ - (void) notifyMouseModeChange {
+         } else {
+             pingouin_corner_release();
+             CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
++            [self pingouinUpdateMacCursor];
+         }
+     }
++    /* Pingouin: no click needed when the pointer is already on the VM. */
++    [self pingouinTakePointer:nil why:"absolute pointer"];
+ }
+ - (BOOL) isMouseGrabbed {return isMouseGrabbed;}
+ 
+@@ -2130,6 +2233,18 @@ - (BOOL)canBecomeMainWindow { return YES; }
+ 
+ static BOOL notchFull;
+ static NSRect notchSavedFrame;
++
++/*
++ * Full screen takes the pointer. An absolute one only while the app is in
++ * front and the pointer on the VM (ui/pingouin-pointer-start.h): at a VM
++ * start the window goes full screen before Pingouin.app hands it the focus,
++ * and the pointer may be on another display. Its first motion there, or the
++ * window becoming key, takes it then.
++ */
++static void pingouin_full_screen_take(void)
++{
++    [cocoaView pingouinFullScreenTake];
++}
+ static NSWindowStyleMask notchSavedMask;
+ 
+ /* Enters notch full screen on the window's display, or leaves it. */
+@@ -2155,7 +2270,7 @@ static void pingouin_toggle_notch_full_screen(void)
+         [fullScreenMenuItem setTitle:@"Exit Full Screen"];
+         [cocoaView updateScale];
+         [cocoaView updateUIInfo];
+-        [cocoaView grabMouse];
++        pingouin_full_screen_take();
+         pingouin_displays_update();
+     } else {
+         notchFull = NO;
+@@ -2388,7 +2503,7 @@ - (void)windowDidEnterFullScreen:(NSNotification *)notification
+     [fullScreenMenuItem setTitle:@"Exit Full Screen"];
+     [cocoaView updateScale];
+     [cocoaView updateUIInfo];
+-    [cocoaView grabMouse];
++    pingouin_full_screen_take();
+     pingouin_displays_update();
+ }
+ 
+@@ -2443,10 +2558,23 @@ - (NSApplicationPresentationOptions) window:(NSWindow *)window
+ - (void) windowDidResignKey: (NSNotification *)aNotification
+ {
+     COCOA_DEBUG("%s\n", __func__);
++    pingouin_pointer_left(&pingouin_ptr);
+     [cocoaView ungrabMouse];
+     [cocoaView raiseAllKeys];
+ }
+ 
++/*
++ * Pingouin: the window became key (Pingouin.app handed it the focus after a
++ * start, the escape combo came back, Command-Tab): the pointer on it is
++ * the VM's at once. After AppKit's own handling of the key change.
++ */
++- (void) windowDidBecomeKey: (NSNotification *)aNotification
++{
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [cocoaView pingouinTakePointer:nil why:"window key"];
++    });
++}
++
+ /* We abstract the method called by the Enter Fullscreen menu item
+  * because Mac OS 10.7 and higher disables it. This is because of the
+  * menu item's old selector's name toggleFullScreen:
+@@ -4863,8 +4991,11 @@ static void pingouin_guard_corners(NSEvent *event)
+     if (!on) {
+         s.nours = 0;    /* never takes hold */
+     }
+-    /* The Mac's cursor is the only pointer shown (show-cursor=on): it follows. */
+-    pingouin_guard.follow = !cursor_hide;
++    /*
++     * The Mac's cursor is shown (show-cursor=on, or the guest draws no
++     * pointer yet): it follows.
++     */
++    pingouin_guard.follow = !pingouin_mac_cursor_hidden;
+     pingouin_guard_event(&pingouin_guard, &s, [event timestamp], loc.x, loc.y,
+                        dx, dy, cur.x, cur.y, &st);
+     pingouin_guard_apply(&st);
+@@ -5725,6 +5856,12 @@ static void pingouin_chan_line(NSData *data)
+         NSDictionary *d = obj;
+         bool update = false;
+         if (d[@"hello"]) {
++            if (!pingouin_ptr.drawing) {
++                info_report("cocoa: the guest draws its own pointer now");
++            }
++            pingouin_pointer_guest_hello(&pingouin_ptr);
++            [cocoaView pingouinUpdateMacCursor];
++            [cocoaView pingouinTakePointer:nil why:"guest pointer up"];
+             pingouin_guest_ready = true;
+             [pingouin_last_layout release];
+             pingouin_last_layout = nil;
+@@ -5823,6 +5960,73 @@ static void pingouin_chan_connect(void)
+     dispatch_resume(pingouin_chan_src);
+ }
+ 
++/* A guest reset (QEMU's thread, BQL): its firmware and boot draw no pointer. */
++static void pingouin_pointer_reset(void *opaque)
++{
++    dispatch_async(dispatch_get_main_queue(), ^{
++        pingouin_pointer_guest_reset(&pingouin_ptr);
++        [cocoaView pingouinUpdateMacCursor];
++    });
++}
++
++/*
++ * Test (PINGOUIN_TEST_POINTER=<seconds>, test mode only): made-up motion over
++ * the main view four times a second, from the start, through AppKit's
++ * entry for it (mouseMoved:), as if the user moved the mouse and never
++ * clicked. Never the real cursor: the window counts as key and in front,
++ * the guard is off for it, and the Mac's cursor is only logged.
++ */
++static void pingouin_test_motion(int tick, int ticks)
++{
++    NSWindow *w = [cocoaView window];
++    NSRect b = [cocoaView bounds];
++    double t = tick * 0.35;
++    NSPoint p;
++    NSEvent *e;
++
++    if (tick >= ticks) {
++        info_report("pingouin-pointer: test motion done (%d moves)", ticks);
++        return;
++    }
++    p = NSMakePoint(NSMidX(b) + cos(t) * b.size.width / 4,
++                    NSMidY(b) + sin(t) * b.size.height / 4);
++    e = [NSEvent mouseEventWithType:NSEventTypeMouseMoved
++                           location:[cocoaView convertPoint:p toView:nil]
++                      modifierFlags:0
++                          timestamp:[[NSProcessInfo processInfo] systemUptime]
++                       windowNumber:[w windowNumber]
++                            context:nil
++                        eventNumber:0
++                         clickCount:0
++                           pressure:0];
++    if (e && [w isVisible]) {
++        [cocoaView mouseMoved:e];
++    }
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 4),
++                   dispatch_get_main_queue(), ^{ pingouin_test_motion(tick + 1, ticks); });
++}
++
++/* Main thread, with the BQL (from pingouin_displays_init). */
++static void pingouin_pointer_init(void)
++{
++    const char *v = getenv("PINGOUIN_POINTER_START");
++    const char *test = getenv("PINGOUIN_TEST_POINTER");
++
++    pingouin_ptr.off = v && !strcmp(v, "0");
++    pingouin_test_pointer = test && atoi(test) > 0 && pingouin_test_mode();
++    pingouin_pointer_debug = pingouin_test_pointer ||
++                           (getenv("PINGOUIN_POINTER_DEBUG") &&
++                            !strcmp(getenv("PINGOUIN_POINTER_DEBUG"), "1"));
++    qemu_register_reset(pingouin_pointer_reset, NULL);
++    info_report("cocoa: pointer: %s", pingouin_ptr.off ?
++                "taken on enter or click (PINGOUIN_POINTER_START=0)" :
++                "taken without a click when it is on the VM");
++    if (pingouin_test_pointer) {
++        int ticks = atoi(test) * 4;
++        dispatch_async(dispatch_get_main_queue(), ^{ pingouin_test_motion(0, ticks); });
++    }
++}
++
+ /* Main thread, with the BQL (from cocoa_display_init). */
+ static void pingouin_displays_init(void)
+ {
+@@ -5868,10 +6072,19 @@ static void pingouin_displays_init(void)
+                     object:nil
+                      queue:[NSOperationQueue mainQueue]
+                 usingBlock:^(NSNotification *note) {
++        pingouin_pointer_left(&pingouin_ptr);
+         if ([cocoaView isMouseGrabbed]) {
+             [cocoaView ungrabMouse];
+         }
+     }];
++    [[NSNotificationCenter defaultCenter]
++        addObserverForName:NSApplicationDidBecomeActiveNotification
++                    object:nil
++                     queue:[NSOperationQueue mainQueue]
++                usingBlock:^(NSNotification *note) {
++        [cocoaView pingouinTakePointer:nil why:"app active"];
++    }];
++    pingouin_pointer_init();
+     pingouin_update_mac_layout();
+     pingouin_chan_connect();
+ }

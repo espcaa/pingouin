@@ -1,0 +1,72 @@
+From: OmacVM
+Subject: [PATCH] cocoa: the full-grab tap at the end of the chain for keyboard sharing apps
+
+What: with PINGOUIN_KEYS_LAST=1 the full-grab event tap goes at the end of
+macOS's event tap chain (kCGTailAppendEventTap) instead of its head.
+OmacVM.app sets it for a start when its Keyboard sharing apps switch is on
+(defaults write app.pingouin.Pingouin shareKeyboard -bool true).
+qemu.log then says "full-grab tap at the end of the event tap chain".
+Without it nothing changes. OmacVM Gestures and the Bridge read the same
+setting for their own taps.
+
+Why: issue #350. A keyboard sharing app (Synergy, Deskflow, Barrier, Input
+Leap) taps the keys at the head of the HID chain too, and the newest tap
+runs first. A VM started after the sharing app took the keys while the
+pointer was on the other computer. At the end of the chain the sharing app
+sees the keys first: it keeps those it sends to the other computer, the VM
+gets the rest. The escape combo still passes (pingouin-cocoa-escape-combo-
+tap.patch), so the tap order with OmacVM Gestures does not matter.
+
+Upstream: not sent (OmacVM's setting).
+
+Test: app/runtime/Tests/keys/test-keys-last.sh (CI: pingouin_keys_place from
+this patch with PINGOUIN_KEYS_LAST unset, 1, 0 and other values; the runtime
+build: the same from the patched ui/cocoa.m, and that the tap is made at
+that place). Applies after pingouin-cocoa-tap-permission.patch, before
+pingouin-cocoa-no-app-nap.patch (last).
+
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -1891,12 +1891,29 @@
+     }
+ }
+ 
++/*
++ * Pingouin (#350): where the full-grab tap goes in macOS's event tap chain.
++ * A keyboard sharing app (Synergy, Deskflow, Barrier, Input Leap) taps the
++ * keys at the head of the chain too, and the newest tap runs first: a VM
++ * started after it took the keys while the pointer was on the other
++ * computer. With PINGOUIN_KEYS_LAST=1 (Pingouin.app's hidden shareKeyboard
++ * setting) the tap goes at the end, so the sharing app sees the keys first.
++ * Without it: at the head, as before.
++ */
++static CGEventTapPlacement pingouin_keys_place(void)
++{
++    const char *v = getenv("PINGOUIN_KEYS_LAST");
++
++    return v && !strcmp(v, "1") ? kCGTailAppendEventTap : kCGHeadInsertEventTap;
++}
++
+ - (void) setFullGrab:(id)sender
+ {
+     COCOA_DEBUG("QemuCocoaView: setFullGrab\n");
+ 
+     CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(kCGEventFlagsChanged);
+-    eventsTap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
++    CGEventTapPlacement place = pingouin_keys_place();
++    eventsTap = CGEventTapCreate(kCGHIDEventTap, place, kCGEventTapOptionDefault,
+                                  mask, handleTapEvent, self);
+     if (!eventsTap) {
+         warn_report("Could not create event tap, system key combos will not be captured.\n");
+@@ -1904,6 +1921,10 @@
+     } else {
+         COCOA_DEBUG("Global events tap created! Will capture system key combos.\n");
+     }
++    if (place == kCGTailAppendEventTap) {
++        info_report("cocoa: full-grab tap at the end of the event tap chain "
++                    "(PINGOUIN_KEYS_LAST=1: keyboard sharing apps see the keys first)");
++    }
+ 
+     CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+     if (!runLoop) {

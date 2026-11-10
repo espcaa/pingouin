@@ -1,0 +1,74 @@
+From: OmacVM
+Subject: [PATCH] cocoa: name and icon from the OmacVM launcher
+
+Applies after the try-omarchy patches. PINGOUIN_PRODUCT_NAME sets the app name
+(default OmacVM), PINGOUIN_ICON the icon file.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -115,6 +115,13 @@
+ static bool immersive_mode_enabled = true;
+ static NSMenuItem *fullScreenMenuItem;
+ 
++/* Pingouin: the app's name and icon come from the launcher (the user picks the name). */
++static NSString *pingouin_product_name(void)
++{
++    const char *name = getenv("PINGOUIN_PRODUCT_NAME");
++    return name && *name ? [NSString stringWithUTF8String:name] : @"Pingouin";
++}
++
+ static bool zoom_interpolation;
+ static NSTextField *pauseLabel;
+ 
+@@ -2062,7 +2069,7 @@
+ {
+     NSAlert *alert = [NSAlert new];
+     [alert autorelease];
+-    [alert setMessageText: @"Are you sure you want to quit Pingouin?"];
++    [alert setMessageText: [NSString stringWithFormat:@"Are you sure you want to quit %@?", pingouin_product_name()]];
+     [alert addButtonWithTitle: @"Cancel"];
+     [alert addButtonWithTitle: @"Quit"];
+     if([alert runModal] == NSAlertSecondButtonReturn) {
+@@ -2152,17 +2159,17 @@
+ 
+     // Application menu
+     menu = [[NSMenu alloc] initWithTitle:@""];
+-    [menu addItemWithTitle:@"About Pingouin" action:@selector(do_about_menu_item:) keyEquivalent:@""];
++    [menu addItemWithTitle:[NSString stringWithFormat:@"About %@", pingouin_product_name()] action:@selector(do_about_menu_item:) keyEquivalent:@""];
+     [menu addItem:[NSMenuItem separatorItem]]; //Separator
+     menuItem = [menu addItemWithTitle:@"Services" action:nil keyEquivalent:@""];
+     [menuItem setSubmenu:[NSApp servicesMenu]];
+     [menu addItem:[NSMenuItem separatorItem]];
+-    [menu addItemWithTitle:@"Hide Pingouin" action:@selector(hide:) keyEquivalent:@"h"];
++    [menu addItemWithTitle:[NSString stringWithFormat:@"Hide %@", pingouin_product_name()] action:@selector(hide:) keyEquivalent:@"h"];
+     menuItem = (NSMenuItem *)[menu addItemWithTitle:@"Hide Others" action:@selector(hideOtherApplications:) keyEquivalent:@"h"]; // Hide Others
+     [menuItem setKeyEquivalentModifierMask:(NSEventModifierFlagOption|NSEventModifierFlagCommand)];
+     [menu addItemWithTitle:@"Show All" action:@selector(unhideAllApplications:) keyEquivalent:@""]; // Show All
+     [menu addItem:[NSMenuItem separatorItem]]; //Separator
+-    [menu addItemWithTitle:@"Quit Pingouin" action:@selector(terminate:) keyEquivalent:@"q"];
++    [menu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", pingouin_product_name()] action:@selector(terminate:) keyEquivalent:@"q"];
+     menuItem = [[NSMenuItem alloc] initWithTitle:@"Apple" action:nil keyEquivalent:@""];
+     [menuItem setSubmenu:menu];
+     [[NSApp mainMenu] addItem:menuItem];
+@@ -2834,8 +2841,10 @@
+         [[[executablePath stringByDeletingLastPathComponent]
+           stringByDeletingLastPathComponent]
+          stringByDeletingLastPathComponent];
+-    NSString *iconPath =
+-        [resourcesPath stringByAppendingPathComponent:@"Pingouin.icns"];
++    const char *iconEnv = getenv("PINGOUIN_ICON");
++    NSString *iconPath = iconEnv && *iconEnv
++        ? [NSString stringWithUTF8String:iconEnv]
++        : [resourcesPath stringByAppendingPathComponent:@"Pingouin.icns"];
+     NSImage *icon = [[NSImage alloc] initWithContentsOfFile:iconPath];
+ 
+     if (icon) {
+@@ -2856,7 +2865,7 @@
+     ProcessSerialNumber psn = { 0, kCurrentProcess };
+     TransformProcessType(&psn, kProcessTransformToForegroundApplication);
+ 
+-    [[NSProcessInfo processInfo] setProcessName:@"Pingouin"];
++    [[NSProcessInfo processInfo] setProcessName:pingouin_product_name()];
+     [QemuApplication sharedApplication];
+     cocoa_set_product_icon();
+ 

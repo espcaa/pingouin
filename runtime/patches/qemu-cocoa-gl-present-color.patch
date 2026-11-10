@@ -1,0 +1,224 @@
+From: OmacVM
+Subject: [PATCH] cocoa: tag GL frames with their colour space; deep colour and HDR
+
+The IOSurfaces of the GL present carried no colour space, so Core
+Animation showed the guest's sRGB as display RGB: on a P3 MacBook every
+colour was stretched to the panel's wider gamut (guest #ff0000 came out as
+P3 (255,0,0); measured with ScreenCaptureKit in Display P3). Tagged sRGB
+it shows as P3 (234,51,35), the sRGB red.
+
+A 10-bit scanout (GL_RGB10_A2: Hyprland with bitdepth 10, needs a guest
+virtio-gpu that offers 10-bit planes) now keeps its depth: the present
+surfaces become half float (8 bytes a pixel, still capped at the largest
+display like the 8-bit ones). With PINGOUIN_GL_HDR=1 that output is taken as
+BT.2100 PQ (Hyprland's cm "hdr"): the surfaces are tagged PQ and the layer
+asks for EDR headroom, so HDR in the guest shows as HDR on the Mac. The
+app sets PINGOUIN_GL_HDR=1 only when a display has EDR headroom
+(amended by pingouin-cocoa-hdr-headroom.patch, ADR 0049: the app's switch
+sets PINGOUIN_GL_EDR=1, only GL_RGB10_A2 is PQ, macOS does not tone-map
+again and the guest is told the display's headroom). If
+half-float surfaces cannot be made, the frames go to 8-bit surfaces, the
+log says so once and half float is not tried again (else every surface
+remake would try it twice a second).
+Measured on the MacBook's XDR panel: the EDR headroom goes from 1.0 to
+8.8-16 while the VM shows HDR; PQ bars of 100/203/400/600/1000 nits from
+a client that sends PQ (GStreamer waylandsink) read 0.37/0.60/0.89/1.10/
+1.50x SDR white (Hyprland 0.56 tone-maps the top); Hyprland's desktop at
+sdrbrightness 3 reads 2.95x SDR white. mpv 0.41 on OpenGL sends no image
+description, so Hyprland shows it as SDR.
+
+PINGOUIN_GL_COLOR=native leaves the surfaces untagged (the old colours).
+
+Upstream: not sent (OmacVM's IOSurface present).
+Tests: tests/graphics/pacing (colors.html + snapcolor.swift for the
+colours, snaphdr.swift for EDR values, mkclip.sh for the PQ bars), see
+docs/architecture/graphics.md section 12.
+Applies after qemu-cocoa-gl-present-vsync.patch.
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -2915,6 +2915,19 @@
+ static IOSurfaceRef present_surf[PRESENT_SURFACES];
+ static GLuint present_tex[PRESENT_SURFACES];
+ static uint32_t present_w, present_h;
++static bool present_deep;              /* half-float surfaces (10-bit scanout) */
++
++/*
++ * Colour. The guest renders sRGB unless it says otherwise, so the surfaces
++ * are tagged sRGB and Core Animation converts them for the Mac's display;
++ * untagged, a P3 panel showed them oversaturated. A 10-bit scanout keeps
++ * its depth in half-float surfaces. With PINGOUIN_GL_HDR=1 the guest's
++ * 10-bit output is BT.2100 PQ (Hyprland: bitdepth 10, cm "hdr"): those
++ * surfaces are tagged PQ and the layer shows them with EDR headroom.
++ * PINGOUIN_GL_COLOR=native leaves the surfaces untagged, as before.
++ */
++static int present_color = -1;
++static int present_hdr = -1;
+ static unsigned present_next;
+ static dispatch_queue_t present_queue;
+ static QEMUTimer *present_timer;
+@@ -3103,15 +3116,50 @@
+         }
+     }
+     present_w = present_h = 0;
++    present_deep = false;
++}
++
++static bool cocoa_gl_present_hdr_wanted(void)
++{
++    if (present_hdr < 0) {
++        const char *e = getenv("PINGOUIN_GL_HDR");
++        present_hdr = e && !strcmp(e, "1");
++    }
++    return present_hdr == 1;
++}
++
++/* The colour space of frames in a surface of this depth, or NULL. */
++static CGColorSpaceRef cocoa_gl_present_colorspace(bool deep)
++{
++    if (present_color < 0) {
++        const char *e = getenv("PINGOUIN_GL_COLOR");
++        present_color = !(e && !strcmp(e, "native"));
++    }
++    if (!present_color) {
++        return NULL;
++    }
++    return CGColorSpaceCreateWithName(deep && cocoa_gl_present_hdr_wanted() ?
++                                      kCGColorSpaceITUR_2100_PQ :
++                                      kCGColorSpaceSRGB);
+ }
+ 
++/* The thread that commits a frame: EDR only while showing HDR. */
++static void cocoa_gl_layer_follow(CALayer *layer, IOSurfaceRef surf)
++{
++    BOOL hdr = IOSurfaceGetPixelFormat(surf) == 'RGhA' &&
++               present_color == 1 && cocoa_gl_present_hdr_wanted();
++    if ([layer wantsExtendedDynamicRangeContent] != hdr) {
++        [layer setWantsExtendedDynamicRangeContent:hdr];
++    }
++}
++
+ /*
+  * present_ctx is current. Surfaces for a w x h frame, capped at the
+  * largest display. Made again at most every PRESENT_REALLOC_NS: until
+  * then the frame is drawn scaled into the surfaces there are, and the
+  * timer comes back to make the right ones.
+  */
+-static bool cocoa_gl_present_alloc(uint32_t w, uint32_t h)
++static bool cocoa_gl_present_alloc(uint32_t w, uint32_t h, bool deep)
+ {
+     uint64_t cap = qatomic_read(&present_cap);
+     uint32_t cap_w = cap >> 32, cap_h = (uint32_t)cap;
+@@ -3126,7 +3174,7 @@
+         h = MAX(1, (uint32_t)(h * scale));
+     }
+     if (present_surf[0]) {
+-        if (w == present_w && h == present_h) {
++        if (w == present_w && h == present_h && deep == present_deep) {
+             return true;
+         }
+         if (now - present_alloc_ns < PRESENT_REALLOC_NS) {
+@@ -3142,28 +3190,42 @@
+     NSDictionary *props = @{
+         (id)kIOSurfaceWidth: @(w),
+         (id)kIOSurfaceHeight: @(h),
+-        (id)kIOSurfaceBytesPerElement: @4,
+-        (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
++        (id)kIOSurfaceBytesPerElement: deep ? @8 : @4,
++        (id)kIOSurfacePixelFormat: @(deep ? (uint32_t)'RGhA' : (uint32_t)'BGRA'),
+     };
+-    for (int i = 0; i < present_nsurf; i++) {
++    CGColorSpaceRef cs = cocoa_gl_present_colorspace(deep);
++    CFPropertyListRef cs_plist = cs ? CGColorSpaceCopyPropertyList(cs) : NULL;
++    bool ok = true;
++    for (int i = 0; i < present_nsurf && ok; i++) {
+         present_surf[i] = IOSurfaceCreate((CFDictionaryRef)props);
+         if (!present_surf[i]) {
+-            cocoa_gl_present_free();
+-            return false;
++            ok = false;
++            break;
+         }
++        if (cs_plist) {
++            IOSurfaceSetValue(present_surf[i], kIOSurfaceColorSpace, cs_plist);
++        }
+         glGenTextures(1, &present_tex[i]);
+         glBindTexture(GL_TEXTURE_RECTANGLE, present_tex[i]);
+-        if (CGLTexImageIOSurface2D(present_ctx, GL_TEXTURE_RECTANGLE,
+-                                   GL_RGBA, w, h, GL_BGRA,
+-                                   GL_UNSIGNED_INT_8_8_8_8_REV,
+-                                   present_surf[i], 0) != kCGLNoError) {
+-            cocoa_gl_present_free();
+-            return false;
+-        }
++        ok = CGLTexImageIOSurface2D(present_ctx, GL_TEXTURE_RECTANGLE,
++                                    deep ? GL_RGBA16F : GL_RGBA, w, h,
++                                    deep ? GL_RGBA : GL_BGRA,
++                                    deep ? GL_HALF_FLOAT :
++                                           GL_UNSIGNED_INT_8_8_8_8_REV,
++                                    present_surf[i], 0) == kCGLNoError;
+     }
++    if (cs_plist) {
++        CFRelease(cs_plist);
++    }
++    CGColorSpaceRelease(cs);
+     glBindTexture(GL_TEXTURE_RECTANGLE, 0);
++    if (!ok) {
++        cocoa_gl_present_free();
++        return false;
++    }
+     present_w = w;
+     present_h = h;
++    present_deep = deep;
+     present_next = 0;
+     return true;
+ }
+@@ -3202,10 +3264,30 @@
+     }
+     CGLSetCurrentContext(present_ctx);
+ 
+-    if (!cocoa_gl_present_alloc(w, h)) {
+-        CGLSetCurrentContext(prev);
+-        return false;
++    /* A 10-bit scanout keeps its depth: half-float surfaces. */
++    GLint ifmt = 0;
++    glBindTexture(GL_TEXTURE_2D, src);
++    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    bool deep = ifmt == GL_RGB10_A2 || ifmt == GL_RGBA16F || ifmt == GL_RGB16F;
++    static bool deep_failed;           /* half-float surfaces could not be made */
++    deep = deep && !deep_failed;
++    static int deep_logged = -1;
++    if (deep != deep_logged) {
++        info_report("cocoa: scanout format 0x%x, %s surfaces%s", ifmt,
++                    deep ? "half-float" : "8-bit",
++                    deep && cocoa_gl_present_hdr_wanted() ? ", HDR (PQ)" : "");
++        deep_logged = deep;
+     }
++    if (!cocoa_gl_present_alloc(w, h, deep)) {
++        if (!deep || !cocoa_gl_present_alloc(w, h, false)) {
++            CGLSetCurrentContext(prev);
++            return false;
++        }
++        deep_failed = true;
++        warn_report("cocoa: half-float surfaces failed, 8-bit from now on "
++                    "(no deep colour or HDR)");
++    }
+ 
+     /* The next surface Core Animation is not showing or reading. */
+     unsigned i;
+@@ -3297,6 +3379,7 @@
+             NSString *f = filter == GL_LINEAR ? kCAFilterLinear : kCAFilterNearest;
+             [layer setMagnificationFilter:f];
+             [layer setMinificationFilter:f];
++            cocoa_gl_layer_follow(layer, surf);
+             [layer setContents:(id)surf];
+             [CATransaction commit];
+             IOSurfaceDecrementUseCount(surf);
+@@ -3399,6 +3482,7 @@
+     [CATransaction setDisableActions:YES];
+     [layer setMagnificationFilter:f];
+     [layer setMinificationFilter:f];
++    cocoa_gl_layer_follow(layer, surf);
+     [layer setContents:(id)surf];
+     [CATransaction commit];
+ }

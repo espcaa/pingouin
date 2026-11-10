@@ -1,0 +1,108 @@
+From: OmacVM
+Subject: [PATCH] console: a GPU lock for virgl users besides the main loop
+
+What: qemu_console_gl_render_lock()/unlock() in ui/console.c, one mutex.
+The window code's two draw paths that read virglrenderer's textures on the
+AppKit thread take it before the BQL: the layer fallback's
+drawInCGLContext (gpuSafeMode, PINGOUIN_GL_PRESENT=layer) and the extra
+displays' (heads, ADR 0015).
+
+Why: virglrenderer is single threaded. Up to now the BQL kept its users
+apart: QEMU's main loop and those two AppKit draws all held it. With
+virgl running without the BQL (qemu-virtio-gpu-virgl-unlocked.patch) the
+main loop holds this lock instead during such a run, so the AppKit draws
+still never run at the same time. Lock order: this lock, then the BQL. The
+main loop never holds both: it lets go of the BQL before it takes this lock
+and gives this lock back before it takes the BQL again. Without unlocked
+runs nobody else takes the lock and nothing changes.
+
+Upstream: OmacVM only.
+Test: src/tests/gpu-unlocked.sh (both draw paths take it, in that order);
+the stress runs with a second display in full screen (work/tracks/gpu-thread.md).
+
+diff --git a/include/ui/console.h b/include/ui/console.h
+index 34c0606..6919ece 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -305,6 +305,16 @@ void qemu_console_gl_cursor_position(QemuConsole *con,
+                                      uint32_t pos_x, uint32_t pos_y);
+ void qemu_console_gl_release_dmabuf(QemuConsole *con,
+                                     QemuDmaBuf *dmabuf);
++/*
++ * Pingouin: the GPU lock. virglrenderer is single threaded. Its calls come from
++ * QEMU's main loop, which may make them without the BQL (virtio-gpu-gl's
++ * unlocked runs) and then holds this lock, and from the window code's own
++ * GL draws on the AppKit thread, which hold it too. The main loop never holds
++ * this lock and the BQL at once; any other thread takes this lock first.
++ */
++void qemu_console_gl_render_lock(void);
++void qemu_console_gl_render_unlock(void);
++
+ void qemu_console_gl_update(QemuConsole *con,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+ 
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 1756313..105ac97 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -310,9 +310,14 @@ - (void)drawInCGLContext:(CGLContextObj)ctx
+              displayTime:(const CVTimeStamp *)ts
+ {
+     CGLSetCurrentContext(ctx);
+-    
+-    BQL_LOCK_GUARD();
+-    cocoa_gl_render();
++
++    /* Pingouin: virgl's texture: the GPU lock first, then the BQL. */
++    qemu_console_gl_render_lock();
++    {
++        BQL_LOCK_GUARD();
++        cocoa_gl_render();
++    }
++    qemu_console_gl_render_unlock();
+ 
+     [super drawInCGLContext:ctx
+                 pixelFormat:pf
+@@ -9072,11 +9077,14 @@ - (void)drawInCGLContext:(CGLContextObj)ctx
+     CGFloat scale = [self contentsScale];
+ 
+     CGLSetCurrentContext(ctx);
++    /* virgl's texture: the GPU lock first, then the BQL. */
++    qemu_console_gl_render_lock();
+     {
+         BQL_LOCK_GUARD();
+         pingouin_head_render(&pingouin_heads[output],
+                            NSMakeSize(size.width * scale, size.height * scale));
+     }
++    qemu_console_gl_render_unlock();
+     [super drawInCGLContext:ctx pixelFormat:pf forLayerTime:t displayTime:ts];
+ }
+ @end
+diff --git a/ui/console.c b/ui/console.c
+index b025e08..7b5aaaf 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -1041,6 +1041,23 @@ void qemu_console_gl_release_dmabuf(QemuConsole *con,
+     }
+ }
+ 
++static QemuMutex gl_render_mutex;
++
++static void __attribute__((constructor)) gl_render_mutex_init(void)
++{
++    qemu_mutex_init(&gl_render_mutex);
++}
++
++void qemu_console_gl_render_lock(void)
++{
++    qemu_mutex_lock(&gl_render_mutex);
++}
++
++void qemu_console_gl_render_unlock(void)
++{
++    qemu_mutex_unlock(&gl_render_mutex);
++}
++
+ void qemu_console_gl_update(QemuConsole *con,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+ {

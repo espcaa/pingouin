@@ -1,0 +1,146 @@
+virglrenderer: a program the GL gives a too small VirglBlock is refused, no abort
+
+What: bind_virgl_block_loc() reads the GL's size of a linked program's VirglBlock
+(the sysval uniform block every vrend shader declares) into a variable that now
+starts at 0. When the GL reports less than vrend's struct sysval_uniform_block, or
+the query fails and writes nothing, the program is not used: add_shader_program()
+destroys it and handles it as a failed link (remembered per fragment shader, its
+draws skipped, logged as "the host refused a shader (link)", one VirglBlock line);
+a separable pipeline's rebind skips the draw and tries again at the next one. The
+link and compile status variables start at GL_FALSE for the same reason: a status
+query that fails reads as a failure, not as stack garbage.
+Why: the size was read into an uninitialized variable and checked with assert(),
+and the runtime builds virglrenderer with assertions on: QEMU aborted once at
+desktop start ("Assertion failed: ((size_t) virgl_block_size >= sizeof(struct
+sysval_uniform_block)), function bind_virgl_block_loc"), right after the Mac's GL
+had refused calls of the same context (quickshell: a valid shader failed to
+compile with an empty log, fence syncs, buffer maps and framebuffer checks failed,
+while macOS reconfigured its displays). The whole VM died (#547).
+Upstream: the same assert is in upstream virglrenderer; not sent.
+Test: Tests/virgl/test-sysval-block.c with sysval-block-gl.c (the GL's answer for
+VirglBlock made 16 bytes, then a failed query: no abort, no draw reaches the GL,
+one refused-link line; then new shaders draw, the refused program is not linked
+again).
+
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -1772,7 +1772,7 @@ static inline int conv_shader_type(int type)
+ static bool vrend_compile_shader(struct vrend_sub_context *sub_ctx,
+                                  struct vrend_shader *shader)
+ {
+-   GLint param;
++   GLint param = GL_FALSE;
+    const char *shader_parts[SHADER_MAX_STRINGS];
+    char *modified_shaders[SHADER_MAX_STRINGS] = {NULL};
+ 
+@@ -2209,7 +2209,10 @@ static unsigned bind_ubo_locs(struct vrend_linked_shader_program *sprog,
+    return next_ubo_id;
+ }
+ 
+-static void bind_virgl_block_loc(struct vrend_linked_shader_program *sprog,
++/* Pingouin: false when the GL does not report a VirglBlock as large as vrend's sysval block
++ * (a failed query, as Apple's GL gave once while a context's GL calls failed, #547):
++ * the program cannot be used, its draws are skipped like a refused link's. */
++static bool bind_virgl_block_loc(struct vrend_linked_shader_program *sprog,
+                                  enum pipe_shader_type shader_type,
+                                  GLuint virgl_block_ubo_id)
+ {
+@@ -2232,12 +2235,20 @@ static void bind_virgl_block_loc(struct vrend_linked_shader_program *sprog,
+                                   sprog->separate_virgl_block_id[shader_type],
+                                   sprog->virgl_block_bind);
+ 
+-      GLint virgl_block_size;
++      GLint virgl_block_size = 0;
+       int prog_id = sprog->is_pipeline ? sprog->ss[shader_type]->program_id :
+                                          sprog->id.program;
+       glGetActiveUniformBlockiv(prog_id, sprog->separate_virgl_block_id[shader_type],
+                                 GL_UNIFORM_BLOCK_DATA_SIZE, &virgl_block_size);
+-      assert((size_t) virgl_block_size >= sizeof(struct sysval_uniform_block));
++      if (virgl_block_size < 0 ||
++          (size_t) virgl_block_size < sizeof(struct sysval_uniform_block)) {
++         static unsigned logged;
++         if (logged++ < 3)
++            virgl_error("program %u: the GL gives its VirglBlock %d bytes, vrend fills %zu; "
++                        "the program is not used\n", (unsigned)prog_id, virgl_block_size,
++                        sizeof(struct sysval_uniform_block));
++         return false;
++      }
+ 
+       if (created_virgl_block_buffer) {
+          glBindBuffer(GL_UNIFORM_BUFFER, sprog->ubo_sysval_buffer_id);
+@@ -2245,6 +2256,7 @@ static void bind_virgl_block_loc(struct vrend_linked_shader_program *sprog,
+          glBindBuffer(GL_UNIFORM_BUFFER, 0);
+       }
+    }
++   return true;
+ }
+ 
+ /* The binding vrend never puts a buffer at. Before vrend binds a program's uniform
+@@ -2312,7 +2324,8 @@ static bool vrend_blocks_all_bound(const GLuint *ids, unsigned n, GLuint next_ub
+    return true;
+ }
+ 
+-static void rebind_ubo_and_sampler_locs(struct vrend_linked_shader_program *sprog,
++/* false: the program's VirglBlock cannot be used (bind_virgl_block_loc) */
++static bool rebind_ubo_and_sampler_locs(struct vrend_linked_shader_program *sprog,
+                                         enum pipe_shader_type last_shader)
+ {
+    int next_sampler_id = 0;
+@@ -2343,7 +2356,8 @@ static void rebind_ubo_and_sampler_locs(struct vrend_linked_shader_program *spro
+       if (!sprog->ss[shader_type])
+          continue;
+ 
+-      bind_virgl_block_loc(sprog, shader_type, next_ubo_id);
++      if (!bind_virgl_block_loc(sprog, shader_type, next_ubo_id))
++         return false;
+    }
+ 
+    /* Pingouin: the constants' blocks take the bindings after the VirglBlock; a vertex
+@@ -2407,6 +2421,7 @@ static void rebind_ubo_and_sampler_locs(struct vrend_linked_shader_program *spro
+       virgl_info("shader constants: a program had no binding left for its constants "
+                  "blocks; its shaders keep uniforms\n");
+    }
++   return true;
+ }
+ 
+ static void bind_ssbo_locs(struct vrend_linked_shader_program *sprog,
+@@ -2469,7 +2484,7 @@ static void bind_image_locs(struct vrend_linked_shader_program *sprog,
+ 
+ static bool vrend_link(GLuint id)
+ {
+-   GLint lret;
++   GLint lret = GL_FALSE;
+    glLinkProgram(id);
+    glGetProgramiv(id, GL_LINK_STATUS, &lret);
+    if (lret == GL_FALSE) {
+@@ -2830,7 +2845,14 @@ static struct vrend_linked_shader_program *add_shader_program(struct vrend_sub_c
+       if (sprog->ss[shader_type]->sel->sinfo.reads_drawid)
+          sprog->reads_drawid = true;
+    }
+-   rebind_ubo_and_sampler_locs(sprog, last_shader);
++   if (!rebind_ubo_and_sampler_locs(sprog, last_shader)) {
++      /* as a failed link: the program goes, its draws are skipped */
++      bool dual_src = sprog->dual_src_linked;
++      vrend_destroy_program(sprog);
++      vrend_remember_failed_program(vs, fs, gs, tcs, tes, dual_src);
++      vrend_report_shader_failure(sub_ctx->parent, "link");
++      return NULL;
++   }
+ 
+    if (!has_feature(feat_gles31_vertex_attrib_binding)) {
+       if (vs->sel->sinfo.num_inputs) {
+@@ -7460,7 +7482,13 @@ vrend_select_program(struct vrend_sub_context *sub_ctx, uint8_t vertices_per_pat
+ 
+           if (need_rebind) {
+              vrend_use_program(sub_ctx, prog);
+-             rebind_ubo_and_sampler_locs(prog, last_shader);
++             if (!rebind_ubo_and_sampler_locs(prog, last_shader)) {
++                /* rebound again at the next draw; this one is skipped */
++                for (enum pipe_shader_type t = PIPE_SHADER_VERTEX; t <= last_shader; t++)
++                   if (prog->ss[t])
++                      prog->ss[t]->last_pipeline_id = 0xffffffff;
++                return PROGRAMM_ERROR;
++             }
+           }
+       }
+ 

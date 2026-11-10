@@ -1,0 +1,1777 @@
+From: OmacVM
+Subject: [PATCH] ui/cocoa: start animation, then Omarchy's logo until the desktop
+
+What: when the window opens, OMACVM turns into Omarchy's logo (O, M and A
+stay, the cells of C, V and M fly and land as R, C, H and Y), Omarchy green
+on Omarchy's background: OMACVM holds 2.5 s, the cells fly for about 2.6 s,
+the glow goes by 5.46 s. Then the logo holds until Omarchy's desktop (or its
+login or lock screen) is there, over the firmware's progress bar, GRUB's
+text and Linux's console, and fades into it. The desktop is there when the
+guest's picture is lit almost everywhere (a wallpaper, not text on black nor
+Hyprland's grey before the wallpaper; 32 x 18 pixels looked at 4 times a
+second, read back from the scanout's texture), or 2 s after Omarchy's
+display agent (pingouin-displays, a user service that starts with the desktop)
+said hello on its port app.pingouin.display without a lit picture (a dark
+wallpaper). The hello comes about 0.5 s before the wallpaper: fading on it
+showed Hyprland's grey for a moment. QEMU's window talks to the agent when
+the launcher sets PINGOUIN_DISPLAY_SOCKET; without that channel the port's
+opening counts (with it, the firmware opens the port too, EDK2's
+VirtioSerialDxe answers the host's open 0.2 s into the boot). If the
+desktop comes before the animation ends, the animation still plays to its
+end. The logo gives way at once when the VM stops on an error, and after
+40 s of running time without a desktop (PINGOUIN_SPLASH_HOLD_SECONDS), so a
+prompt or an error in the guest is not hidden for long; qemu.log says which
+it was. After that it still looks once a second for the desktop, so that
+an output the desktop turns off later is black, not the logo. The
+animation's frames come from a display link, which gives a window that is
+not visible none: once the animation is over by the clock and no frame came
+for 0.25 s, the logo fades without them (it stayed over the desktop). After a reboot the logo comes back, still, the same way. It
+plays with macOS's Reduce motion on too (the user wants it on every start);
+PINGOUIN_SPLASH_ANIMATION=0: the logo without the morph. Only the main window
+has the animation.
+Under it, in the GL layers of the main window and the other displays' windows:
+until the guest shows a picture on an output, and when it switches it off,
+Omarchy's logo on Omarchy's background instead of QEMU's placeholder text
+("Display output is not active.", "Guest has not initialized the display
+(yet)."); once the desktop was there (until the next reset), plain black, as
+a screen that is off (an idle Omarchy turns its display off). If the guest
+has shown nothing of its own 90 s of running time after it started
+(PINGOUIN_SPLASH_HINT_SECONDS), a line under the logo says Omarchy is taking
+long and where its logs are (PINGOUIN_LOGS, set by the launcher), and qemu.log
+gets a warning. PINGOUIN_BOOT_SPLASH=0 brings QEMU's text back and turns the
+logo and the animation off. The main window's layer now draws again when the
+window changes size (cheap; the still logo has no frames of its own).
+With frames shown as IOSurfaces (the default since 2.9.0) the still logo
+and the black are drawn into the surface at the view's size in pixels
+(updateUIInfo tells it, and a new size draws again), and the animation's
+layer goes over the surface layer as it did over the CAOpenGLLayer;
+PINGOUIN_GL_PRESENT=layer draws them in the CAOpenGLLayer as before. The patch comes after the GPU,
+shortcut, pointer and idle-refresh patches of ui/cocoa.m.
+
+Why: every start showed QEMU's text for a few seconds (before the firmware,
+and from GRUB until Linux draws), then the firmware, GRUB and Linux's text,
+and every reboot the text for longer. It looked like errors but is just the
+guest getting ready. The user asked for the logo from the window's first
+frame to the desktop, and for the animation (the preview they picked,
+a-pixel-morph) to run slower to fill the 3 to 5 s of loading.
+
+How: the animation and the held logo are a Core Animation layer over the
+window's GL layer (a shape layer for the cells, sharp at any size and scale;
+a small glow image under them laid over the preview's frame), driven by a
+CADisplayLink on the main thread; the guest is never held up. Their green and
+navy are made in the window's colour space: GL's pixels reach the screen
+unconverted, so the layer's are the very values of the GL logo, the
+firmware's and the guest's. The core (no Cocoa, no QEMU, ui/pingouin-splash.h)
+is a port of the preview's generator on a slowed timeline: the flying cells'
+table is made by boot-logo/make-splash-morph.py, the glow is the preview's
+blur (Pillow's resampling weights). The still logo in the GL layers is an
+81 x 19 texture with sharp cells. The logo is as big as the firmware's
+1920 x 1080 frame stretched to the view would have it (810 x 190 there:
+10 pixels a cell; the user asked for a small logo, about 200 pixels tall),
+with square cells, in the middle. The logo is the firmware's
+(boot-logo/make-logo-bmp.py logo.svg --rows, from Omarchy's logo.svg, MIT).
+
+Upstream: OmacVM only (branding), not for QEMU.
+
+Test: Tests/display/test-boot-splash-cells.py (the cells make exactly the
+firmware's Logo.bmp of edk2-logo-omarchy.patch, at SPLASH_CELL);
+make-splash-morph.py --check (the table is the generator's);
+Tests/display/test-boot-splash-morph.c (the core starts as OMACVM, holds it
+about 0.6 s, flies 2.5 to 3 s and ends as the logo, still, on the pixels GL's
+nearest sampling gives at several window sizes, square cells; no jumps; the
+glow comes and goes; the desktop is told apart from the firmware's logo,
+a console full of text and Hyprland's grey; the logo goes on the lit
+desktop, not on the agent's hello alone, 2 s after the hello at most, at
+the time limit only without the agent, at once on an error); Tests/display/
+test-boot-splash-fade.m (the layer's no-action list has "opacity", so the
+fade into the desktop is only its own 0.4 s one: CA's implicit 0.25 s fade
+ended first and the logo came back at ~25 %); Tests/display/
+test-boot-splash-motion.m (pingouin_intro_start: the animation with macOS's
+Reduce motion on and off, the still logo only with
+PINGOUIN_SPLASH_ANIMATION=0). The build runs all five;
+Tests/display/check-boot-splash.sh runs them from this patch alone (CI).
+The core's cells and glow at any time are the earlier core's (which matched
+the preview's frames) at the preview's time, frame for frame at 120 Hz.
+Checked in the app on a test VM: a cold start (OMACVM 0.6 s, the morph to
+about 3.2 s at ~60 fps, the logo held over the firmware, GRUB's menu and
+Linux, given way when the wallpaper showed, 12.6 s), a reboot (the still
+logo again to the desktop), the display agent's port opened by hand (gives
+way at once), the time limit at 2 s (the animation still ends first), the
+still logo; the layer's green and navy are the GL logo's and the firmware's
+values on the screen (168,205,118 and 26,27,38), the logo's box the GL
+logo's to the pixel. Through the launcher (RC2 pre-stage verify) the
+logo gave way 0.2 s in, on the firmware's port open: fixed by the hello.
+RC2 polish: the fade landed on Hyprland's grey ~0.5 s before the wallpaper
+(the logo now waits for it), and after a 40 s fallback an output the later
+desktop turned off showed the logo instead of black. Twice in five test
+starts the window got no display-link frames, the animation stood still
+and the logo never faded: now it fades by the clock. A display link only
+the run loop held was freed inside its -invalidate: replacing one that
+never gave a frame (window not visible: screen locked, app hidden) aborted
+QEMU; the logo layer now holds its link.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -210,6 +210,10 @@ static void cocoa_gl_switch(DisplayChangeListener *dcl,
+                             DisplaySurface *new_surface);
+ 
+ static void cocoa_gl_render(void);
++/* Pingouin boot splash: the main view's size in pixels (BQL). */
++static void pingouin_splash_view_size(uint32_t w, uint32_t h);
++/* GL frames are shown as IOSurfaces (the view's layer is a plain CALayer). */
++static bool cocoa_gl_present_on(void);
+ 
+ static bool cocoa_gl_is_compatible_dcl(DisplayGLCtx *dgc,
+                                        DisplayChangeListener *dcl);
+@@ -238,6 +242,8 @@ static DisplayGLCtx dgc = {
+     self = [super init];
+     if (self) {
+         [self setAsynchronous:NO];
++        /* Pingouin: drawn again at the new size (the boot splash has no frames). */
++        [self setNeedsDisplayOnBoundsChange:YES];
+     }
+     return self;
+ }
+@@ -1266,6 +1272,9 @@ static bool pingouin_notch_mode(void)
+     info.yoff = 0;
+     NSSize backingFrameSize = [self convertSizeToBacking:frameSize];
+     CGFloat backingScale = [[self window] backingScaleFactor];
++#ifdef CONFIG_OPENGL
++    pingouin_splash_view_size(backingFrameSize.width, backingFrameSize.height);
++#endif
+     /* Keep the corresponding Hyprland logical dimensions integral. */
+     uint32_t cleanScaleDivisor = backingScale > 1.75 ? 2 :
+                                  backingScale > 1.25 ? 3 : 1;
+@@ -3353,6 +3362,889 @@ static void cocoa_gl_destroy_context(DisplayGLCtx *dgc, QEMUGLContext ctx)
+     CGLDestroyContext(ctx);
+ }
+ 
++/*
++ * Pingouin boot splash. When the window opens, PINGOUIN turns into Omarchy's
++ * logo (the start animation, below), and the logo stays over the window
++ * until Omarchy's desktop (or its login or lock screen) is there: the
++ * firmware's progress bar, GRUB's text and Linux's console stay under it.
++ * After a reboot the logo comes back, still, the same way. The desktop is
++ * there when the guest's picture is lit almost everywhere
++ * (pingouin_splash_desktop: a wallpaper, not text on black nor Hyprland's grey
++ * before the wallpaper), looked at 4 times a second, or 2 s after Omarchy's
++ * display agent (pingouin-displays, a user service that starts with the
++ * desktop) said hello on its port, app.pingouin.display, without a lit
++ * picture (a dark wallpaper). QEMU's window talks to the agent when the
++ * launcher gives PINGOUIN_DISPLAY_SOCKET; else the port's opening counts. The
++ * hello comes about 0.5 s before the wallpaper, so the logo does not fade
++ * into Hyprland's grey (pingouin_splash_look decides).
++ * The logo gives way earlier, and says why in qemu.log, when the VM stops on
++ * an error (at once, even mid-animation), or when there is no desktop after
++ * PINGOUIN_SPLASH_HOLD_SECONDS (40) of running time: whatever the guest shows
++ * then (a prompt, an error) is not hidden for longer. It still looks once a
++ * second for the desktop then, so that an output the desktop turns off later
++ * is black, not the logo. If QEMU itself fails (no disk, a crash), it quits
++ * and the app says so, as before.
++ *
++ * Under the logo, in the window's GL layer, and on the other displays: until
++ * the guest shows a picture on an output, and when it switches the output
++ * off again, the output shows Omarchy's logo on Omarchy's background instead
++ * of QEMU's "Display output is not active."; once the desktop was there
++ * (until the next reset) plain black, as a screen that is off (an idle
++ * Omarchy turns its display off). When the guest has shown nothing of its own
++ * PINGOUIN_SPLASH_HINT_SECONDS (90) of running time after it started, a line
++ * under the logo says so and where the logs are, and qemu.log gets a warning.
++ * PINGOUIN_BOOT_SPLASH=0: QEMU's text, as before, and no animation.
++ *
++ * The logo is as big as the firmware's 1920 x 1080 frame stretched to the
++ * view would have it (810 x 190 there), with square cells, in the middle.
++ *
++ * Threads: the state below is used with the BQL (QEMU's thread, and the
++ * layers' draws on the main thread take it); the hint label and the
++ * animation's layer are main thread only.
++ */
++#include "hw/virtio/virtio-serial.h"
++#include "ui/pingouin-splash.h"   /* the logo's cells, the animation's core */
++
++static int pingouin_splash_on = -1;       /* PINGOUIN_BOOT_SPLASH */
++static GLuint pingouin_splash_tex;        /* the logo; gl_view_ctx's group */
++static bool pingouin_guest_drew;          /* a picture of the guest's since the last reset */
++static bool pingouin_desktop_up;          /* its desktop since the last reset */
++/* The display agent said hello since the last reset (main thread sets, BQL clears; atomic). */
++static bool pingouin_display_hello;
++static bool pingouin_splash_hint_up;
++static QEMUTimer *pingouin_splash_timer;
++static NSTextField *pingouin_splash_hint; /* main thread */
++/* The main scanout's place in its texture (the texture may not know its size). */
++static uint32_t gl_scanout_x, gl_scanout_y, gl_scanout_w, gl_scanout_h;
++/* The window's logo waits for the desktop: */
++static bool pingouin_overlay_ok;          /* the window has the logo's layer */
++static bool pingouin_holding;
++static bool pingouin_hold_dirty;          /* the guest's picture changed since the last look */
++static int64_t pingouin_hold_since;       /* QEMU_CLOCK_VIRTUAL ms */
++static int64_t pingouin_agent_since = -1; /* QEMU_CLOCK_REALTIME ms the agent was first seen, -1 */
++/* After the time limit the logo has gone; the desktop may still come (then black when off). */
++static bool pingouin_watching;
++static QEMUTimer *pingouin_hold_timer;    /* QEMU_CLOCK_REALTIME, while holding or watching */
++/* The main view in pixels: the IOSurface path draws the logo at its size. */
++static uint32_t pingouin_view_w, pingouin_view_h;
++
++#define SPLASH_HOLD_TICK_MS 250
++#define SPLASH_SETTLE_TICK_MS 100   /* the agent is up: the wallpaper is close */
++#define SPLASH_WATCH_TICK_MS 1000   /* after the time limit */
++
++static bool pingouin_splash_enabled(void)
++{
++    if (pingouin_splash_on < 0) {
++        const char *v = getenv("PINGOUIN_BOOT_SPLASH");
++        pingouin_splash_on = !(v && !strcmp(v, "0"));
++        info_report("cocoa: boot splash %s",
++                    pingouin_splash_on ? "on" : "off (PINGOUIN_BOOT_SPLASH=0)");
++    }
++    return pingouin_splash_on;
++}
++
++/* An output without a picture of the guest's: none yet, or switched off. */
++static bool pingouin_splash_wanted(DisplayGLTextureBorrower borrow,
++                                 DisplaySurface *s)
++{
++#ifdef CONFIG_EGL
++    if (egl_surface) {
++        return false;   /* the logo's texture is in the CGL contexts */
++    }
++#endif
++    return !borrow && (!s || surface_is_placeholder(s)) &&
++           pingouin_splash_enabled();
++}
++
++/* BQL: the main view's size changed; the IOSurface path draws again at it. */
++static void pingouin_splash_view_size(uint32_t w, uint32_t h)
++{
++    if (w == pingouin_view_w && h == pingouin_view_h) {
++        return;
++    }
++    pingouin_view_w = w;
++    pingouin_view_h = h;
++    gl_dirty = true;
++    cocoa_refresh_activity();
++}
++
++/*
++ * With the BQL, in a CGL context that shares gl_view_ctx's objects: a w x h
++ * pixel output without a picture. logo: the logo on Omarchy's background;
++ * else black (the desktop was there: the guest turned the output off).
++ * top_first: the framebuffer's first row is the top (an IOSurface), not the
++ * bottom (a CAOpenGLLayer); gls: the context's shader.
++ */
++static void pingouin_splash_draw_with(QemuGLShader *gls, int w, int h, bool logo,
++                                    bool top_first)
++{
++    uint32_t bg = logo ? SPLASH_NAVY : 0;
++
++    glClearColor((bg >> 16) / 255.0, ((bg >> 8) & 0xff) / 255.0, (bg & 0xff) / 255.0, 1);
++    glClear(GL_COLOR_BUFFER_BIT);
++    if (!logo) {
++        return;
++    }
++    if (!pingouin_splash_tex) {
++        static uint32_t px[SPLASH_ROWS * SPLASH_COLS];
++        for (int r = 0; r < SPLASH_ROWS; r++) {
++            for (int c = 0; c < SPLASH_COLS; c++) {
++                px[r * SPLASH_COLS + c] = 0xff000000 |
++                    (pingouin_splash_cells[r][c] == '#' ? SPLASH_GREEN : SPLASH_NAVY);
++            }
++        }
++        glGenTextures(1, &pingouin_splash_tex);
++        glBindTexture(GL_TEXTURE_2D, pingouin_splash_tex);
++        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SPLASH_COLS, SPLASH_ROWS, 0,
++                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, px);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    }
++    IntroGeom g = pingouin_intro_geom(w, h);
++
++    glViewport((int)g.left, top_first ? (int)g.top : h - (int)g.top - g.lh, g.lw, g.lh);
++    glBindTexture(GL_TEXTURE_2D, pingouin_splash_tex);
++    /* Sharp cells, whatever the zoom filter. */
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    qemu_gl_run_texture_blit(gls, top_first);
++    glViewport(0, 0, w, h);
++}
++
++static void pingouin_splash_draw(int w, int h, bool logo)
++{
++    pingouin_splash_draw_with(dgc.gls, w, h, logo, false);
++}
++
++/* Main thread: the hint under the logo of the main window. */
++static void pingouin_splash_hint_show(bool show)
++{
++    if (!show) {
++        [pingouin_splash_hint removeFromSuperview];
++        return;
++    }
++    if (!pingouin_splash_hint) {
++        const char *logs = getenv("PINGOUIN_LOGS");
++        NSString *text = logs && *logs ?
++            [NSString stringWithFormat:@"The guest is taking long to start. Its logs: %@",
++             [[NSString stringWithUTF8String:logs] stringByAbbreviatingWithTildeInPath]] :
++            @"The guest is taking long to start. Its logs are in the VM's folder.";
++        pingouin_splash_hint = [[NSTextField labelWithString:text] retain];
++        [pingouin_splash_hint setFont:[NSFont monospacedSystemFontOfSize:13
++                                                                weight:NSFontWeightRegular]];
++        [pingouin_splash_hint setTextColor:[NSColor colorWithSRGBRed:0.66 green:0.69
++                                                              blue:0.84 alpha:1]];
++        [pingouin_splash_hint sizeToFit];
++        [pingouin_splash_hint setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin |
++                                                NSViewMinYMargin | NSViewMaxYMargin];
++    }
++    NSRect b = [cocoaView bounds];
++    NSSize size = [pingouin_splash_hint frame].size;
++    /* 32 points under the logo (in points, from the bottom). */
++    IntroGeom g = pingouin_intro_geom((int)b.size.width, (int)b.size.height);
++    CGFloat y = b.size.height - g.top - g.lh - 32 - size.height;
++    [pingouin_splash_hint setFrame:NSMakeRect(floor((b.size.width - size.width) / 2),
++                                            floor(MAX(8, y)), size.width, size.height)];
++    if (![pingouin_splash_hint superview]) {
++        [cocoaView addSubview:pingouin_splash_hint];
++    }
++}
++
++static int pingouin_splash_seconds(const char *name, int fallback)
++{
++    const char *v = getenv(name);
++    return v && atoi(v) > 0 ? MIN(atoi(v), 3600) : fallback;
++}
++
++static int pingouin_splash_hint_seconds(void)
++{
++    static int seconds;
++    if (!seconds) {
++        seconds = pingouin_splash_seconds("PINGOUIN_SPLASH_HINT_SECONDS", 90);
++    }
++    return seconds;
++}
++
++/* QEMU's thread, BQL: the guest has run that long and shows nothing yet. */
++static void pingouin_splash_hint_timer(void *opaque)
++{
++    if (pingouin_guest_drew || !pingouin_splash_wanted(gl_scanout_borrow, surface)) {
++        return;
++    }
++    pingouin_splash_hint_up = true;
++    warn_report("cocoa: no picture from the guest %d s after it started",
++                pingouin_splash_hint_seconds());
++    dispatch_async(dispatch_get_main_queue(), ^{
++        pingouin_splash_hint_show(true);
++    });
++}
++
++/* QEMU's thread, BQL: the main output changed. */
++static void pingouin_splash_update(void)
++{
++    pingouin_hold_dirty = true;
++    if (gl_scanout_borrow || (surface && !surface_is_placeholder(surface))) {
++        pingouin_guest_drew = true;
++    }
++    if (!pingouin_guest_drew && pingouin_splash_wanted(gl_scanout_borrow, surface)) {
++        /* Guest time: a paused VM is not slow to start. */
++        if (!pingouin_splash_timer) {
++            pingouin_splash_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                                               pingouin_splash_hint_timer, NULL);
++        }
++        if (!pingouin_splash_hint_up && !timer_pending(pingouin_splash_timer)) {
++            timer_mod(pingouin_splash_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
++                                           pingouin_splash_hint_seconds() * 1000LL);
++        }
++        return;
++    }
++    if (pingouin_splash_timer) {
++        timer_del(pingouin_splash_timer);
++    }
++    if (pingouin_splash_hint_up) {
++        pingouin_splash_hint_up = false;
++        dispatch_async(dispatch_get_main_queue(), ^{
++            pingouin_splash_hint_show(false);
++        });
++    }
++}
++
++/*
++ * With the view context: w x h pixels of the texture from (x, y) (GL's rows,
++ * from the bottom) into px as 0xAARRGGBB. False if it cannot be read (said
++ * once; the logo then waits for the display agent or the time limit).
++ */
++static bool pingouin_splash_read(GLuint tex, int x, int y, int w, int h, uint32_t *px)
++{
++    static GLuint fb;
++    static bool said;
++    GLenum status, err;
++
++    if (!fb) {
++        glGenFramebuffers(1, &fb);
++    }
++    while (glGetError() != GL_NO_ERROR) {
++        /* not ours */
++    }
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
++    status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
++    if (status == GL_FRAMEBUFFER_COMPLETE) {
++        glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++        glReadPixels(x, y, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, px);
++    }
++    err = glGetError();
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++    if (status != GL_FRAMEBUFFER_COMPLETE || err != GL_NO_ERROR) {
++        if (!said) {
++            said = true;
++            info_report("cocoa: boot splash cannot read the guest's picture "
++                        "(framebuffer 0x%x, error 0x%x)", status, err);
++        }
++        return false;
++    }
++    return true;
++}
++
++/*
++ * QEMU's thread, BQL: does the main output show the guest's desktop? The
++ * probe's pixels, from the GL scanout's texture (one row of it at a time) or
++ * from the 2D surface.
++ */
++static bool pingouin_splash_sees_desktop(void)
++{
++    static uint32_t px[SPLASH_PROBE_ROWS * SPLASH_PROBE_COLS];
++    static uint32_t line[16384];
++
++    if (gl_scanout_borrow) {
++        DisplayGLTexture tex = gl_scanout_borrow(gl_scanout_id);
++        __block bool ok = true;
++
++        if (!tex.width || !tex.height) {
++            tex.width = gl_scanout_x + gl_scanout_w;
++            tex.height = gl_scanout_y + gl_scanout_h;
++        }
++        if (!tex.id || !gl_scanout_w || !gl_scanout_h || tex.width > 16384 ||
++            gl_scanout_x + gl_scanout_w > tex.width || gl_scanout_y + gl_scanout_h > tex.height) {
++            return false;
++        }
++        with_gl_view_ctx(^{
++            for (int r = 0; r < SPLASH_PROBE_ROWS && ok; r++) {
++                int y = gl_scanout_y + pingouin_splash_probe_at(r, SPLASH_PROBE_ROWS, gl_scanout_h);
++                ok = pingouin_splash_read(tex.id, gl_scanout_x, tex.y_0_top ? y : tex.height - 1 - y,
++                                        gl_scanout_w, 1, line);
++                for (int c = 0; ok && c < SPLASH_PROBE_COLS; c++) {
++                    px[r * SPLASH_PROBE_COLS + c] =
++                        line[pingouin_splash_probe_at(c, SPLASH_PROBE_COLS, gl_scanout_w)];
++                }
++            }
++        });
++        return ok && pingouin_splash_desktop(px);
++    }
++    if (!surface || surface_is_placeholder(surface) || surface_bits_per_pixel(surface) != 32) {
++        return false;
++    }
++    for (int r = 0; r < SPLASH_PROBE_ROWS; r++) {
++        const uint8_t *row = (const uint8_t *)surface_data(surface) + (size_t)surface_stride(surface) *
++            pingouin_splash_probe_at(r, SPLASH_PROBE_ROWS, surface_height(surface));
++        for (int c = 0; c < SPLASH_PROBE_COLS; c++) {
++            memcpy(&px[r * SPLASH_PROBE_COLS + c],
++                   row + 4 * pingouin_splash_probe_at(c, SPLASH_PROBE_COLS, surface_width(surface)), 4);
++        }
++    }
++    return pingouin_splash_desktop(px);
++}
++
++/* BQL: has the guest's display agent opened its port (it starts with the desktop)? */
++static int pingouin_splash_agent_port(Object *obj, void *opaque)
++{
++    VirtIOSerialPort *port = (VirtIOSerialPort *)object_dynamic_cast(obj, TYPE_VIRTIO_SERIAL_PORT);
++
++    if (port && port->name && !strcmp(port->name, "app.pingouin.display") &&
++        port->guest_connected) {
++        *(bool *)opaque = true;
++        return 1;
++    }
++    return 0;
++}
++
++static bool pingouin_splash_agent_up(void)
++{
++    const char *chan = getenv("PINGOUIN_DISPLAY_SOCKET");
++    bool up = false;
++
++    /*
++     * With the window's channel open on the Mac side, the port's opening
++     * proves nothing: the firmware (EDK2's VirtioSerialDxe) opens every port
++     * the host has open, 0.2 s into the boot. Then only the agent's hello counts.
++     */
++    if (chan && *chan) {
++        return qatomic_read(&pingouin_display_hello);
++    }
++    object_child_foreach_recursive(object_get_root(), pingouin_splash_agent_port, &up);
++    return up;
++}
++
++static void pingouin_intro_reveal(bool now);
++
++/*
++ * QEMU's thread, BQL, 4 times a second while the logo waits (10 once the
++ * agent is up): is the desktop there? After the time limit, once a second
++ * until the desktop comes, so that an output it turns off is black.
++ */
++static void pingouin_hold_tick(void *opaque)
++{
++    int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
++    int64_t ran = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) - pingouin_hold_since;
++    int limit = pingouin_splash_seconds("PINGOUIN_SPLASH_HOLD_SECONDS", 40);
++    bool error = runstate_check(RUN_STATE_INTERNAL_ERROR) || runstate_check(RUN_STATE_IO_ERROR) ||
++                 runstate_check(RUN_STATE_GUEST_PANICKED);
++    const char *why = NULL;
++    bool lit;
++
++    if (!pingouin_holding && !pingouin_watching) {
++        return;
++    }
++    if (pingouin_agent_since < 0 && pingouin_splash_agent_up()) {
++        pingouin_agent_since = now_ms;
++        pingouin_hold_dirty = true;   /* the wallpaper may be there already */
++    }
++    lit = pingouin_hold_dirty && pingouin_splash_sees_desktop();
++    pingouin_hold_dirty = false;
++    if (pingouin_watching) {
++        if (pingouin_agent_since >= 0 || lit) {
++            pingouin_watching = false;
++            pingouin_desktop_up = true;
++            gl_dirty = true;
++            info_report("cocoa: the desktop came after the boot logo's time limit "
++                        "(%.1f s of running time after the start)", ran / 1000.0);
++        } else {
++            timer_mod(pingouin_hold_timer, now_ms + SPLASH_WATCH_TICK_MS);
++        }
++        return;
++    }
++    switch (pingouin_splash_look(error, lit, pingouin_agent_since < 0 ? -1 : now_ms - pingouin_agent_since,
++                               ran, limit * 1000LL)) {
++    case SPLASH_LOOK_HOLD:
++        timer_mod(pingouin_hold_timer, now_ms +
++                  (pingouin_agent_since < 0 ? SPLASH_HOLD_TICK_MS : SPLASH_SETTLE_TICK_MS));
++        return;
++    case SPLASH_LOOK_ERROR:
++        why = "the VM stopped on an error";
++        break;
++    case SPLASH_LOOK_DESKTOP:
++        why = pingouin_agent_since < 0 ? "the guest shows its desktop"
++                                     : "the guest's display agent started and the desktop is drawn";
++        pingouin_desktop_up = true;
++        break;
++    case SPLASH_LOOK_AGENT:
++        why = "the guest's display agent started (no lit desktop 2 s later)";
++        pingouin_desktop_up = true;
++        break;
++    case SPLASH_LOOK_LIMIT:
++        why = "no desktop yet: the guest's screen as it is";
++        pingouin_watching = true;
++        timer_mod(pingouin_hold_timer, now_ms + SPLASH_WATCH_TICK_MS);
++        break;
++    }
++    pingouin_holding = false;
++    gl_dirty = true;
++    info_report("cocoa: boot logo gives way, %s (%.1f s of running time after the start)",
++                why, ran / 1000.0);
++    dispatch_async(dispatch_get_main_queue(), ^{
++        pingouin_intro_reveal(error);
++    });
++}
++
++/* BQL: the window's logo waits for the desktop from now on. */
++static void pingouin_hold_start(void)
++{
++    pingouin_holding = true;
++    pingouin_watching = false;
++    pingouin_hold_dirty = true;
++    pingouin_agent_since = -1;
++    pingouin_hold_since = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    if (!pingouin_hold_timer) {
++        pingouin_hold_timer = timer_new_ms(QEMU_CLOCK_REALTIME, pingouin_hold_tick, NULL);
++    }
++    timer_mod(pingouin_hold_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + SPLASH_HOLD_TICK_MS);
++}
++
++static void pingouin_intro_again(void);
++
++/* A guest reset starts over: the logo again until the desktop, the hint's clock. */
++static void pingouin_splash_reset(void *opaque)
++{
++    pingouin_guest_drew = false;
++    qatomic_set(&pingouin_display_hello, false);
++    pingouin_desktop_up = false;
++    pingouin_watching = false;
++    pingouin_agent_since = -1;
++    if (pingouin_overlay_ok) {
++        pingouin_hold_start();
++        dispatch_async(dispatch_get_main_queue(), ^{
++            pingouin_intro_again();
++        });
++    }
++}
++
++/*
++ * Pingouin start animation: when the window opens, PINGOUIN turns into Omarchy's
++ * logo (O, M and A stay, the cells of C, V and M fly and land as R, C, H and
++ * Y), Omarchy green on Omarchy's background: PINGOUIN holds 2.5 s, the cells
++ * fly for about 2.6 s, the glow goes by 5.46 s (pingouin-splash.h has the
++ * timeline). This is the preview the user picked (a-pixel-morph), slowed
++ * down, drawn natively: the cells are a Core Animation shape layer, sharp at
++ * any size, the soft glow a small image under them, worked out as the
++ * preview did. Then the logo holds until the desktop is there (above); if
++ * that comes earlier, the animation still plays to its end, then fades. The
++ * guest is never held up: this is only drawing over the window.
++ * Also with macOS's Reduce motion on (the user wants it on every start);
++ * PINGOUIN_SPLASH_ANIMATION=0: the logo without the morph.
++ * After a reboot: the logo, still. Only the main window has it.
++ *
++ * Colours: GL's pixels reach the screen unconverted (the layer has no colour
++ * space), so the layer's green and navy are made in the window's colour space,
++ * and stay the very values of the GL logo, the firmware's and the guest's.
++ *
++ * Threads: all of it runs on the main thread (a CADisplayLink drives the
++ * frames); QEMU's thread only says when to give way (dispatch_async).
++ * The core (the cells at a time, where they go in the window, the glow) is
++ * in ui/pingouin-splash.h: Tests/display/test-boot-splash-morph.c builds and
++ * checks it on its own.
++ */
++
++static void pingouin_splash_colour(uint32_t rgb, CGFloat *c)
++{
++    c[0] = (rgb >> 16) / 255.0;
++    c[1] = ((rgb >> 8) & 0xff) / 255.0;
++    c[2] = (rgb & 0xff) / 255.0;
++    c[3] = 1;
++}
++
++@interface PingouinIntroLayer : CALayer
++- (id)initStill:(BOOL)still;
++- (void)play;
++- (void)hold;
++- (void)reveal:(BOOL)now;
++@end
++
++static PingouinIntroLayer *pingouin_intro;   /* main thread; nil once it fades */
++
++#define INTRO_FADE 0.4   /* s */
++
++@implementation PingouinIntroLayer {
++    CAShapeLayer *cells;
++    CALayer *glow;              /* the glow image over the preview's frame */
++    CADisplayLink *link;
++    CGColorSpaceRef space;      /* the window's */
++    double t;                   /* where the animation is (s) */
++    CFTimeInterval start;       /* of the first frame; 0 before */
++    CFTimeInterval opened;
++    CFTimeInterval last_tick;   /* when the display link last gave a frame; 0 before */
++    CFTimeInterval relinked;    /* when -watchLink made a new display link; 0 before */
++    int relinks;
++    unsigned frames;            /* the animation's, for the log */
++    double longest;             /* the longest time between two of them (s) */
++    bool ready;                 /* the desktop is there: fade once the animation ends */
++    bool fading;
++    IntroCell buf[INTRO_MAX];
++    uint8_t bg[INTRO_BG_W * INTRO_BG_H * 4];
++}
++
++- (id)initStill:(BOOL)still
++{
++    self = [super init];
++    if (self) {
++        NSDictionary *none = @{ @"path": [NSNull null], @"bounds": [NSNull null],
++                                @"position": [NSNull null], @"contents": [NSNull null],
++                                @"contentsScale": [NSNull null], @"hidden": [NSNull null],
++                                @"backgroundColor": [NSNull null], @"fillColor": [NSNull null],
++                                /* -fade's own animation only: CA's implicit 0.25 s one would
++                                 * end first and the logo come back at 25 % for a moment. */
++                                @"opacity": [NSNull null] };
++
++        t = still ? INTRO_END : 0;
++        opened = CACurrentMediaTime();
++        [self setActions:none];
++        /* Under QEMU's labels (pause, the slow-start hint) and the cursor. */
++        [self setZPosition:-1];
++        [self setAutoresizingMask:kCALayerWidthSizable | kCALayerHeightSizable];
++        glow = [[CALayer alloc] init];
++        [glow setActions:none];
++        [glow setContentsGravity:kCAGravityResize];
++        [glow setMagnificationFilter:kCAFilterLinear];
++        [glow setHidden:YES];
++        [self addSublayer:glow];
++        cells = [[CAShapeLayer alloc] init];
++        [cells setActions:none];
++        [cells setAutoresizingMask:kCALayerWidthSizable | kCALayerHeightSizable];
++        [self addSublayer:cells];
++        [self colours];
++        /* Moved to a display with another scale or colour space: draw for it. */
++        [[NSNotificationCenter defaultCenter]
++            addObserver:self selector:@selector(backingChanged:)
++                   name:NSWindowDidChangeBackingPropertiesNotification
++                 object:[cocoaView window]];
++        [[NSNotificationCenter defaultCenter]
++            addObserver:self selector:@selector(backingChanged:)
++                   name:NSWindowDidChangeScreenNotification
++                 object:[cocoaView window]];
++    }
++    return self;
++}
++
++- (void)dealloc
++{
++    [[NSNotificationCenter defaultCenter] removeObserver:self];
++    [cells release];
++    [glow release];
++    CGColorSpaceRelease(space);
++    [super dealloc];
++}
++
++/* Green and navy in the window's colour space, where GL's pixels show unconverted. */
++- (void)colours
++{
++    CGColorSpaceRef s = [[[cocoaView window] colorSpace] CGColorSpace];
++    CGFloat c[4];
++
++    CGColorSpaceRelease(space);
++    space = s ? CGColorSpaceRetain(s) : CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++    pingouin_splash_colour(SPLASH_NAVY, c);
++    CGColorRef navy = CGColorCreate(space, c);
++    [self setBackgroundColor:navy];
++    CGColorRelease(navy);
++    pingouin_splash_colour(SPLASH_GREEN, c);
++    CGColorRef green = CGColorCreate(space, c);
++    [cells setFillColor:green];
++    CGColorRelease(green);
++}
++
++- (void)backingChanged:(NSNotification *)n
++{
++    [self colours];
++    [self render];
++}
++
++/* The frame at t, at the layer's size now. */
++- (void)render
++{
++    CGRect b = [self bounds];
++    CGFloat scale = [[cocoaView window] backingScaleFactor];
++    double strength;
++    int n = pingouin_intro_cells(t, buf, &strength);
++    int w = (int)(b.size.width * scale), h = (int)(b.size.height * scale);
++
++    if (w < 1 || h < 1 || scale <= 0) {
++        return;
++    }
++    IntroGeom g = pingouin_intro_geom(w, h);
++    CGMutablePathRef path = CGPathCreateMutable();
++    for (int i = 0; i < n; i++) {
++        double e[4];
++        pingouin_intro_rect(&g, &buf[i], e);
++        /* The layer counts from the bottom, in points. */
++        CGPathAddRect(path, NULL, CGRectMake(e[0] / scale, (h - e[3]) / scale,
++                                             (e[2] - e[0]) / scale, (e[3] - e[1]) / scale));
++    }
++
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    [cells setFrame:b];
++    [cells setContentsScale:scale];
++    [cells setPath:path];
++    if (strength > 0) {
++        /* The preview's frame, scaled so that its logo lies on the window's. */
++        double sx = g.sx / INTRO_PX, sy = g.sy / INTRO_PX;
++        double top = g.top - INTRO_LOGO_Y * sy;
++
++        pingouin_intro_background(buf, n, strength, bg);
++        CFDataRef bytes = CFDataCreate(NULL, bg, sizeof(bg));
++        CGDataProviderRef data = CGDataProviderCreateWithCFData(bytes);
++        CGImageRef image = CGImageCreate(INTRO_BG_W, INTRO_BG_H, 8, 32, INTRO_BG_W * 4,
++                                         space, (CGBitmapInfo)kCGImageAlphaNoneSkipLast,
++                                         data, NULL, true, kCGRenderingIntentDefault);
++        [glow setFrame:CGRectMake((g.left - INTRO_LOGO_X * sx) / scale,
++                                  (h - top - INTRO_H * sy) / scale,
++                                  INTRO_W * sx / scale, INTRO_H * sy / scale)];
++        [glow setContents:(id)image];
++        [glow setHidden:NO];
++        CGImageRelease(image);
++        CGDataProviderRelease(data);
++        CFRelease(bytes);
++    } else {
++        [glow setContents:nil];
++        [glow setHidden:YES];
++    }
++    [CATransaction commit];
++    CGPathRelease(path);
++}
++
++- (void)layoutSublayers
++{
++    [super layoutSublayers];
++    [self render];
++}
++
++- (void)play
++{
++    if (t >= INTRO_END) {
++        [self render];
++        return;
++    }
++    [self makeLink];
++    [self watchLink];
++}
++
++- (void)makeLink
++{
++    link = [[cocoaView displayLinkWithTarget:self selector:@selector(tick:)] retain];
++    [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
++}
++
++/*
++ * The link is ours until here. One that only the run loop held was freed
++ * inside its -invalidate, which then unlocked freed memory: QEMU aborted
++ * (os_unfair_lock not owned) when -watchLink replaced a link that never gave
++ * a frame, in a window that was not visible (screen locked, app hidden).
++ */
++- (void)dropLink
++{
++    [link invalidate];
++    [link release];
++    link = nil;
++}
++
++/*
++ * In some test starts the display link gave no frames from ~1 s on and never
++ * again (cause not found: not a second display link on the view, a busy main
++ * thread, or a covered window; see -fadeIfStalled). While the animation runs,
++ * once no frame came for 0.5 s, say how the window is (the next one to see it
++ * knows more) and make a new link, twice at most. The animation goes on from
++ * the clock, so it only skips what was missed.
++ */
++- (void)watchLink
++{
++    CFTimeInterval now = CACurrentMediaTime();
++    CFTimeInterval seen = MAX(opened, MAX(last_tick, relinked));
++
++    if (!link || fading) {
++        return;
++    }
++    if (now - seen > 0.5 && relinks < 2) {
++        NSWindow *w = [cocoaView window];
++
++        info_report("cocoa: boot logo: no display link frame for %.1f s (%u so far; window %s, %s, "
++                    "app %s): a new display link", now - seen, frames,
++                    [w occlusionState] & NSWindowOcclusionStateVisible ? "visible" : "not visible",
++                    [w isOnActiveSpace] ? "on the active Space" : "on another Space",
++                    [NSApp isHidden] ? "hidden" : [NSApp isActive] ? "active" : "in the background");
++        relinks++;
++        relinked = now;
++        [self dropLink];
++        [self makeLink];
++    }
++    [self retain];
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++        [self watchLink];
++        [self release];
++    });
++}
++
++- (void)fade
++{
++    CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"opacity"];
++    CFTimeInterval now = [self convertTime:CACurrentMediaTime() fromLayer:nil];
++
++    if (fading) {
++        return;
++    }
++    fading = true;
++    [self dropLink];   /* it holds us */
++    if (pingouin_intro == self) {
++        pingouin_intro = nil;   /* a reset from now on gets a new logo */
++    }
++    info_report("cocoa: boot logo fades into the guest's screen, %.2f s after it came up",
++                CACurrentMediaTime() - opened);
++    [a setFromValue:@1.0];
++    [a setToValue:@0.0];
++    [a setBeginTime:now];
++    [a setDuration:INTRO_FADE];
++    [a setFillMode:kCAFillModeBackwards];
++    [a setTimingFunction:[CAMediaTimingFunction
++                          functionWithName:kCAMediaTimingFunctionEaseInEaseOut]];
++    [CATransaction begin];
++    [CATransaction setCompletionBlock:^{
++        [self removeFromSuperlayer];
++        [self release];   /* the alloc in pingouin_intro_show */
++    }];
++    [self addAnimation:a forKey:@"fade"];
++    [self setOpacity:0];
++    [CATransaction commit];
++}
++
++- (void)tick:(CADisplayLink *)l
++{
++    CFTimeInterval now = [l targetTimestamp];
++    CFTimeInterval at = CACurrentMediaTime();
++
++    if (last_tick) {
++        longest = MAX(longest, at - last_tick);
++    }
++    last_tick = at;
++    frames++;
++    if (!start) {
++        start = now;
++    }
++    t = now - start;
++    if (t >= INTRO_END) {
++        t = INTRO_END;
++        [self dropLink];
++        info_report("cocoa: boot logo animation: %u frames, at most %.0f ms apart%s", frames,
++                    longest * 1000, relinks ? " (after a new display link)" : "");
++        if (ready) {
++            [self fade];
++        }
++    }
++    [self render];
++}
++
++/* The guest was reset before the logo faded: wait for the desktop again. */
++- (void)hold
++{
++    ready = false;
++}
++
++/*
++ * Ready, and the display link still runs the animation: it fades at the
++ * animation's end. A window that is not visible gets no frames from it
++ * (another Space, hidden), so once the animation is over by the clock and
++ * no frame came for a while, fade without it: else the logo would stay over
++ * the desktop until the window shows again.
++ */
++- (void)fadeIfStalled
++{
++    CFTimeInterval left = opened + INTRO_END - CACurrentMediaTime();
++
++    if (!ready || fading || !link) {
++        return;
++    }
++    if (left <= 0 && CACurrentMediaTime() - last_tick > 0.25) {
++        info_report("cocoa: boot logo: the animation got no frames for a while, fading without it");
++        [self fade];
++        return;
++    }
++    [self retain];
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(left, 0.25) * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++        [self fadeIfStalled];
++        [self release];
++    });
++}
++
++/* The desktop is there (or the logo gives way): fade after the animation; now: at once. */
++- (void)reveal:(BOOL)now
++{
++    ready = true;
++    if (now || !link) {
++        [self fade];
++        return;
++    }
++    [self fadeIfStalled];
++}
++@end
++
++/* Main thread: put the logo's layer over the window (still: without the morph). */
++static void pingouin_intro_show(bool still)
++{
++    pingouin_intro = [[PingouinIntroLayer alloc] initStill:still];
++    [pingouin_intro setFrame:[[cocoaView layer] bounds]];
++    [[cocoaView layer] addSublayer:pingouin_intro];
++    [pingouin_intro play];
++}
++
++/* Main thread: the guest was reset: the logo, still, until its desktop. */
++static void pingouin_intro_again(void)
++{
++    if (pingouin_intro) {
++        [pingouin_intro hold];
++    } else {
++        pingouin_intro_show(true);
++    }
++}
++
++/* Main thread: the logo gives way (now: at once, even mid-animation). */
++static void pingouin_intro_reveal(bool now)
++{
++    [pingouin_intro reveal:now];
++}
++
++/* Main thread, with the BQL (cocoa_display_init): start the animation. */
++static void pingouin_intro_start(void)
++{
++    const char *v = getenv("PINGOUIN_SPLASH_ANIMATION");
++    bool off = v && !strcmp(v, "0");
++
++    if (!pingouin_splash_enabled() || getenv("PINGOUIN_COCOA_HIDDEN") ||
++        !(cocoa_gl_present_on() ||
++          [[cocoaView layer] isKindOfClass:[CAOpenGLLayer class]])) {
++        return;
++    }
++    /* Reduce motion only named in the log: the animation plays with it too. */
++    info_report("cocoa: start animation %s", off ? "still (PINGOUIN_SPLASH_ANIMATION=0)" :
++                [[NSWorkspace sharedWorkspace] accessibilityDisplayShouldReduceMotion] ?
++                "on (macOS Reduce motion is on: it plays anyway)" : "on");
++    pingouin_overlay_ok = true;
++    pingouin_intro_show(off);
++    pingouin_hold_start();
++}
++
+ static void cocoa_gl_update(DisplayChangeListener *dcl,
+                             int x, int y, int w, int h)
+ {
+@@ -3361,6 +4253,7 @@ static void cocoa_gl_update(DisplayChangeListener *dcl,
+         gl_dirty = true;
+     });
+     cocoa_refresh_activity();
++    pingouin_hold_dirty = true;
+ }
+ 
+ static void cocoa_gl_switch(DisplayChangeListener *dcl,
+@@ -3374,6 +4267,7 @@ static void cocoa_gl_switch(DisplayChangeListener *dcl,
+     cocoa_switch(dcl, new_surface);
+     gl_dirty = true;
+     cocoa_refresh_activity();
++    pingouin_splash_update();
+ }
+ 
+ static void cocoa_gl_render(void)
+@@ -3451,6 +4345,8 @@ static void cocoa_gl_render(void)
+             glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+             cocoa_gl_log("after texture blit fb=%d err=0x%x", fb, blit_err);
+         }
++    } else if (pingouin_splash_wanted(NULL, surface)) {
++        pingouin_splash_draw(size.width, size.height, !pingouin_desktop_up);
+     } else {
+         glBindTexture(GL_TEXTURE_2D, surface->texture);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+@@ -3689,6 +4585,11 @@ static bool cocoa_gl_present_init(void)
+     return true;
+ }
+ 
++static bool cocoa_gl_present_on(void)
++{
++    return present_ctx != NULL;
++}
++
+ static void cocoa_gl_present_free(void)
+ {
+     for (int i = 0; i < present_nsurf; i++) {
+@@ -3823,6 +4724,7 @@ static bool cocoa_gl_present(void)
+     bool flip;
+     uint32_t w, h;
+     GLint filter = qatomic_read(&zoom_interpolation) ? GL_LINEAR : GL_NEAREST;
++    bool splash = false;
+ 
+     if (gl_scanout_borrow) {
+         DisplayGLTexture texture = gl_scanout_borrow(gl_scanout_id);
+@@ -3834,6 +4736,13 @@ static bool cocoa_gl_present(void)
+         h = texture.height;
+         /* The surface's first row is the top of the window. */
+         flip = !texture.y_0_top;
++    } else if (pingouin_splash_wanted(NULL, surface)) {
++        /* No picture of the guest's: the boot logo (or black), view-sized. */
++        splash = true;
++        src = 0;
++        w = pingouin_view_w ? pingouin_view_w : (surface ? surface_width(surface) : 0);
++        h = pingouin_view_h ? pingouin_view_h : (surface ? surface_height(surface) : 0);
++        flip = false;
+     } else if (surface && surface->texture) {
+         src = surface->texture;
+         w = surface_width(surface);
+@@ -3852,14 +4761,16 @@ static bool cocoa_gl_present(void)
+ 
+     /* A 10-bit scanout keeps its depth: half-float surfaces. */
+     GLint ifmt = 0;
+-    glBindTexture(GL_TEXTURE_2D, src);
+-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
+-    glBindTexture(GL_TEXTURE_2D, 0);
++    if (src) {
++        glBindTexture(GL_TEXTURE_2D, src);
++        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
++        glBindTexture(GL_TEXTURE_2D, 0);
++    }
+     bool deep = ifmt == GL_RGB10_A2 || ifmt == GL_RGBA16F || ifmt == GL_RGB16F;
+     static bool deep_failed;           /* half-float surfaces could not be made */
+     deep = deep && !deep_failed;
+     static int deep_logged = -1;
+-    if (deep != deep_logged) {
++    if (src && deep != deep_logged) {
+         info_report("cocoa: scanout format 0x%x, %s surfaces%s", ifmt,
+                     deep ? "half-float" : "8-bit",
+                     deep && cocoa_gl_present_hdr_wanted() ? ", HDR (PQ)" : "");
+@@ -3911,13 +4822,18 @@ static bool cocoa_gl_present(void)
+     glClear(GL_COLOR_BUFFER_BIT);
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+     glActiveTexture(GL_TEXTURE0);
+-    glBindTexture(GL_TEXTURE_2D, src);
+-    /* Pixel for pixel, unless the frame had to be scaled (see alloc). */
+-    GLint blit_filter = (w == present_w && h == present_h) ? GL_NEAREST
+-                                                           : GL_LINEAR;
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, blit_filter);
+-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, blit_filter);
+-    qemu_gl_run_texture_blit(present_gls, flip);
++    if (splash) {
++        pingouin_splash_draw_with(present_gls, present_w, present_h,
++                                !pingouin_desktop_up, true);
++    } else {
++        glBindTexture(GL_TEXTURE_2D, src);
++        /* Pixel for pixel, unless the frame had to be scaled (see alloc). */
++        GLint blit_filter = (w == present_w && h == present_h) ? GL_NEAREST
++                                                               : GL_LINEAR;
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, blit_filter);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, blit_filter);
++        qemu_gl_run_texture_blit(present_gls, flip);
++    }
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+     glBindTexture(GL_TEXTURE_2D, 0);
+     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+@@ -4531,6 +5447,7 @@ static void cocoa_gl_scanout_disable(DisplayChangeListener *dcl)
+     gl_scanout_borrow = NULL;
+     gl_dirty = true;
+     cocoa_refresh_activity();
++    pingouin_splash_update();
+ 
+     cocoa_gl_log("scanout disable");
+ }
+@@ -4543,8 +5460,13 @@ static void cocoa_gl_scanout_texture(DisplayChangeListener *dcl,
+ {
+     gl_scanout_id = backing_id;
+     gl_scanout_borrow = backing_borrow;
++    gl_scanout_x = x;
++    gl_scanout_y = y;
++    gl_scanout_w = w;
++    gl_scanout_h = h;
+     gl_dirty = true;
+     cocoa_refresh_activity();
++    pingouin_splash_update();
+ 
+     cocoa_gl_log("scanout texture id=%u region=%ux%u+%u+%u",
+                  backing_id, w, h, x, y);
+@@ -4555,6 +5477,7 @@ static void cocoa_gl_scanout_flush(DisplayChangeListener *dcl,
+                                    uint32_t w, uint32_t h)
+ {
+     gl_dirty = true;
++    pingouin_hold_dirty = true;
+ 
+     /*
+      * Show the guest's frame now, not on the next 30 ms refresh tick:
+@@ -5299,6 +6222,8 @@ static void pingouin_head_render(PingouinHead *hd, NSSize size)
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+         qemu_gl_run_texture_blit(dgc.gls, texture.y_0_top);
++    } else if (pingouin_splash_wanted(NULL, hd->surface)) {
++        pingouin_splash_draw(size.width, size.height, !pingouin_desktop_up);
+     } else if (hd->surface && hd->surface->texture) {
+         glBindTexture(GL_TEXTURE_2D, hd->surface->texture);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+@@ -5968,6 +6893,8 @@ static void pingouin_chan_line(NSData *data)
+         NSDictionary *d = obj;
+         bool update = false;
+         if (d[@"hello"]) {
++            /* Omarchy's desktop is up: the boot logo may give way. */
++            qatomic_set(&pingouin_display_hello, true);
+             if (!pingouin_ptr.drawing) {
+                 info_report("cocoa: the guest draws its own pointer now");
+             }
+@@ -6332,6 +7259,10 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
+         }
+         info_report("cocoa: GL frames shown %s",
+                     present_ctx ? "as IOSurfaces" : "with a CAOpenGLLayer");
++        qemu_register_reset(pingouin_splash_reset, NULL);
++        if (opts->gl != DISPLAY_GL_MODE_ES) {
++            pingouin_intro_start();
++        }
+ 
+         for (unsigned int index = 0; ; index++) {
+             QemuConsole *con = qemu_console_lookup_by_index(index);
+--- /dev/null
++++ b/ui/pingouin-splash.h
+@@ -0,0 +1,575 @@
++/*
++ * Pingouin boot splash: Omarchy's logo as cells, and the core of the start
++ * animation (PINGOUIN turns into the logo). Only C, no Cocoa or QEMU, so that
++ * Tests/display/test-boot-splash-morph.c builds it on its own; the includer
++ * gives <math.h>, MIN, MAX and g_new0. ui/cocoa.m draws with it
++ * (pingouin-cocoa-boot-splash.patch has the whole story).
++ */
++#ifndef PINGOUIN_SPLASH_H
++#define PINGOUIN_SPLASH_H
++
++#define SPLASH_COLS 81
++#define SPLASH_ROWS 19
++#define SPLASH_CELL 10      /* pixels a cell in the firmware's frame */
++/* Omarchy's Plymouth theme: the logo's green and the background. */
++#define SPLASH_GREEN 0xa8cd76
++#define SPLASH_NAVY 0x1a1b26
++
++/*
++ * Omarchy's logo.svg (github.com/basecamp/omarchy 6520ac7d, MIT, (c) David
++ * Heinemeier Hansson), one character per cell, the same cells as the
++ * firmware's logo: boot-logo/make-logo-bmp.py logo.svg --rows. The build
++ * checks that (Tests/display/test-boot-splash-cells.py).
++ */
++static const char pingouin_splash_cells[SPLASH_ROWS][SPLASH_COLS + 1] = {
++    ".................###.............................................................",
++    "..#####......###########......#######....#######....#######....#...#......#...#..",
++    ".#######....#############....########...########...########...##...##....##...##.",
++    "###...###..###...###...###..###...###..###...###..###...###..###...###..###...###",
++    "###...###..###...###...###..###...###..###...###..###...###..###...###..###...###",
++    "###...###..###...###...###..###...###..###...###..###...##...###...###..###...###",
++    "###...###..###...###...###..###...###..###...###..###...#....###...###..###...###",
++    "###...###..###...###...###..###...###..###...###..###........###...###..###...###",
++    "###...###..###...###...###.##########.#########...###.......###########.#########",
++    "###...###..###...###...###.##########.########....###......###########..#########",
++    "###...###..###...###...###..###...###..###........###........###...###........###",
++    "###...###..###...###...###..###...###.##########..###...#....###...###...##...###",
++    "###...###..###...###...###..###...###.##########..###...##...###...###..###...###",
++    "###...###..###...###...###..###...###..###...###..###...###..###...###..###...###",
++    "###...###..###...###...###..###...###..###...###..###...###..###...###..###...###",
++    ".#######....##...###...##...###...##...###...###..########...###...##....#######.",
++    "..#####......#...###...#....###...#....###...###..#######....###...#......#####..",
++    ".......................................###...##..................................",
++    ".......................................###...#...................................",
++};
++
++/* Made by boot-logo/make-splash-morph.py; the build checks it. */
++#define MORPH_KEEP_COLS 38  /* O, M and A: the logo's cells left of this column */
++#define MORPH_PARTS 482
++/* The flying cells: from (x, y) in PINGOUIN to (x, y) in the logo, start (s of the
++   preview), arc. */
++static const float pingouin_morph_parts[MORPH_PARTS][6] = {
++    {44.5f, 1, 41, 1, 0.6389f, -5.5669f}, {44.5f, 1, 42, 2, 0.6948f, -6.3119f}, {44.5f, 2, 41, 3, 0.6643f, -3.5260f},
++    {43.5f, 3, 41, 4, 0.6070f, -2.1794f}, {43.5f, 4, 41, 5, 0.6045f, -2.8804f}, {43.5f, 5, 41, 6, 0.6084f, -6.1382f},
++    {43.5f, 6, 41, 7, 0.6509f, 0.8551f}, {43.5f, 7, 42, 8, 0.6315f, -4.8792f}, {43.5f, 8, 43, 9, 0.7086f, 2.0032f},
++    {43.5f, 8, 44, 9, 0.7193f, -3.2315f}, {47.5f, 6, 45, 9, 0.7838f, -6.5575f}, {47.5f, 6, 46, 8, 0.7863f, -4.2487f},
++    {48.5f, 5, 47, 7, 0.7173f, -5.8810f}, {48.5f, 5, 47, 6, 0.7370f, 0.7532f}, {49.5f, 4, 47, 5, 0.7217f, -1.4748f},
++    {49.5f, 3, 47, 4, 0.7767f, -3.4622f}, {49.5f, 2, 47, 3, 0.7657f, -6.4035f}, {49.5f, 1, 47, 2, 0.7072f, -5.0434f},
++    {49.5f, 1, 47, 1, 0.7816f, -2.9379f}, {48.5f, 1, 46, 1, 0.7210f, -1.4372f}, {47.5f, 1, 45, 2, 0.7210f, -4.1522f},
++    {47.5f, 2, 45, 3, 0.7620f, -0.3596f}, {47.5f, 3, 45, 4, 0.6960f, -1.5430f}, {47.5f, 4, 45, 5, 0.7297f, 1.3138f},
++    {47.5f, 5, 45, 6, 0.7542f, -4.2646f}, {46.5f, 1, 44, 2, 0.7676f, -5.8784f}, {46.5f, 1, 44, 1, 0.7002f, 0.1928f},
++    {47.5f, 1, 45, 1, 0.6849f, -2.3549f}, {48.5f, 1, 46, 2, 0.6880f, -0.6519f}, {48.5f, 2, 46, 3, 0.7751f, -1.5563f},
++    {48.5f, 3, 46, 4, 0.7884f, -4.0194f}, {48.5f, 4, 46, 5, 0.7668f, -1.3535f}, {48.5f, 5, 46, 6, 0.7529f, -2.6660f},
++    {47.5f, 6, 46, 7, 0.7841f, 1.9745f}, {47.5f, 6, 45, 7, 0.7236f, -0.6906f}, {47.5f, 6, 45, 8, 0.6739f, -0.3358f},
++    {47.5f, 6, 44, 8, 0.7277f, 2.4344f}, {43.5f, 8, 42, 9, 0.7153f, -4.2963f}, {43.5f, 8, 41, 10, 0.6463f, -0.6478f},
++    {43.5f, 9, 42, 11, 0.6194f, -2.6139f}, {47.5f, 11, 43, 12, 0.6535f, -5.8876f}, {47.5f, 11, 44, 12, 0.6571f, 0.2982f},
++    {47.5f, 11, 45, 13, 0.6822f, -4.6477f}, {48.5f, 12, 46, 14, 0.7302f, 1.2785f}, {49.5f, 13, 47, 15, 0.7097f, -2.7327f},
++    {49.5f, 14, 47, 16, 0.7659f, 1.3921f}, {48.5f, 15, 46, 17, 0.7816f, 1.2079f}, {47.5f, 16, 45, 18, 0.7001f, -3.0547f},
++    {47.5f, 15, 45, 17, 0.7097f, 1.3998f}, {47.5f, 14, 45, 16, 0.7816f, -5.5663f}, {48.5f, 14, 46, 16, 0.7045f, -4.7964f},
++    {48.5f, 13, 46, 15, 0.7113f, -2.3929f}, {47.5f, 13, 45, 15, 0.7374f, -4.5039f}, {48.5f, 12, 47, 14, 0.7005f, -3.0200f},
++    {48.5f, 12, 47, 13, 0.7443f, -1.6198f}, {47.5f, 11, 47, 12, 0.8144f, -0.4403f}, {52.5f, 9, 47, 11, 0.7619f, -1.1329f},
++    {47.5f, 11, 46, 11, 0.7645f, -6.4871f}, {47.5f, 12, 45, 14, 0.7746f, 0.4097f}, {47.5f, 11, 46, 13, 0.7883f, 0.5798f},
++    {47.5f, 11, 46, 12, 0.7304f, -3.2097f}, {47.5f, 11, 45, 12, 0.6791f, -0.9742f}, {47.5f, 11, 45, 11, 0.6741f, -6.3602f},
++    {43.5f, 9, 44, 11, 0.6751f, -5.4581f}, {43.5f, 10, 42, 12, 0.6575f, -6.5005f}, {43.5f, 11, 41, 13, 0.6000f, -5.5630f},
++    {43.5f, 12, 41, 14, 0.6122f, -3.5457f}, {43.5f, 13, 41, 15, 0.6031f, 1.3062f}, {43.5f, 14, 41, 16, 0.6737f, -5.5888f},
++    {44.5f, 15, 41, 17, 0.6303f, -3.6998f}, {44.5f, 16, 41, 18, 0.6437f, -5.8330f}, {43.5f, 16, 40, 18, 0.6852f, 2.4345f},
++    {42.5f, 16, 39, 18, 0.6226f, -2.4036f}, {42.5f, 15, 39, 17, 0.5770f, -6.0292f}, {42.5f, 14, 39, 16, 0.6078f, -4.4848f},
++    {42.5f, 13, 39, 15, 0.6661f, -5.4663f}, {42.5f, 12, 39, 14, 0.5694f, 2.0344f}, {42.5f, 11, 39, 13, 0.6301f, -5.6073f},
++    {42.5f, 10, 39, 12, 0.6318f, -6.7431f}, {42.5f, 9, 39, 11, 0.6300f, 2.2958f}, {42.5f, 8, 39, 10, 0.6703f, -0.3861f},
++    {42.5f, 8, 39, 9, 0.5980f, -3.5164f}, {42.5f, 7, 39, 8, 0.5867f, 0.3334f}, {42.5f, 6, 39, 7, 0.6306f, 0.4010f},
++    {42.5f, 5, 39, 6, 0.6062f, -4.8811f}, {42.5f, 4, 39, 5, 0.6640f, 2.3568f}, {42.5f, 3, 39, 4, 0.6690f, 0.6577f},
++    {42.5f, 2, 39, 3, 0.6649f, 0.0288f}, {41.5f, 7, 38, 8, 0.5772f, -2.0824f}, {41.5f, 8, 38, 9, 0.5927f, -6.7247f},
++    {41.5f, 9, 38, 11, 0.5534f, -4.3455f}, {41.5f, 10, 38, 12, 0.5811f, -0.4210f}, {43.5f, 15, 40, 17, 0.6981f, -2.7513f},
++    {43.5f, 14, 40, 16, 0.6958f, 2.3864f}, {43.5f, 13, 40, 15, 0.6979f, -3.5360f}, {43.5f, 12, 40, 14, 0.6098f, -4.8450f},
++    {43.5f, 11, 40, 13, 0.6069f, -5.0585f}, {43.5f, 10, 40, 12, 0.6582f, 1.5529f}, {43.5f, 10, 41, 12, 0.7009f, -2.4450f},
++    {43.5f, 9, 43, 11, 0.7117f, 0.5966f}, {43.5f, 9, 41, 11, 0.6102f, -0.7244f}, {43.5f, 9, 40, 11, 0.6925f, 0.4319f},
++    {43.5f, 8, 40, 10, 0.6734f, -2.4587f}, {43.5f, 8, 40, 9, 0.6048f, 0.4968f}, {43.5f, 8, 41, 9, 0.6399f, 0.6078f},
++    {47.5f, 6, 43, 8, 0.7499f, -3.2395f}, {43.5f, 7, 41, 8, 0.6482f, 1.9946f}, {43.5f, 7, 40, 8, 0.6703f, -5.3850f},
++    {43.5f, 6, 40, 7, 0.5986f, -5.5641f}, {43.5f, 5, 40, 6, 0.6919f, 0.6618f}, {43.5f, 4, 40, 5, 0.6009f, 0.8518f},
++    {43.5f, 3, 40, 4, 0.7010f, -0.7560f}, {43.5f, 2, 40, 3, 0.6254f, -1.7877f}, {45.5f, 1, 43, 2, 0.6491f, -6.8647f},
++    {45.5f, 1, 43, 1, 0.7498f, -0.8281f}, {44.5f, 1, 41, 2, 0.6632f, 1.8694f}, {43.5f, 1, 40, 2, 0.6354f, 1.2816f},
++    {44.5f, 1, 42, 1, 0.7158f, -4.9951f}, {54.5f, 1, 52, 1, 0.8136f, -4.2168f}, {54.5f, 1, 53, 2, 0.8289f, -1.4288f},
++    {53.5f, 2, 52, 3, 0.8145f, -3.0194f}, {53.5f, 3, 52, 4, 0.7991f, 1.6452f}, {53.5f, 4, 52, 5, 0.8258f, -2.6475f},
++    {53.5f, 5, 52, 6, 0.8533f, 1.5908f}, {53.5f, 6, 52, 7, 0.8338f, 1.7184f}, {53.5f, 7, 52, 8, 0.8435f, -1.9477f},
++    {53.5f, 8, 52, 9, 0.8462f, -6.8223f}, {53.5f, 8, 52, 10, 0.8361f, -5.2605f}, {53.5f, 9, 52, 11, 0.7838f, 0.5921f},
++    {53.5f, 10, 52, 12, 0.8040f, -2.5018f}, {53.5f, 11, 52, 13, 0.8704f, -1.7135f}, {53.5f, 12, 52, 14, 0.8225f, -2.0757f},
++    {54.5f, 13, 53, 15, 0.8667f, 0.4506f}, {55.5f, 14, 54, 16, 0.8294f, -1.6772f}, {56.5f, 14, 55, 16, 0.8632f, -4.3693f},
++    {56.5f, 14, 56, 16, 0.9427f, -2.1767f}, {57.5f, 13, 57, 15, 0.9341f, 0.2199f}, {58.5f, 12, 58, 14, 0.9928f, -2.7891f},
++    {58.5f, 11, 58, 13, 0.9568f, -2.1972f}, {58.5f, 10, 57, 12, 0.9281f, -0.4191f}, {57.5f, 12, 56, 13, 0.9043f, -1.9338f},
++    {58.5f, 10, 56, 12, 0.9074f, 1.9443f}, {58.5f, 9, 56, 11, 0.9339f, 1.3271f}, {58.5f, 11, 57, 13, 0.9797f, -4.5339f},
++    {57.5f, 12, 57, 14, 0.9338f, 1.9610f}, {57.5f, 12, 56, 14, 0.9508f, -5.6972f}, {57.5f, 13, 56, 15, 0.8646f, -2.7999f},
++    {55.5f, 13, 55, 15, 0.8420f, -4.7139f}, {54.5f, 14, 53, 16, 0.8088f, -0.6400f}, {54.5f, 14, 52, 16, 0.8774f, 1.5218f},
++    {54.5f, 14, 51, 16, 0.7852f, -0.1969f}, {49.5f, 14, 50, 16, 0.8292f, -5.6417f}, {53.5f, 13, 50, 15, 0.8559f, 2.1917f},
++    {53.5f, 12, 50, 14, 0.7764f, 2.0488f}, {52.5f, 11, 50, 13, 0.7978f, -2.3710f}, {52.5f, 10, 50, 12, 0.8688f, 0.9082f},
++    {52.5f, 9, 50, 11, 0.7694f, -2.9005f}, {52.5f, 8, 50, 10, 0.8119f, -3.7784f}, {52.5f, 8, 50, 9, 0.7735f, -3.9740f},
++    {52.5f, 7, 50, 8, 0.8367f, -6.8149f}, {52.5f, 6, 50, 7, 0.8165f, -2.8156f}, {52.5f, 5, 50, 6, 0.7522f, -3.8508f},
++    {52.5f, 4, 50, 5, 0.8249f, -2.1335f}, {52.5f, 3, 50, 4, 0.7577f, 2.3583f}, {53.5f, 2, 50, 3, 0.8446f, 2.2311f},
++    {55.5f, 13, 54, 15, 0.8292f, -4.4771f}, {53.5f, 13, 52, 15, 0.7881f, 0.4005f}, {53.5f, 13, 51, 15, 0.7991f, -5.7692f},
++    {53.5f, 12, 51, 14, 0.8173f, 1.6584f}, {52.5f, 11, 51, 13, 0.8649f, -4.5432f}, {52.5f, 10, 51, 12, 0.7846f, 1.7321f},
++    {52.5f, 9, 51, 11, 0.8351f, -0.3460f}, {52.5f, 8, 51, 10, 0.7774f, -6.4535f}, {52.5f, 8, 51, 9, 0.8493f, -2.9595f},
++    {52.5f, 7, 51, 8, 0.7754f, 1.9143f}, {52.5f, 6, 51, 7, 0.8428f, 0.6155f}, {52.5f, 5, 51, 6, 0.7767f, 1.1342f},
++    {52.5f, 4, 51, 5, 0.7747f, 1.1964f}, {52.5f, 3, 51, 4, 0.8211f, -3.7781f}, {53.5f, 2, 51, 3, 0.8330f, 1.8034f},
++    {54.5f, 1, 54, 2, 0.8488f, -5.7724f}, {54.5f, 1, 55, 2, 0.8966f, -4.7349f}, {58.5f, 2, 56, 3, 0.8631f, -5.4662f},
++    {58.5f, 3, 57, 4, 0.8727f, -5.0832f}, {58.5f, 4, 57, 5, 0.9041f, -4.1024f}, {58.5f, 5, 56, 6, 0.9411f, -4.2454f},
++    {58.5f, 4, 56, 5, 0.9100f, -5.3100f}, {58.5f, 3, 58, 4, 0.9250f, -6.8275f}, {58.5f, 2, 58, 3, 0.9134f, -6.8542f},
++    {58.5f, 1, 58, 2, 0.9713f, -1.7650f}, {58.5f, 1, 58, 1, 0.9061f, -2.4898f}, {58.5f, 1, 57, 1, 0.9788f, -5.9903f},
++    {58.5f, 3, 56, 4, 0.9483f, -2.8943f}, {58.5f, 2, 57, 3, 0.9261f, 0.9288f}, {58.5f, 1, 57, 2, 0.9138f, -2.1865f},
++    {58.5f, 1, 56, 2, 0.9325f, 2.3332f}, {58.5f, 1, 56, 1, 0.8911f, 0.9067f}, {54.5f, 1, 55, 1, 0.9181f, -0.9582f},
++    {54.5f, 1, 54, 1, 0.8652f, -3.6983f}, {54.5f, 1, 52, 2, 0.7899f, -5.7667f}, {54.5f, 1, 51, 2, 0.7752f, 0.0384f},
++    {54.5f, 1, 53, 1, 0.8307f, -5.4492f}, {65.5f, 1, 63, 1, 0.9768f, 0.9921f}, {65.5f, 1, 63, 2, 1.0711f, -0.6298f},
++    {64.5f, 2, 63, 3, 1.0005f, -4.6990f}, {63.5f, 3, 63, 4, 1.0018f, -2.6352f}, {63.5f, 4, 63, 5, 0.9856f, -2.7647f},
++    {63.5f, 5, 63, 6, 0.9983f, 2.1370f}, {63.5f, 6, 63, 7, 1.0834f, -1.8028f}, {63.5f, 7, 64, 8, 1.0127f, 2.1738f},
++    {64.5f, 8, 65, 9, 1.0371f, -3.6125f}, {65.5f, 8, 66, 9, 1.0168f, -3.3745f}, {65.5f, 8, 67, 10, 1.0903f, -2.2237f},
++    {65.5f, 9, 68, 11, 1.0741f, -2.2050f}, {69.5f, 10, 69, 12, 1.0673f, -4.4904f}, {69.5f, 11, 69, 13, 1.0774f, -3.2046f},
++    {69.5f, 12, 69, 14, 1.0717f, -6.7863f}, {65.5f, 13, 68, 15, 1.0865f, -4.7883f}, {65.5f, 14, 67, 16, 1.1036f, -1.9727f},
++    {65.5f, 13, 67, 15, 1.1234f, -0.7533f}, {65.5f, 12, 67, 14, 1.1193f, 1.3514f}, {65.5f, 11, 67, 13, 1.0801f, -3.9017f},
++    {65.5f, 12, 68, 14, 1.1682f, -5.5801f}, {65.5f, 11, 68, 13, 1.1369f, -0.8894f}, {65.5f, 10, 68, 12, 1.0553f, 0.9353f},
++    {65.5f, 10, 67, 12, 1.1404f, -1.0403f}, {69.5f, 9, 69, 11, 1.1547f, 0.7161f}, {69.5f, 8, 69, 10, 1.0834f, -2.0243f},
++    {69.5f, 8, 69, 9, 1.1272f, 0.9319f}, {69.5f, 7, 70, 8, 1.1799f, 0.8509f}, {69.5f, 6, 69, 7, 1.1368f, 1.4819f},
++    {65.5f, 6, 68, 7, 1.1319f, -0.4134f}, {65.5f, 6, 67, 7, 1.0609f, -6.7040f}, {65.5f, 5, 67, 6, 1.0493f, -3.5733f},
++    {65.5f, 4, 68, 5, 1.0626f, 0.9403f}, {69.5f, 4, 69, 5, 1.1337f, -1.0362f}, {69.5f, 3, 69, 4, 1.1418f, -0.5337f},
++    {68.5f, 2, 69, 3, 1.1254f, -6.9685f}, {67.5f, 1, 68, 2, 1.1457f, 0.1085f}, {66.5f, 2, 67, 3, 1.0937f, -1.9156f},
++    {66.5f, 1, 67, 2, 1.1124f, -6.3725f}, {66.5f, 1, 67, 1, 1.1217f, -4.6042f}, {67.5f, 2, 68, 3, 1.0589f, -4.4772f},
++    {65.5f, 3, 68, 4, 1.1375f, -5.0504f}, {65.5f, 3, 67, 4, 1.1221f, 2.2695f}, {65.5f, 4, 67, 5, 1.0926f, -3.3657f},
++    {69.5f, 5, 69, 6, 1.1241f, -0.5049f}, {65.5f, 5, 68, 6, 1.1420f, -1.1387f}, {69.5f, 7, 69, 8, 1.1438f, -6.2640f},
++    {65.5f, 7, 68, 8, 1.0677f, -4.5876f}, {65.5f, 9, 67, 11, 1.1225f, -4.1080f}, {65.5f, 8, 68, 10, 1.1181f, -6.8815f},
++    {65.5f, 8, 68, 9, 1.0573f, -4.4467f}, {65.5f, 8, 67, 9, 1.1140f, -0.4242f}, {65.5f, 7, 67, 8, 1.1144f, -4.2369f},
++    {65.5f, 7, 66, 8, 1.0787f, -2.5857f}, {63.5f, 8, 64, 9, 1.0393f, -5.8742f}, {63.5f, 8, 63, 10, 1.0739f, -5.1071f},
++    {63.5f, 9, 63, 11, 1.0840f, 1.8944f}, {63.5f, 10, 63, 12, 0.9688f, -2.6398f}, {63.5f, 11, 63, 13, 1.0651f, 2.1970f},
++    {63.5f, 12, 63, 14, 1.0206f, -4.4478f}, {63.5f, 13, 63, 15, 0.9918f, 1.9831f}, {63.5f, 14, 63, 16, 0.9920f, -1.4760f},
++    {63.5f, 14, 62, 16, 0.9670f, -2.0214f}, {63.5f, 14, 61, 16, 1.0477f, -5.7403f}, {59.5f, 13, 61, 15, 1.0318f, -2.1669f},
++    {59.5f, 12, 61, 14, 1.0398f, -0.3183f}, {60.5f, 11, 61, 13, 0.9611f, 1.5282f}, {60.5f, 10, 61, 12, 0.9917f, -6.7641f},
++    {60.5f, 9, 61, 11, 0.9338f, -2.3289f}, {60.5f, 8, 61, 10, 0.9874f, -4.1315f}, {60.5f, 8, 61, 9, 0.9502f, -3.7324f},
++    {60.5f, 7, 61, 8, 0.9713f, 0.9822f}, {60.5f, 6, 61, 7, 0.9335f, 0.1320f}, {60.5f, 5, 61, 6, 1.0340f, -5.8596f},
++    {60.5f, 4, 61, 5, 1.0445f, -0.2263f}, {60.5f, 3, 61, 4, 1.0415f, -4.2466f}, {59.5f, 2, 61, 3, 0.9780f, -3.2675f},
++    {60.5f, 7, 60, 8, 1.0365f, -1.4028f}, {59.5f, 8, 59, 9, 0.9433f, -2.9335f}, {60.5f, 8, 60, 9, 0.9497f, -6.5415f},
++    {63.5f, 13, 62, 15, 0.9622f, 0.9294f}, {63.5f, 12, 62, 14, 0.9843f, 1.8881f}, {63.5f, 11, 62, 13, 0.9799f, -4.4756f},
++    {63.5f, 10, 62, 12, 1.0113f, -5.1964f}, {63.5f, 9, 62, 11, 0.9948f, 2.0836f}, {63.5f, 8, 62, 10, 1.0561f, 0.7136f},
++    {63.5f, 8, 62, 9, 1.0257f, 1.6775f}, {63.5f, 8, 63, 9, 1.0796f, -1.7823f}, {64.5f, 7, 65, 8, 1.0863f, -6.5300f},
++    {63.5f, 7, 63, 8, 1.0545f, -2.7168f}, {63.5f, 7, 62, 8, 1.0403f, -0.8773f}, {63.5f, 6, 62, 7, 0.9843f, -6.5347f},
++    {63.5f, 5, 62, 6, 1.0612f, -5.7905f}, {63.5f, 4, 62, 5, 1.0067f, -3.7352f}, {63.5f, 3, 62, 4, 0.9857f, 0.0208f},
++    {64.5f, 2, 62, 3, 1.0672f, -4.5284f}, {64.5f, 2, 62, 2, 1.0287f, -4.1421f}, {71.5f, 0, 74, 1, 1.2169f, -3.2535f},
++    {72.5f, 1, 74, 2, 1.1701f, -5.4643f}, {72.5f, 2, 74, 3, 1.1749f, 1.6066f}, {71.5f, 3, 74, 4, 1.2096f, -4.9098f},
++    {71.5f, 4, 74, 5, 1.2588f, 2.4665f}, {71.5f, 5, 74, 6, 1.2040f, -5.6738f}, {71.5f, 6, 74, 7, 1.1731f, -6.1382f},
++    {71.5f, 7, 75, 8, 1.2077f, -6.1346f}, {75.5f, 8, 76, 9, 1.2120f, -4.5456f}, {75.5f, 8, 77, 9, 1.2684f, 1.4289f},
++    {75.5f, 8, 78, 10, 1.3066f, -3.0786f}, {76.5f, 9, 79, 11, 1.2830f, -2.0204f}, {77.5f, 10, 80, 12, 1.2952f, -3.7871f},
++    {77.5f, 11, 80, 13, 1.2574f, -4.3636f}, {77.5f, 12, 80, 14, 1.3661f, -5.8042f}, {76.5f, 13, 79, 15, 1.2937f, -1.0185f},
++    {75.5f, 14, 78, 16, 1.3202f, -4.9484f}, {75.5f, 14, 77, 16, 1.2325f, -4.6397f}, {75.5f, 14, 76, 16, 1.2313f, -2.7643f},
++    {71.5f, 14, 75, 16, 1.2811f, 1.0625f}, {71.5f, 14, 74, 16, 1.2547f, -6.7928f}, {71.5f, 13, 73, 15, 1.1372f, -0.2596f},
++    {71.5f, 12, 74, 14, 1.2575f, -2.5040f}, {71.5f, 11, 74, 13, 1.2205f, -6.9983f}, {71.5f, 10, 74, 12, 1.1970f, 1.8049f},
++    {71.5f, 9, 74, 11, 1.2491f, 1.1269f}, {71.5f, 9, 73, 11, 1.2500f, -4.6396f}, {70.5f, 10, 72, 12, 1.1298f, -5.5334f},
++    {70.5f, 11, 72, 13, 1.1794f, -0.5203f}, {71.5f, 10, 73, 12, 1.2463f, -0.1435f}, {71.5f, 11, 73, 13, 1.2110f, 0.2656f},
++    {71.5f, 12, 73, 14, 1.1882f, -1.7607f}, {70.5f, 12, 72, 14, 1.1214f, 0.4318f}, {71.5f, 13, 74, 15, 1.1779f, 1.7392f},
++    {71.5f, 13, 75, 15, 1.2441f, -4.1141f}, {75.5f, 13, 76, 15, 1.1987f, -4.6080f}, {75.5f, 13, 77, 15, 1.2764f, -0.3635f},
++    {75.5f, 13, 78, 15, 1.2301f, -6.3317f}, {75.5f, 12, 78, 14, 1.2796f, -1.4625f}, {75.5f, 11, 78, 13, 1.2632f, -4.8760f},
++    {76.5f, 12, 79, 14, 1.3055f, -6.9006f}, {76.5f, 11, 79, 13, 1.2695f, -2.6234f}, {76.5f, 10, 79, 12, 1.3484f, -0.8765f},
++    {75.5f, 10, 78, 12, 1.3227f, -2.4846f}, {77.5f, 9, 80, 11, 1.2782f, -4.6529f}, {77.5f, 8, 80, 10, 1.3653f, -0.3058f},
++    {77.5f, 8, 80, 9, 1.2869f, -6.7930f}, {77.5f, 7, 80, 8, 1.3098f, -0.5926f}, {77.5f, 6, 80, 7, 1.3004f, -4.5561f},
++    {77.5f, 5, 80, 6, 1.3301f, 1.7890f}, {77.5f, 4, 80, 5, 1.2772f, -6.6761f}, {77.5f, 3, 80, 4, 1.2906f, -3.0047f},
++    {76.5f, 2, 80, 3, 1.3319f, -5.1182f}, {75.5f, 1, 79, 2, 1.3290f, 0.0217f}, {75.5f, 2, 78, 3, 1.2773f, -5.0504f},
++    {75.5f, 3, 78, 4, 1.3330f, -4.0387f}, {75.5f, 4, 78, 5, 1.3151f, -4.8073f}, {75.5f, 5, 78, 6, 1.2432f, 0.2245f},
++    {75.5f, 6, 78, 7, 1.2521f, 2.0433f}, {75.5f, 1, 78, 2, 1.2762f, -5.2205f}, {75.5f, 1, 78, 1, 1.2435f, -3.0382f},
++    {76.5f, 2, 79, 3, 1.3132f, 2.0132f}, {76.5f, 3, 79, 4, 1.2509f, -3.2621f}, {76.5f, 4, 79, 5, 1.2589f, 2.2541f},
++    {76.5f, 5, 79, 6, 1.2504f, -6.5075f}, {76.5f, 6, 79, 7, 1.2405f, -3.2634f}, {76.5f, 7, 79, 8, 1.3411f, 1.3940f},
++    {75.5f, 9, 78, 11, 1.3046f, 2.4765f}, {76.5f, 8, 79, 10, 1.3451f, -3.8722f}, {76.5f, 8, 79, 9, 1.2556f, 1.8909f},
++    {75.5f, 8, 78, 9, 1.3062f, -6.6970f}, {75.5f, 7, 78, 8, 1.2964f, -3.4031f}, {75.5f, 7, 77, 8, 1.2449f, -3.8489f},
++    {71.5f, 8, 75, 9, 1.1870f, -6.9727f}, {71.5f, 8, 74, 9, 1.1836f, -3.6611f}, {71.5f, 8, 73, 9, 1.2480f, -5.8248f},
++    {70.5f, 8, 72, 9, 1.2324f, -5.0297f}, {70.5f, 7, 72, 8, 1.1595f, 0.8049f}, {70.5f, 6, 72, 7, 1.2153f, -2.8917f},
++    {70.5f, 5, 72, 6, 1.1226f, -2.5021f}, {70.5f, 4, 72, 5, 1.1614f, 1.7353f}, {70.5f, 3, 72, 4, 1.1398f, -3.5396f},
++    {70.5f, 2, 72, 3, 1.2243f, -6.7123f}, {75.5f, 7, 76, 8, 1.2326f, 0.7123f}, {71.5f, 7, 74, 8, 1.2420f, -6.6138f},
++    {71.5f, 7, 73, 8, 1.1375f, -6.4055f}, {71.5f, 6, 73, 7, 1.2437f, -4.5583f}, {71.5f, 5, 73, 6, 1.2230f, 1.5362f},
++    {71.5f, 4, 73, 5, 1.1740f, -4.4130f}, {71.5f, 3, 73, 4, 1.2483f, -1.1387f}, {71.5f, 2, 73, 3, 1.1648f, -0.1920f},
++    {71.5f, 1, 73, 2, 1.1713f, -4.3815f}, {45.5f, 16, 41, 18, 0.6005f, 0.1787f}, {46.5f, 16, 45, 18, 0.7766f, -0.9772f},
++    {46.5f, 15, 45, 17, 0.7799f, -6.7696f}, {41.5f, 16, 39, 18, 0.5947f, -2.4857f}, {41.5f, 15, 39, 17, 0.6815f, 2.0622f},
++    {41.5f, 14, 39, 16, 0.6130f, -4.6151f}, {41.5f, 13, 39, 15, 0.6183f, -2.3120f}, {41.5f, 12, 39, 14, 0.6780f, -5.2621f},
++    {41.5f, 11, 39, 13, 0.6630f, 0.0156f}, {41.5f, 6, 39, 7, 0.6654f, 0.3417f}, {41.5f, 5, 39, 6, 0.6395f, -3.8859f},
++    {41.5f, 4, 39, 5, 0.6050f, -3.5623f}, {41.5f, 3, 39, 4, 0.6605f, -6.2494f}, {45.5f, 15, 41, 17, 0.6237f, 0.1524f},
++    {45.5f, 2, 41, 3, 0.6297f, -6.3850f}, {46.5f, 2, 45, 3, 0.6707f, -1.7504f}, {54.5f, 2, 52, 3, 0.8224f, 2.3124f},
++    {54.5f, 3, 52, 4, 0.8894f, 2.3843f}, {59.5f, 3, 58, 4, 0.9151f, -6.2012f}, {54.5f, 4, 52, 5, 0.7949f, -2.2645f},
++    {59.5f, 4, 57, 5, 0.9518f, -2.7539f}, {54.5f, 5, 52, 6, 0.8114f, -3.0400f}, {59.5f, 5, 61, 6, 1.0078f, -0.5960f},
++    {54.5f, 6, 52, 7, 0.8731f, 1.0464f}, {58.5f, 6, 60, 8, 0.9964f, -5.8489f}, {59.5f, 6, 60, 8, 1.0176f, -4.2091f},
++    {54.5f, 7, 52, 8, 0.8514f, -3.4568f}, {58.5f, 7, 59, 9, 0.9886f, -5.1077f}, {59.5f, 7, 59, 9, 0.9297f, -4.6693f},
++    {54.5f, 8, 52, 9, 0.8017f, 1.3996f}, {58.5f, 8, 59, 9, 0.9694f, -3.8998f}, {54.5f, 9, 52, 11, 0.8309f, 2.4283f},
++    {59.5f, 9, 61, 11, 0.9942f, -4.8019f}, {54.5f, 10, 52, 12, 0.8803f, -0.7934f}, {59.5f, 10, 57, 12, 0.9856f, -6.0278f},
++    {54.5f, 11, 52, 13, 0.8403f, 0.7815f}, {59.5f, 11, 58, 13, 0.9842f, 1.6866f}, {54.5f, 12, 52, 14, 0.7882f, -4.2101f},
++    {55.5f, 12, 56, 14, 0.8643f, -5.1991f}, {58.5f, 13, 57, 15, 0.9834f, -1.4597f}, {57.5f, 14, 56, 16, 0.9616f, -3.4637f},
++    {58.5f, 14, 56, 16, 0.9539f, -2.7334f}, {54.5f, 15, 53, 16, 0.8312f, 0.3889f}, {55.5f, 15, 54, 16, 0.9302f, -5.9951f},
++    {56.5f, 15, 55, 16, 0.9049f, -1.1105f}, {57.5f, 15, 56, 16, 0.8761f, -3.4973f}, {58.5f, 15, 56, 16, 0.8670f, -5.0622f},
++    {55.5f, 16, 54, 16, 0.8473f, -1.3055f}, {56.5f, 16, 55, 16, 0.9115f, -5.0673f}, {57.5f, 16, 56, 16, 0.8514f, -3.8911f},
++    {69.5f, 0, 74, 1, 1.2314f, -5.2411f}, {70.5f, 1, 73, 2, 1.1708f, -5.0676f}, {71.5f, 15, 74, 16, 1.2454f, -1.7936f},
++    {71.5f, 16, 74, 16, 1.1576f, -6.0368f}, {70.5f, 16, 74, 16, 1.1974f, -1.7737f}, {69.5f, 16, 74, 16, 1.2267f, -6.1341f},
++    {69.5f, 15, 74, 16, 1.1696f, -0.3936f}, {69.5f, 14, 73, 15, 1.1825f, -4.3086f}, {69.5f, 13, 73, 15, 1.1702f, 2.0553f},
++    {65.5f, 15, 67, 16, 1.0708f, -1.6181f}, {65.5f, 16, 67, 16, 1.0762f, -3.0438f}, {64.5f, 15, 63, 16, 1.0704f, 2.4679f},
++    {64.5f, 14, 63, 16, 1.0103f, -5.1266f}, {64.5f, 13, 63, 15, 1.0540f, -5.0652f}, {64.5f, 12, 63, 14, 0.9674f, 1.5655f},
++    {64.5f, 11, 63, 13, 1.0175f, 0.7935f}, {64.5f, 10, 63, 12, 1.0154f, 1.3870f}, {64.5f, 9, 63, 11, 1.0220f, -5.4558f},
++    {64.5f, 6, 65, 8, 1.0018f, -1.7603f}, {64.5f, 5, 63, 6, 1.0435f, 1.6430f}, {64.5f, 4, 63, 5, 0.9774f, -1.0892f},
++    {64.5f, 3, 63, 4, 1.0112f, -2.2076f}, {65.5f, 2, 67, 3, 1.0508f, -4.3087f}, {70.5f, 15, 74, 16, 1.2125f, 1.7922f},
++    {70.5f, 14, 74, 16, 1.1631f, -2.3402f}, {70.5f, 13, 73, 15, 1.2299f, 2.1853f}, {70.5f, 9, 73, 11, 1.1570f, -5.7968f},
++    {73.5f, 2, 74, 3, 1.2632f, 2.2677f}, {74.5f, 2, 78, 3, 1.2746f, -6.4929f}, {77.5f, 13, 79, 15, 1.3445f, -3.3150f},
++    {77.5f, 14, 78, 16, 1.3252f, -1.1067f}, {76.5f, 15, 78, 16, 1.3156f, -5.4774f}, {75.5f, 16, 78, 16, 1.3110f, -4.8903f},
++    {75.5f, 15, 78, 16, 1.2652f, 1.0403f}, {76.5f, 14, 78, 16, 1.3162f, -5.2618f}, {74.5f, 1, 78, 2, 1.2428f, -3.2024f},
++    {73.5f, 1, 74, 2, 1.2121f, -3.3560f}, {69.5f, 2, 72, 3, 1.1314f, -4.6529f}, {69.5f, 1, 73, 2, 1.2203f, 1.5243f},
++    {68.5f, 1, 68, 2, 1.0549f, -1.6577f}, {70.5f, 0, 74, 1, 1.2409f, -6.6378f},
++};
++
++/*
++ * Is a picture of the guest's its desktop (or its login or lock screen), not
++ * the firmware's logo, GRUB's or Linux's text on black? px: SPLASH_PROBE_COLS
++ * x SPLASH_PROBE_ROWS pixels taken evenly across the picture (the middle of
++ * each part), 32 bits each with the colour in the low 24 bits, in any order.
++ * Text and the logo light up well under a fifth of them; a desktop (a
++ * wallpaper, a lock screen) almost all: 40 % or more brighter than 0x18 in
++ * some channel count as the desktop. Hyprland's grey (0x111111) before the
++ * wallpaper does not.
++ */
++#define SPLASH_PROBE_COLS 32
++#define SPLASH_PROBE_ROWS 18
++
++static bool pingouin_splash_desktop(const uint32_t *px)
++{
++    const int n = SPLASH_PROBE_COLS * SPLASH_PROBE_ROWS;
++    int lit = 0;
++
++    for (int i = 0; i < n; i++) {
++        lit += (px[i] & 0xff) > 0x18 || ((px[i] >> 8) & 0xff) > 0x18 ||
++               ((px[i] >> 16) & 0xff) > 0x18;
++    }
++    return lit * 10 >= n * 4;
++}
++
++/*
++ * The window's logo looks a few times a second whether it can go. error: the
++ * VM stopped on an error; lit: the guest's picture is its desktop
++ * (pingouin_splash_desktop); agent_ms: how long the guest's display agent has
++ * been up (it starts with the desktop), -1 while it is not; ran_ms: running
++ * time since the start; limit_ms: PINGOUIN_SPLASH_HOLD_SECONDS.
++ * The agent says hello about half a second before Hyprland draws the
++ * wallpaper (its grey comes first), so the logo waits for a lit picture, but
++ * at most SPLASH_AGENT_SETTLE_MS after the hello: a dark wallpaper is never
++ * "lit". The time limit does not cut that short.
++ */
++#define SPLASH_AGENT_SETTLE_MS 2000
++
++typedef enum {
++    SPLASH_LOOK_HOLD,       /* keep the logo */
++    SPLASH_LOOK_ERROR,      /* go at once: the VM stopped on an error */
++    SPLASH_LOOK_DESKTOP,    /* the desktop is drawn: fade into it */
++    SPLASH_LOOK_AGENT,      /* the agent is up, nothing lit SETTLE ms later: fade */
++    SPLASH_LOOK_LIMIT,      /* no desktop after the limit: the guest's screen as it is */
++} SplashLook;
++
++static SplashLook pingouin_splash_look(bool error, bool lit, long long agent_ms,
++                                     long long ran_ms, long long limit_ms)
++{
++    if (error) {
++        return SPLASH_LOOK_ERROR;
++    }
++    if (lit) {
++        return SPLASH_LOOK_DESKTOP;
++    }
++    if (agent_ms >= SPLASH_AGENT_SETTLE_MS) {
++        return SPLASH_LOOK_AGENT;
++    }
++    if (agent_ms < 0 && ran_ms >= limit_ms) {
++        return SPLASH_LOOK_LIMIT;
++    }
++    return SPLASH_LOOK_HOLD;
++}
++
++/* Where the probe's i-th of n pixels lies across w: the middle of its part. */
++static int pingouin_splash_probe_at(int i, int n, int w)
++{
++    return (int)((2LL * i + 1) * w / (2 * n));
++}
++
++/*
++ * The animation is the preview's (a-pixel-morph, the one the user picked),
++ * slowed down to fill the start: PINGOUIN holds INTRO_HOLD s, then the morph
++ * plays INTRO_SLOW times slower than in the preview, where it ran from 0.55 s
++ * (nothing moves before) to 2.4 s (the logo holds after): about 2.6 s of
++ * flying cells, then 0.4 s of the glow going. The table's starts are the
++ * preview's seconds.
++ */
++#define INTRO_HOLD    2.5   /* s PINGOUIN holds */
++#define INTRO_SLOW    1.6
++#define PREVIEW_START 0.55  /* s of the preview: the first movement */
++#define PREVIEW_END   2.4   /* s of the preview: the last */
++#define INTRO_END     (INTRO_HOLD + (PREVIEW_END - PREVIEW_START) * INTRO_SLOW)   /* 5.46 s */
++#define INTRO_FLIGHT  0.8   /* s of the preview a cell flies */
++#define INTRO_SHIFT   2.5   /* cells PINGOUIN sits right of the logo (76 vs 81 wide) */
++#define INTRO_MAX     (SPLASH_ROWS * MORPH_KEEP_COLS + MORPH_PARTS)
++/* The preview's frame, 1280 x 720 at 10 pixels a cell with the logo in the
++ * middle: the glow is worked out in its pixels, then laid over the window so
++ * that its logo lies on the window's. */
++#define INTRO_W       1280
++#define INTRO_H       720
++#define INTRO_PX      10.0
++#define INTRO_LOGO_X  235.0
++#define INTRO_LOGO_Y  265.0
++#define INTRO_BG_W    640   /* the glow image: half the preview, scaled up */
++#define INTRO_BG_H    360
++
++/* The preview's second at t s into the animation. */
++static double pingouin_intro_preview_time(double t)
++{
++    return PREVIEW_START + (t - INTRO_HOLD) / INTRO_SLOW;
++}
++
++/* A cell in logo cells (x right, y down from the logo's top left). rest: not
++ * moving, so its edges go on whole pixels exactly as the GL splash's. */
++typedef struct {
++    float x, y, size;
++    bool rest;
++} IntroCell;
++
++static double intro_clamp(double v)
++{
++    return v < 0 ? 0 : v > 1 ? 1 : v;
++}
++
++static double intro_ease(double p)   /* cubic in and out */
++{
++    p = intro_clamp(p);
++    return p < 0.5 ? 4 * p * p * p : 1 - pow(-2 * p + 2, 3) / 2;
++}
++
++static double intro_pulse(double t, double at, double width)
++{
++    double d = fabs(t - at) / width;
++    return d >= 1 ? 0 : 0.5 + 0.5 * cos(M_PI * d);
++}
++
++/* The cells at t seconds into the animation (out: INTRO_MAX), and how strong
++ * the glow is then. The preview's movements, on its timeline. */
++static int pingouin_intro_cells(double t, IntroCell *out, double *glow)
++{
++    double flying = 0, drift;
++
++    t = pingouin_intro_preview_time(t);
++    drift = intro_ease((t - 0.6) / 1.5);
++    int n = 0;
++
++    for (int r = 0; r < SPLASH_ROWS; r++) {
++        for (int c = 0; c < MORPH_KEEP_COLS; c++) {
++            if (pingouin_splash_cells[r][c] == '#') {
++                out[n++] = (IntroCell){ c + INTRO_SHIFT * (1 - drift), r, 1,
++                                        drift <= 0 || drift >= 1 };
++            }
++        }
++    }
++    for (int i = 0; i < MORPH_PARTS; i++) {
++        const float *p = pingouin_morph_parts[i];
++        double e = intro_ease((t - p[4]) / INTRO_FLIGHT);
++        double bump = sin(M_PI * e), size = 1 - 0.55 * bump, off = (1 - size) / 2;
++        bool rest = e <= 0 || e >= 1;
++
++        if (rest) {
++            bump = 0;
++            size = 1;
++            off = 0;
++        }
++        flying = fmax(flying, bump);
++        out[n++] = (IntroCell){ p[0] + (p[2] - p[0]) * e + off,
++                                p[1] + (p[3] - p[1]) * e + p[5] * bump + off,
++                                size, rest };
++    }
++    *glow = 0.35 * flying + 0.5 * intro_pulse(t, 2.05, 0.35);   /* t: the preview's */
++    return n;
++}
++
++/*
++ * Where the logo goes in a w x h pixel view: as big as in the firmware's
++ * 1920 x 1080 frame stretched to the view (cells of SPLASH_CELL frame pixels),
++ * but with square cells (the smaller side decides), in the middle. GL's
++ * still logo (pingouin_splash_draw) and the animation both place it so.
++ */
++#define SPLASH_FRAME_W 1920
++#define SPLASH_FRAME_H 1080
++
++typedef struct {
++    double left, top, sx, sy;   /* pixels, from the top left; per cell */
++    int lw, lh;                 /* the logo's size in pixels */
++} IntroGeom;
++
++static IntroGeom pingouin_intro_geom(int w, int h)
++{
++    double cell = fmin((double)w * SPLASH_CELL / SPLASH_FRAME_W,
++                       (double)h * SPLASH_CELL / SPLASH_FRAME_H);
++    int lw = MAX(1, (int)lround(SPLASH_COLS * cell));
++    int lh = MAX(1, (int)lround(SPLASH_ROWS * cell));
++    int bottom = (h - lh) / 2;   /* GL's viewport, from the bottom */
++
++    return (IntroGeom){ (w - lw) / 2, h - bottom - lh,
++                        (double)lw / SPLASH_COLS, (double)lh / SPLASH_ROWS, lw, lh };
++}
++
++/* A cell's edges in pixels (x0, y0, x1, y1 from the top left). Resting cells
++ * end where GL's nearest sampling of the 81 x 19 texture ends them. */
++static void pingouin_intro_rect(const IntroGeom *g, const IntroCell *c, double e[4])
++{
++    e[0] = g->left + c->x * g->sx;
++    e[1] = g->top + c->y * g->sy;
++    e[2] = g->left + (c->x + c->size) * g->sx;
++    e[3] = g->top + (c->y + c->size) * g->sy;
++    if (c->rest) {
++        for (int k = 0; k < 4; k++) {
++            e[k] = ceil(e[k] - 0.5);
++        }
++    }
++}
++
++/*
++ * Pillow's resampling weights (the preview was made with Pillow's resize):
++ * for each output pixel the first input and its weights (at most kmax).
++ */
++enum { INTRO_BOX, INTRO_BILINEAR, INTRO_BICUBIC };
++
++typedef struct {
++    int n_out, kmax;
++    int *first, *count;
++    double *w;
++} IntroResample;
++
++static double intro_filter(int kind, double x)
++{
++    x = fabs(x);
++    switch (kind) {
++    case INTRO_BOX:
++        return 1;   /* the window is exactly the box */
++    case INTRO_BILINEAR:
++        return x < 1 ? 1 - x : 0;
++    default:        /* bicubic, a = -0.5 */
++        if (x < 1) {
++            return (1.5 * x - 2.5) * x * x + 1;
++        }
++        return x < 2 ? ((-0.5 * x + 2.5) * x - 4) * x + 2 : 0;
++    }
++}
++
++static void intro_resample_init(IntroResample *r, int in, int out, int kind)
++{
++    static const double support[] = { 0.5, 1, 2 };
++    double scale = (double)in / out, fscale = MAX(scale, 1.0);
++    double sup = support[kind] * fscale;
++
++    r->n_out = out;
++    r->kmax = (int)ceil(sup) * 2 + 1;
++    r->first = g_new0(int, out);
++    r->count = g_new0(int, out);
++    r->w = g_new0(double, out * r->kmax);
++    for (int o = 0; o < out; o++) {
++        double center = (o + 0.5) * scale, sum = 0;
++        int lo = MAX(0, (int)(center - sup + 0.5));
++        int hi = MIN(in, (int)(center + sup + 0.5));
++        double *w = r->w + o * r->kmax;
++
++        if (kind == INTRO_BOX) {
++            /* Pillow's box: inside (-0.5, 0.5] of the scaled distance. */
++            for (int i = lo; i < hi; i++) {
++                double x = (i - center + 0.5) / fscale;
++                w[i - lo] = x > -0.5 && x <= 0.5;
++                sum += w[i - lo];
++            }
++        } else {
++            for (int i = lo; i < hi; i++) {
++                w[i - lo] = intro_filter(kind, (i - center + 0.5) / fscale);
++                sum += w[i - lo];
++            }
++        }
++        for (int i = lo; i < hi && sum != 0; i++) {
++            w[i - lo] /= sum;
++        }
++        r->first[o] = lo;
++        r->count[o] = hi - lo;
++    }
++}
++
++/* dst[y][x] for an image of `lines` rows: along a row (stride 1) or down a
++ * column (step = the row length). */
++static void intro_resample_run(const IntroResample *r, const float *src, float *dst,
++                               int lines, int in_step, int in_line, int out_step,
++                               int out_line)
++{
++    for (int l = 0; l < lines; l++) {
++        for (int o = 0; o < r->n_out; o++) {
++            const double *w = r->w + o * r->kmax;
++            double acc = 0;
++
++            for (int k = 0; k < r->count[o]; k++) {
++                acc += w[k] * src[l * in_line + (r->first[o] + k) * in_step];
++            }
++            dst[l * out_line + o * out_step] = acc;
++        }
++    }
++}
++
++/*
++ * The background with the glow, INTRO_BG_W x INTRO_BG_H RGBA (bytes R, G, B,
++ * A): Omarchy's background plus the green, 0.6 x glow x a blur of the cells.
++ * The blur is the preview's: the cells' cover in 8 x 8 pixel blocks, scaled
++ * up 4x (bilinear), down 8x (box), then up again (bicubic).
++ */
++static void pingouin_intro_background(const IntroCell *cells, int n, double glow,
++                                    uint8_t *rgba)
++{
++    enum { SW = INTRO_W / 8, SH = INTRO_H / 8, BW = INTRO_W / 2, BH = INTRO_H / 2,
++           KW = INTRO_W / 16, KH = INTRO_H / 16 };
++    static IntroResample up_x, up_y, box_x, box_y, out_x, out_y;
++    static float small[SH * SW], tmp1[SH * BW], big[BH * BW], tmp2[BH * KW];
++    static float k[KH * KW], tmp3[KH * INTRO_BG_W], glow_px[INTRO_BG_H * INTRO_BG_W];
++    const double fg[3] = { 0xa8, 0xcd, 0x76 }, bg[3] = { 0x1a, 0x1b, 0x26 };
++
++    if (glow <= 0) {
++        for (int i = 0; i < INTRO_BG_W * INTRO_BG_H; i++) {
++            uint8_t *p = rgba + i * 4;
++            p[0] = bg[0], p[1] = bg[1], p[2] = bg[2], p[3] = 255;
++        }
++        return;
++    }
++    if (!up_x.first) {
++        intro_resample_init(&up_x, SW, BW, INTRO_BILINEAR);
++        intro_resample_init(&up_y, SH, BH, INTRO_BILINEAR);
++        intro_resample_init(&box_x, BW, KW, INTRO_BOX);
++        intro_resample_init(&box_y, BH, KH, INTRO_BOX);
++        intro_resample_init(&out_x, KW, INTRO_BG_W, INTRO_BICUBIC);
++        intro_resample_init(&out_y, KH, INTRO_BG_H, INTRO_BICUBIC);
++    }
++    /* Each cell's area in each 8 x 8 block (the preview adds overlaps up). */
++    memset(small, 0, sizeof(small));
++    for (int i = 0; i < n; i++) {
++        double x0 = INTRO_LOGO_X + cells[i].x * INTRO_PX;
++        double y0 = INTRO_LOGO_Y + cells[i].y * INTRO_PX;
++        double x1 = fmin(x0 + cells[i].size * INTRO_PX, INTRO_W);
++        double y1 = fmin(y0 + cells[i].size * INTRO_PX, INTRO_H);
++
++        x0 = fmax(x0, 0);
++        y0 = fmax(y0, 0);
++        for (int by = (int)(y0 / 8); by < SH && by * 8 < y1; by++) {
++            double h = fmin(y1, by * 8 + 8) - fmax(y0, by * 8);
++            for (int bx = (int)(x0 / 8); bx < SW && bx * 8 < x1; bx++) {
++                double w = fmin(x1, bx * 8 + 8) - fmax(x0, bx * 8);
++                if (w > 0 && h > 0) {
++                    small[by * SW + bx] += w * h / 64;
++                }
++            }
++        }
++    }
++    /* Pillow: across first, then down. */
++    intro_resample_run(&up_x, small, tmp1, SH, 1, SW, 1, BW);
++    intro_resample_run(&up_y, tmp1, big, BW, BW, 1, BW, 1);
++    intro_resample_run(&box_x, big, tmp2, BH, 1, BW, 1, KW);
++    intro_resample_run(&box_y, tmp2, k, KW, KW, 1, KW, 1);
++    intro_resample_run(&out_x, k, tmp3, KH, 1, KW, 1, INTRO_BG_W);
++    intro_resample_run(&out_y, tmp3, glow_px, INTRO_BG_W, INTRO_BG_W, 1, INTRO_BG_W, 1);
++    for (int i = 0; i < INTRO_BG_W * INTRO_BG_H; i++) {
++        double a = 0.6 * glow * intro_clamp(glow_px[i]);
++        uint8_t *p = rgba + i * 4;
++
++        for (int c = 0; c < 3; c++) {
++            p[c] = (uint8_t)fmin(255, bg[c] + (fg[c] - bg[c]) * a + 0.5);
++        }
++        p[3] = 255;
++    }
++}
++
++#endif

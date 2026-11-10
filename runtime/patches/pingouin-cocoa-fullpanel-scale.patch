@@ -1,0 +1,183 @@
+From: OmacVM
+Subject: [PATCH] cocoa: every scale in FullPanel without black bars
+
+What: in "Full screen including notch" (FullPanel) the guest gets the
+panel's size rounded up to the next size that fits the scale it wants (a
+few pixels more: 2944x1912 for 1.6 on the 13-inch Air's 2940x1912), and the
+window shows it scaled onto the panel, filling it (the layer's resize
+gravity; the pointer maps by width and height each). The guest says which
+scale it wants ({"scale": s} on the display port, its display agent, from
+Omarchy's own setting or the panel button just pressed); QEMU checks it
+(1 to 4), keeps it in PINGOUIN_FULLPANEL_SCALE_FILE (the VM's folder, from the
+app) and, in FullPanel, gives the guest the new size at once. The next start
+reads the file, so the guest has the size that fits from its first frame.
+qemu.log: "full panel: guest WxH on the WxH panel (the guest's scale S)".
+Without a scale (automatic) or one whose sizes are too far apart: the
+panel's own size, as before. Outside FullPanel nothing changes (the clean
+size below a notch, a window).
+
+Why: #355 (@brianmerchant): the whole panel fits few of Omarchy's scale
+presets (the 13-inch Air: 1, 1.33, 2, 4), so 1.25 and 1.6 became 1.33 and
+2 in FullPanel; cutting rows (PR #355's way) brought back the black band
+that #346 removed.
+
+Upstream: not applicable (OmacVM's FullPanel).
+Test: app/runtime/Tests/display/test-fullpanel-scale.sh (the sizes, and the
+wiring in the patched ui/cocoa.m at build time). Applies after
+pingouin-cocoa-fullpanel.patch and pingouin-cocoa-fullpanel-scale-logic.patch.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -47,6 +47,7 @@
+ #include "ui/pingouin-gpu-memory.h"
+ #include "ui/pingouin-desktop-restart.h"
+ #include "ui/pingouin-clean-size.h"
++#include "ui/pingouin-fullpanel-scale.h"
+ #include "ui/pingouin-notch-park.h"
+ #include "ui/pingouin-ime.h"
+ #include "ui/pingouin-fullpanel.h"
+@@ -515,6 +516,15 @@
+ 
+ /* Pingouin: the full-screen guest height last logged. */
+ static uint32_t pingouin_clean_logged;
++/*
++ * Pingouin FullPanel (#355, ui/pingouin-fullpanel-scale.h): the scale the guest
++ * wants, in 1/120 (0: not known), and the file in the VM's folder that keeps
++ * it for the next start (PINGOUIN_FULLPANEL_SCALE_FILE, from the app). Main
++ * thread; read with the BQL by updateUIInfoLocked.
++ */
++static uint32_t pingouin_fp_scale_want;
++static uint32_t pingouin_fp_scale_logged;
++static void pingouin_fp_scale_load(void);
+ /* Pingouin: points cut off the bottom of the full-screen area for the guest. */
+ static CGFloat pingouin_full_cut;
+ /*
+@@ -1768,6 +1778,7 @@
+     NSSize frameSize;
+     QemuUIInfo info = { 0 };
+     bool full = false;
++    bool panel = false;   /* FullPanel: the whole panel, at a size the guest's scale fits */
+ 
+     if (!qemu_console_is_graphic(dcl.con)) {
+         return;
+@@ -1789,6 +1800,7 @@
+         full = pingouin_fp_cut_rows(isFullscreen, pingouin_present_layer(),
+                                   [[[self window] screen] safeAreaInsets].top,
+                                   pingouin_fullpanel_window_usable([self window]));
++        panel = isFullscreen && pingouin_fullpanel_window_usable([self window]);
+ 
+         if (!CVDisplayLinkCreateWithCGDisplay(display, &displayLink)) {
+             CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(displayLink);
+@@ -1844,6 +1856,20 @@
+                                          backingScale, full);
+     info.width = clean.w;
+     info.height = clean.h;
++    if (panel) {
++        /* A few pixels more where the guest's scale needs them; shown scaled onto the panel. */
++        pingouin_fp_scale_load();
++        pingouin_fp_scale_size(clean.w, clean.h, qatomic_read(&pingouin_fp_scale_want),
++                             &info.width, &info.height);
++        uint32_t key = info.width * 8192 + info.height;
++        if (key != pingouin_fp_scale_logged) {
++            pingouin_fp_scale_logged = key;
++            uint32_t k = qatomic_read(&pingouin_fp_scale_want);
++            fprintf(stderr, "pingouin: full panel: guest %ux%u on the %ux%u panel (%s%.2f)\n",
++                    info.width, info.height, clean.w, clean.h,
++                    k ? "the guest's scale " : "scale not known yet, ", k / 120.0);
++        }
++    }
+     pingouin_full_cut = full ? (backingFrameSize.height - clean.h) / backingScale : 0;
+     if (full && clean.h != pingouin_clean_logged) {
+         pingouin_clean_logged = clean.h;
+@@ -2516,6 +2542,8 @@
+             /* Pingouin: with the guest at the top, without the black rows. */
+             CGFloat cut = [self pingouinBlackRows];
+             CGFloat d = (CGFloat)screen.height / ([self frame].size.height - cut);
++            /* FullPanel shows a guest a few pixels wider scaled onto the panel. */
++            CGFloat dx = (CGFloat)screen.width / [self frame].size.width;
+             NSPoint p = [event locationInWindow];
+             NSView *gv = self;
+             int go = 0, guarded;
+@@ -2533,7 +2561,7 @@
+             /* Note that the origin for Cocoa mouse coords is bottom left, not top left. */
+             if (!guarded || (guarded > 0 && gv == self)) {
+                 p.y = MAX(0, p.y - cut);
+-                qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * d, 0, screen.width);
++                qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * dx, 0, screen.width);
+                 qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y * d, 0, screen.height);
+             }
+         } else {
+@@ -9408,6 +9436,62 @@
+         last = CFAbsoluteTimeGetCurrent();
+         pingouin_displays_update();
+     });
++}
++
++/*
++ * FullPanel (#355): the scale the guest wants ({"scale": s}, the display
++ * agent's, from Omarchy's own setting). Kept in the VM's folder for the
++ * next start; in FullPanel the guest gets a size that fits it at once.
++ * Main thread. The guest's number is checked (1 to 4, Hyprland's steps).
++ */
++static void pingouin_fp_scale_from_guest(double s)
++{
++    uint32_t k = pingouin_fp_scale_k(s);
++    const char *file = getenv("PINGOUIN_FULLPANEL_SCALE_FILE");
++
++    pingouin_fp_scale_load();
++    if (!k || k == qatomic_read(&pingouin_fp_scale_want)) {
++        return;
++    }
++    qatomic_set(&pingouin_fp_scale_want, k);
++    if (file && *file) {
++        char tmp[PATH_MAX];
++        if (snprintf(tmp, sizeof(tmp), "%s.new", file) < (int)sizeof(tmp)) {
++            FILE *f = fopen(tmp, "w");
++            if (f) {
++                fprintf(f, "%u\n", k);
++                if (fclose(f) == 0) {
++                    rename(tmp, file);
++                }
++            }
++        }
++    }
++    fprintf(stderr, "pingouin: full panel: the guest's scale is %.2f now\n", k / 120.0);
++    if (pingouin_fullpanel_window_usable([cocoaView window]) &&
++        ([[cocoaView window] styleMask] & NSWindowStyleMaskFullScreen)) {
++        [cocoaView updateUIInfo];
++    }
++}
++
++/* The scale kept for the VM (PINGOUIN_FULLPANEL_SCALE_FILE), read once. */
++static void pingouin_fp_scale_load(void)
++{
++    static bool loaded;
++    const char *file = getenv("PINGOUIN_FULLPANEL_SCALE_FILE");
++    unsigned k = 0;
++
++    if (loaded) {
++        return;
++    }
++    loaded = true;
++    FILE *f = file && *file ? fopen(file, "r") : NULL;
++    if (!f) {
++        return;
++    }
++    if (fscanf(f, "%u", &k) == 1 && k >= PINGOUIN_FP_SCALE_MIN && k <= PINGOUIN_FP_SCALE_MAX) {
++        qatomic_set(&pingouin_fp_scale_want, k);
++    }
++    fclose(f);
+ }
+ 
+ static void pingouin_chan_line(NSData *data)
+@@ -9444,6 +9528,10 @@
+         }
+         if ([d[@"monitors"] isKindOfClass:[NSArray class]]) {
+             pingouin_guest_monitors(d[@"monitors"]);
++        }
++        double scale;
++        if (pingouin_json_number(d[@"scale"], &scale)) {
++            pingouin_fp_scale_from_guest(scale);
+         }
+         if (update) {
+             pingouin_guest_update();

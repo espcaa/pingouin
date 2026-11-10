@@ -1,0 +1,71 @@
+From: OmacVM
+Subject: [PATCH] virtio-gpu: blob alignment for 16 KiB host pages
+
+HVF maps guest memory in 16 KiB pages on Apple Silicon (macOS 15 has no
+4 KiB granule), but a 4 KiB Linux guest places host-visible blobs on 4 KiB
+boundaries: such a blob cannot be mapped and Venus (Vulkan) memory breaks.
+Offer VIRTIO_GPU_F_BLOB_ALIGNMENT with the host page size: Linux 6.x+ then
+sizes every blob to it (Mesa's Venus driver asks for the value, 26.2.4
+and newer round their allocations to it), so every blob lands on whole
+host pages.
+
+A blob the renderer maps on part of a host page is refused (guest error,
+-EINVAL). Rounding it up to the page, as an earlier version did, would map
+the rest of that page into the guest, and nothing says the renderer owns
+it: with a small allocation from malloc that is QEMU's own heap.
+
+Upstream: not sent (QEMU 11.1 has the feature bit but never offers it).
+Test: Venus in an app VM with Mesa 26.2.4 (vulkaninfo, vkcube, vkmark; no
+"not whole host pages" error with -d guest_errors), Vulkan CTS smoke in
+tests/graphics; OpenGL unaffected (virgl GL does not use blobs here).
+
+diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
+index 270fbaa..ee53ffe 100644
+--- a/hw/display/virtio-gpu-base.c
++++ b/hw/display/virtio-gpu-base.c
+@@ -276,6 +276,17 @@ virtio_gpu_base_get_features(VirtIODevice *vdev, uint64_t features,
+     if (virtio_gpu_resource_uuid_enabled(g->conf)) {
+         features |= (1 << VIRTIO_GPU_F_RESOURCE_UUID);
+     }
++    /*
++     * Blobs are mapped into the guest with the host's page size (16 KiB
++     * under HVF on Apple Silicon): a 4 KiB guest must size and place them
++     * on that boundary, or they cannot be mapped at all.
++     */
++    if (virtio_gpu_blob_enabled(g->conf) &&
++        qemu_real_host_page_size() > 4096) {
++        features |= (1ULL << VIRTIO_GPU_F_BLOB_ALIGNMENT);
++        g->virtio_config.blob_alignment =
++            cpu_to_le32(qemu_real_host_page_size());
++    }
+ 
+     return features;
+ }
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 1626b47..b08c086 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -215,6 +215,23 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
+         return ret;
+     }
+ 
++    /*
++     * Guest memory is mapped in whole host pages (16 KiB under HVF on Apple
++     * Silicon). A blob that does not start and end on one cannot be mapped,
++     * and rounding it up would hand the guest the rest of a host page the
++     * renderer may not own (another allocation, QEMU's heap). Refuse it:
++     * a guest that honours blob_alignment sizes blobs to whole pages.
++     */
++    if (!QEMU_IS_ALIGNED((uintptr_t)data, qemu_real_host_page_size()) ||
++        !QEMU_IS_ALIGNED(size, qemu_real_host_page_size())) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: blob %" PRIu32 " is not whole host pages "
++                      "(%" PRIu64 " bytes)\n",
++                      __func__, res->base.resource_id, size);
++        virgl_renderer_resource_unmap(res->base.resource_id);
++        return -EINVAL;
++    }
++
+     vmr = g_new0(struct virtio_gpu_virgl_hostmem_region, 1);
+     name = g_strdup_printf("blob[%" PRIu32 "]", res->base.resource_id);
+     object_initialize_child(OBJECT(g), name, vmr,

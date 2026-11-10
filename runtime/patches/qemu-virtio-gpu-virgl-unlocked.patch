@@ -1,0 +1,386 @@
+From: OmacVM
+Subject: [PATCH] virtio-gpu-gl: virgl runs without the BQL (PINGOUIN_GPU_UNLOCKED=1)
+
+What: with PINGOUIN_GPU_UNLOCKED=1 (OmacVM.app: gpuOffMainLoop) commands that
+touch only virglrenderer run without the BQL, on the same main loop thread
+as before: SUBMIT_3D (virgl and Venus), resource create 2D/3D, host-only
+blobs, transfers to and from the host, context create/destroy/attach/
+detach, capsets. Consecutive ones form one run: virtio_gpu_process_cmdq
+lets go of the BQL, takes the GPU lock (qemu-console-gl-render-lock.patch),
+runs them, gives the lock back and takes the BQL again. Every other command
+keeps the BQL: set scanout, flush (console, IOSurface present), display
+info, EDID, attach/detach backing and blobs with guest pages (DMA mapping),
+map/unmap blob (memory regions), unref. Answers written during a run are
+pushed to the queue with the BQL when it ends (one notification).
+- Every caller of virtio_gpu_process_cmdq gets runs: the ctrl BH, the fence
+  poll timer, the blob unmap's resume BH, gl_flushed.
+- The guest can rewrite a command while QEMU reads it: the type (and blob
+  kind) a run picked a command for is kept and checked again where the
+  command runs; a mismatch is refused, so a command that needs the BQL
+  never runs without it.
+- The transport's reentrancy guard is cleared during a run (it would refuse a
+  vCPU's queue kick); nothing in a run maps guest memory.
+- During a device reset (resetting, set with the BQL) no run starts: the vCPU
+  that resets frees the queues after the reset BH.
+- Runs belong to the thread that ran the queue first (the main loop's); on
+  any other thread the queue runs with the BQL (and qemu.log says so once).
+- Only with fences reported by the sync thread (polled fences answer the guest
+  from inside virgl_renderer_poll). qemu.log: "virtio-gpu: virgl runs without
+  the BQL" / "with the BQL" (a warning when asked but fences are polled).
+
+Why: while Chromium opens windows a single SUBMIT_3D takes up to 107 ms
+(Apple's GL compiling programs at their first draw), glmark2's scene
+changes 40 ms. With the BQL held, every vCPU that left the guest waited as
+long (Mac mini M4: vCPU waits of 20 ms or more 13 in 90 s, worst 107 ms; the
+guest froze and its sound streams ran dry). Without it: worst BQL hold 1 ms,
+worst vCPU wait 1 ms (work/tracks/gpu-thread.md, ADR 0046).
+
+Upstream: OmacVM only. Upstream QEMU keeps virgl under the BQL on the main
+loop; its September 2026 scanout rework (after 11.1.1) touches the same
+files and has to be carried over at the next QEMU update.
+Test: src/tests/gpu-unlocked.sh (switch, log lines, check.sh agree); the
+gpu-thread lane's runs: BQL holds, vCPU waits, sound, input latency, pacing,
+glmark2, Venus, guest GPU resets and VM resets during load (20 rounds), 30 min soak.
+
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 2b7a41c..9f61368 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -219,6 +219,7 @@ static void virtio_gpu_gl_class_init(ObjectClass *klass, const void *data)
+     vbc->gl_flushed = virtio_gpu_gl_flushed;
+     vgc->handle_ctrl = virtio_gpu_gl_handle_ctrl;
+     vgc->process_cmd = virtio_gpu_virgl_process_cmd;
++    vgc->cmd_unlocked = virtio_gpu_virgl_cmd_unlocked;
+     vgc->update_cursor_data = virtio_gpu_gl_update_cursor_data;
+ 
+     vgc->resource_destroy = virtio_gpu_virgl_resource_destroy;
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index b8c7c65..de2019d 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -895,6 +895,15 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
+ 
+     VIRTIO_GPU_FILL_CMD(cblob);
+     virtio_gpu_create_blob_bswap(&cblob);
++
++    if (g->unlocked_run && cblob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D) {
++        /* Pingouin: guest pages need the BQL (DMA mapping); rewritten by the guest */
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: blob kind changed to %u\n",
++                      __func__, cblob.blob_mem);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
++        return;
++    }
++
+     trace_virtio_gpu_cmd_res_create_blob(cblob.resource_id, cblob.size);
+ 
+     if (cblob.resource_id == 0) {
+@@ -1091,6 +1100,60 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
+ }
+ #endif
+ 
++/*
++ * Pingouin: may this command run without the BQL (virtio_gpu_process_cmdq's
++ * unlocked runs)? Only those that touch nothing but virglrenderer and guest
++ * pages mapped before (the command itself, a resource's attached backing).
++ * The rest keep the BQL: display (scanout, flush, display info, EDID), DMA
++ * mapping (attach/detach backing, blobs with guest pages), memory regions
++ * (map/unmap blob), unref (may unmap or suspend).
++ * The guest can rewrite a command while QEMU reads it: the type and the blob
++ * kind seen here are kept (run_type) and checked again where the command
++ * runs, so a command that needs the BQL never runs without it.
++ */
++bool virtio_gpu_virgl_cmd_unlocked(VirtIOGPU *g,
++                                   struct virtio_gpu_ctrl_command *cmd)
++{
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
++    struct virtio_gpu_resource_create_blob cblob;
++    uint32_t type;
++
++    if (!gl->unlocked || gl->renderer_state != RS_INITED) {
++        return false;
++    }
++    if (iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num, 0, &cblob.hdr,
++                   sizeof(cblob.hdr)) != sizeof(cblob.hdr)) {
++        return false;
++    }
++    type = le32_to_cpu(cblob.hdr.type);
++    switch (type) {
++    case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
++        if (iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num, 0, &cblob,
++                       sizeof(cblob)) != sizeof(cblob) ||
++            le32_to_cpu(cblob.blob_mem) != VIRTIO_GPU_BLOB_MEM_HOST3D) {
++            return false;
++        }
++        break;
++    case VIRTIO_GPU_CMD_SUBMIT_3D:
++    case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
++    case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
++    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
++    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D:
++    case VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D:
++    case VIRTIO_GPU_CMD_CTX_CREATE:
++    case VIRTIO_GPU_CMD_CTX_DESTROY:
++    case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
++    case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:
++    case VIRTIO_GPU_CMD_GET_CAPSET_INFO:
++    case VIRTIO_GPU_CMD_GET_CAPSET:
++        break;
++    default:
++        return false;
++    }
++    cmd->run_type = type;
++    return true;
++}
++
+ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+                                       struct virtio_gpu_ctrl_command *cmd)
+ {
+@@ -1100,6 +1163,12 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+     VIRTIO_GPU_FILL_CMD(cmd->cmd_hdr);
+ 
+     virgl_renderer_force_ctx_0();
++    if (g->unlocked_run && cmd->cmd_hdr.type != cmd->run_type) {
++        /* Pingouin: rewritten by the guest after it was picked for this run */
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: command 0x%x changed to 0x%x\n",
++                      __func__, cmd->run_type, cmd->cmd_hdr.type);
++        cmd->cmd_hdr.type = 0;  /* refused below (no such command) */
++    }
+     switch (cmd->cmd_hdr.type) {
+     case VIRTIO_GPU_CMD_CTX_CREATE:
+         virgl_cmd_context_create(g, cmd);
+@@ -1620,6 +1689,25 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
+                                 NULL, g);
+         }
+     }
++    /*
++     * Pingouin: unlocked runs (PINGOUIN_GPU_UNLOCKED=1, the app's gpuOffMainLoop)
++     * need fences answered from the sync thread's callbacks: polled fences
++     * answer the guest from inside virgl_renderer_poll().
++     */
++    {
++        const char *u = getenv("PINGOUIN_GPU_UNLOCKED");
++        bool want = u && !strcmp(u, "1");
++
++        gl->unlocked = want && virgl_poll_fd >= 0;
++        if (gl->unlocked) {
++            info_report("virtio-gpu: virgl runs without the BQL");
++        } else if (want) {
++            warn_report("virtio-gpu: virgl runs with the BQL "
++                        "(fences polled: no unlocked runs)");
++        } else {
++            info_report("virtio-gpu: virgl runs with the BQL");
++        }
++    }
+     if (virgl_poll_fd >= 0) {
+         info_report("virtio-gpu: virgl fences reported by the sync thread");
+     } else if (flags & VIRGL_RENDERER_ASYNC_FENCE_CB) {
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 935a187..31dd3b5 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -176,6 +176,12 @@ void virtio_gpu_ctrl_response(VirtIOGPU *g,
+                       "%s: response size incorrect %zu vs %zu\n",
+                       __func__, s, resp_len);
+     }
++    if (g->unlocked_run) {
++        /* Pingouin: the queue needs the BQL; pushed after the run. */
++        cmd->resp_len = s;
++        cmd->finished = true;
++        return;
++    }
+     virtqueue_push(cmd->vq, &cmd->elem, s);
+     virtio_notify(VIRTIO_DEVICE(g), cmd->vq);
+     cmd->finished = true;
+@@ -1130,10 +1136,78 @@ static void virtio_gpu_handle_cursor_cb(VirtIODevice *vdev, VirtQueue *vq)
+     qemu_bh_schedule(g->cursor_bh);
+ }
+ 
++/*
++ * Pingouin: unlocked runs (virtio-gpu-gl with PINGOUIN_GPU_UNLOCKED=1). The
++ * device's class says which commands touch only its renderer
++ * (cmd_unlocked); consecutive ones run without the BQL, so vCPUs and the
++ * window code are not held up while the GPU works. The main loop thread stays
++ * the only one that runs commands. During a run it holds the GPU lock and not
++ * the BQL; it never holds both. Answers written meanwhile are pushed to the
++ * queue with the BQL when the run ends.
++ *
++ * The BH that got here carries the transport's reentrancy guard; while it is
++ * set every MMIO access to the device is refused, a vCPU's queue kick too.
++ * A run clears it: nothing in a run maps guest memory (commands that do keep
++ * the BQL), so the re-entrancy it guards against cannot happen in one.
++ */
++/*
++ * Runs belong to one thread, the main loop's (the first one that runs the
++ * queue). Anywhere else the queue is run with the BQL, as without runs.
++ */
++static bool virtio_gpu_run_thread_ok(void)
++{
++    static int run_thread;
++    int self = qemu_get_thread_id();
++
++    if (!run_thread) {
++        run_thread = self;
++    }
++    if (self != run_thread) {
++        warn_report_once("virtio-gpu: the queue ran on another thread: "
++                         "no unlocked run there");
++        return false;
++    }
++    return true;
++}
++
++static void virtio_gpu_run_begin(VirtIOGPU *g, bool *guard)
++{
++    DeviceState *transport = qdev_get_parent_bus(DEVICE(g))->parent;
++
++    assert(bql_locked() && !g->unlocked_run);
++    *guard = transport->mem_reentrancy_guard.engaged_in_io;
++    transport->mem_reentrancy_guard.engaged_in_io = false;
++    g->unlocked_run = true;
++    bql_unlock();
++    qemu_console_gl_render_lock();
++}
++
++static void virtio_gpu_run_end(VirtIOGPU *g, bool guard)
++{
++    DeviceState *transport = qdev_get_parent_bus(DEVICE(g))->parent;
++    struct virtio_gpu_ctrl_command *cmd;
++    VirtQueue *vq = NULL;
++
++    qemu_console_gl_render_unlock();
++    bql_lock();
++    g->unlocked_run = false;
++    transport->mem_reentrancy_guard.engaged_in_io = guard;
++    while ((cmd = QTAILQ_FIRST(&g->donelist))) {
++        QTAILQ_REMOVE(&g->donelist, cmd, next);
++        virtqueue_push(cmd->vq, &cmd->elem, cmd->resp_len);
++        vq = cmd->vq;
++        g_free(cmd);
++    }
++    if (vq) {
++        virtio_notify(VIRTIO_DEVICE(g), vq);
++    }
++}
++
+ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+ {
+     struct virtio_gpu_ctrl_command *cmd;
+     VirtIOGPUClass *vgc = VIRTIO_GPU_GET_CLASS(g);
++    bool in_run = false, guard = false;
+ 
+     if (g->processing_cmdq) {
+         return;
+@@ -1146,6 +1220,18 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+             break;
+         }
+ 
++        /* Pingouin: never during a reset (a vCPU frees the queues after it) */
++        if (!g->resetting && vgc->cmd_unlocked && vgc->cmd_unlocked(g, cmd) &&
++            (in_run || virtio_gpu_run_thread_ok())) {
++            if (!in_run) {
++                virtio_gpu_run_begin(g, &guard);
++                in_run = true;
++            }
++        } else if (in_run) {
++            virtio_gpu_run_end(g, guard);
++            in_run = false;
++        }
++
+         /* process command */
+         vgc->process_cmd(g, cmd);
+ 
+@@ -1169,10 +1255,15 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+                 }
+                 trace_virtio_gpu_inc_inflight_fences(g->inflight);
+             }
++        } else if (in_run) {
++            QTAILQ_INSERT_TAIL(&g->donelist, cmd, next);
+         } else {
+             g_free(cmd);
+         }
+     }
++    if (in_run) {
++        virtio_gpu_run_end(g, guard);
++    }
+     g->processing_cmdq = false;
+ }
+ 
+@@ -1673,6 +1764,7 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
+     qemu_cond_init(&g->reset_cond);
+     QTAILQ_INIT(&g->reslist);
+     QTAILQ_INIT(&g->cmdq);
++    QTAILQ_INIT(&g->donelist);
+     QTAILQ_INIT(&g->fenceq);
+ }
+ 
+@@ -1723,6 +1815,7 @@ void virtio_gpu_reset(VirtIODevice *vdev)
+     VirtIOGPU *g = VIRTIO_GPU(vdev);
+     struct virtio_gpu_ctrl_command *cmd;
+ 
++    g->resetting = true;
+     if (qemu_in_vcpu_thread()) {
+         g->reset_finished = false;
+         qemu_bh_schedule(g->reset_bh);
+@@ -1749,6 +1842,7 @@ void virtio_gpu_reset(VirtIODevice *vdev)
+     }
+ 
+     virtio_gpu_base_reset(VIRTIO_GPU_BASE(vdev));
++    g->resetting = false;
+ }
+ 
+ static void
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 1e3618f..c5a7409 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -141,6 +141,8 @@ struct virtio_gpu_ctrl_command {
+     struct virtio_gpu_ctrl_hdr cmd_hdr;
+     uint32_t error;
+     bool finished;
++    size_t resp_len;            /* Pingouin: answer written in an unlocked run */
++    uint32_t run_type;          /* Pingouin: the type an unlocked run took it for */
+     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
+ };
+ 
+@@ -208,6 +210,15 @@ struct VirtIOGPU {
+     uint64_t hostmem;
+ 
+     bool processing_cmdq;
++    /*
++     * Pingouin: virgl without the BQL (virtio-gpu-gl, PINGOUIN_GPU_UNLOCKED=1).
++     * Main loop thread only: unlocked_run while it runs commands without the
++     * BQL, donelist the commands answered meanwhile (pushed with the BQL after
++     * the run). resetting is set with the BQL while a reset is under way.
++     */
++    bool unlocked_run;
++    bool resetting;
++    QTAILQ_HEAD(, virtio_gpu_ctrl_command) donelist;
+ 
+     uint32_t inflight;
+     struct {
+@@ -230,6 +241,8 @@ struct VirtIOGPUClass {
+ 
+     void (*handle_ctrl)(VirtIODevice *vdev, VirtQueue *vq);
+     void (*process_cmd)(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd);
++    /* Pingouin: may this command run without the BQL? NULL: never. */
++    bool (*cmd_unlocked)(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd);
+     void (*update_cursor_data)(VirtIOGPU *g,
+                                struct virtio_gpu_scanout *s,
+                                uint32_t resource_id);
+@@ -268,6 +281,7 @@ struct VirtIOGPUGL {
+ 
+     MemoryRegion hostmem_background;
+     void *hostmem_mmap;
++    bool unlocked;              /* Pingouin: PINGOUIN_GPU_UNLOCKED=1 took effect */
+ };
+ 
+ struct VhostUserGPU {
+@@ -409,6 +423,8 @@ void virtio_gpu_disable_scanout(VirtIOGPU *g, int scanout_id);
+ /* virtio-gpu-3d.c */
+ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+                                   struct virtio_gpu_ctrl_command *cmd);
++bool virtio_gpu_virgl_cmd_unlocked(VirtIOGPU *g,
++                                   struct virtio_gpu_ctrl_command *cmd);
+ void virtio_gpu_virgl_fence_poll(VirtIOGPU *g);
+ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g);
+ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g);

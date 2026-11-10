@@ -1,0 +1,140 @@
+From: OmacVM
+Subject: [PATCH] ui: FullPanel armed late, its decisions, tested without a notched Mac
+
+What: a header with no AppKit in it: what a way into full screen does with
+the strip (now; late: the main window on a display without a camera
+housing while every other part is there; or normal full screen, with the
+reason a display with a housing would have); that a full screen armed late
+counts as entered at didEnterFullScreen; the panel size this start's notch
+was measured on (PINGOUIN_FULLPANEL_PANEL, "WxD" in points); and that a full
+screen armed late takes the strip only on a display of that size. Used by
+pingouin-cocoa-fullpanel-late-arm.patch (which explains the why).
+
+Why its own file: so the rules are tested without QEMU, a display or a
+notch (app/runtime/Tests/display/test-fullpanel-late-arm.sh applies this
+patch to an empty folder with the FullPanel, display-settle and retake
+logic patches; at build time and in CI), and replayed with the window's
+FullPanel state in test-fullpanel-retake.c.
+
+Upstream: not applicable (OmacVM's notch strip).
+Test: app/runtime/Tests/display/test-fullpanel-late-arm.c,
+app/runtime/Tests/display/test-fullpanel-retake.c.
+
+diff --git a/ui/pingouin-fullpanel-late.h b/ui/pingouin-fullpanel-late.h
+new file mode 100644
+--- /dev/null
++++ b/ui/pingouin-fullpanel-late.h
+@@ -0,0 +1,113 @@
++/*
++ * Pingouin: FullPanel for a full screen entered on a display without a
++ * camera housing (#716): the VM started with the MacBook's lid closed (an
++ * external display only), or its main window in full screen on an external
++ * display beside the open MacBook. Such a full screen is armed late: normal
++ * full screen there, nothing logged that pingouin check warns about, and the
++ * strip beside the notch once AppKit has its Space on a display with a
++ * housing (the lid opened, the external display unplugged), through the
++ * resume and the retake of a display change
++ * (pingouin-cocoa-fullpanel-retake.patch).
++ *
++ * The decisions only, no AppKit in here, so they are tested on their own
++ * (app/runtime/Tests/display/test-fullpanel-late-arm.c and the rows of
++ * test-fullpanel-retake.c); ui/cocoa.m feeds them
++ * (pingouin-cocoa-fullpanel-late-arm.patch).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef PINGOUIN_FULLPANEL_LATE_H
++#define PINGOUIN_FULLPANEL_LATE_H
++
++#include <math.h>
++#include <stdbool.h>
++#include <stdlib.h>
++
++#include "pingouin-fullpanel.h"
++
++/* What a way into full screen does with the strip. */
++typedef enum {
++    PINGOUIN_FP_ENTRY_ARM,      /* its display has a housing, every part there: the strip now */
++    PINGOUIN_FP_ENTRY_LATE,     /* no housing there: armed, the strip once it is on a display with one */
++    PINGOUIN_FP_ENTRY_NORMAL,   /* normal full screen for this one (pingouin_fp_entry_why says why) */
++} PingouinFPEntry;
++
++/*
++ * here: pingouin_fp_fallback for the window's display now; with_housing: the
++ * same for a display with a housing (the menu bar setting, the reservation,
++ * SkyLight). Only the main window is armed late: it is never made again,
++ * so its Space is what moves to the MacBook's display; the other displays'
++ * windows are made again for each display.
++ */
++static inline PingouinFPEntry pingouin_fp_entry(PingouinFPFallback here, PingouinFPFallback with_housing,
++                                            bool main_window)
++{
++    if (here == PINGOUIN_FP_OK) {
++        return PINGOUIN_FP_ENTRY_ARM;
++    }
++    if (here == PINGOUIN_FP_NO_NOTCH && main_window && with_housing == PINGOUIN_FP_OK) {
++        return PINGOUIN_FP_ENTRY_LATE;
++    }
++    return PINGOUIN_FP_ENTRY_NORMAL;
++}
++
++/*
++ * Why an entry is normal full screen: for the main window on a display
++ * without a housing, the reason it would have on one (the line then names
++ * what really stops it).
++ */
++static inline PingouinFPFallback pingouin_fp_entry_why(PingouinFPFallback here, PingouinFPFallback with_housing,
++                                                   bool main_window)
++{
++    return here == PINGOUIN_FP_NO_NOTCH && main_window && with_housing != PINGOUIN_FP_OK ? with_housing : here;
++}
++
++/*
++ * didEnterFullScreen counts the full screen as entered (the retake and the
++ * lost or displaced sorting of a frame change need it): with the strip, or
++ * armed late (its strip comes later, after the resume).
++ */
++static inline bool pingouin_fp_entered(bool armed, bool accepted, bool late)
++{
++    return armed && (accepted || late);
++}
++
++/*
++ * The panel this start's notch was measured on (PINGOUIN_FULLPANEL_PANEL,
++ * "WxD" in points, from Pingouin.app); false when not given or not a size.
++ */
++static inline bool pingouin_fp_panel(const char *env, double *w, double *h)
++{
++    char *end;
++    double a, b;
++
++    if (!env || !*env) {
++        return false;
++    }
++    a = strtod(env, &end);
++    if (end == env || *end != 'x') {
++        return false;
++    }
++    env = end + 1;
++    b = strtod(env, &end);
++    if (end == env || *end || !(a >= 100 && a <= 20000) || !(b >= 100 && b <= 20000)) {
++        return false;
++    }
++    *w = a;
++    *h = b;
++    return true;
++}
++
++/*
++ * A late full screen takes the strip only on a display of the panel's
++ * size: the guest's bar was given that notch for the whole boot (SMBIOS),
++ * and on another size it would sit unsplit under the housing. Anything
++ * else (not late, no panel given) fits.
++ */
++static inline bool pingouin_fp_late_fits(bool late, bool given, double want_w, double want_h,
++                                       double w, double h)
++{
++    return !late || !given || (fabs(w - want_w) < 0.5 && fabs(h - want_h) < 0.5);
++}
++
++#endif /* PINGOUIN_FULLPANEL_LATE_H */

@@ -1,0 +1,800 @@
+virglrenderer: Venus memory counts against the guest GPU memory budget
+
+What: Venus (Vulkan) device memory and Venus shared-memory blobs are charged
+against the same budget as the GL resources (virgl-resource-memory-budget.patch,
+PINGOUIN_GPU_MEMORY_MB, default three quarters of the Mac's memory): one budget per VM.
+vkAllocateMemory past it fails with VK_ERROR_OUT_OF_DEVICE_MEMORY, a shm blob
+past it is not made; the QEMU log says so at the 1st, 2nd, 4th ... refusal.
+Each allocation is charged in whole pages.
+The charge goes with the storage, not with one object: every object that keeps
+the storage alive holds a reference (struct virgl_gpu_charge): the
+VkDeviceMemory, memory imported from it, the Venus context's resource, and the
+virgl_resource of the guest's blob (handed over in the CREATE_RESOURCE reply,
+like the Metal heap pointer). The bytes come back when the last one is gone.
+So a guest that exports a blob, frees the memory and closes its GEM handle
+(the kernel then sends DETACH) but keeps the dma-buf fd or a mapping still
+pays for the storage until the blob itself is freed. Memory imported from a
+resource this context did not make (no charge known here) is charged again at
+the resource's size: counted twice rather than not at all.
+The budget counter is atomic (Venus allocates on its ring threads) and is read
+once per process (virgl_gpu_budget_init, called by vrend and vkr).
+Why: Venus device memory was not limited at all: a guest Vulkan app could take
+the Mac's memory (standards section 4).
+Limits: the blob's reference only crosses to the virgl_resource when the render
+server runs in QEMU's process (OmacVM on macOS:
+virgl-darwin-venus-in-process.patch). A forked render server (Linux) keeps its
+own count per process and its charge ends with the context's resource. Venus
+resources only the guest's kernel sees (guest memory blobs) are not host memory
+and are not charged.
+Upstream: not sent.
+What the app sees: guest Mesa venus allocates asynchronously by default, so
+vkAllocateMemory returns VK_SUCCESS in the guest; the app's next use of that
+memory finds no object, the context is lost and the guest's Mesa ends the app
+(like any Venus loss, virgl-context-loss-report.patch). With
+VN_PERF=no_async_mem_alloc in the guest the app gets VK_ERROR_OUT_OF_DEVICE_MEMORY
+and can go on.
+Tests: Tests/virgl/test-venus-budget-storage.c (build time): a blob's charge stays
+after DETACH and goes with the blob; fails without this patch.
+Tests/virgl/test-resource-budget.c still passes (the GL side uses the shared
+counter). Venus in a test VM (gpu-2.9.0 runtime with this patch,
+PINGOUIN_GPU_MEMORY_MB=2048, tests/graphics/guest/vk-alloc.c, 256 MB blocks):
+synchronous, the 7th block (1902 MB in use with the desktop) gets
+VK_ERROR_OUT_OF_DEVICE_MEMORY and, after freeing, allocations work again; async,
+the app ends at vkFreeMemory and the VM, desktop and the next Vulkan app go on.
+Without the patch all 24 blocks (6 GB) are made. vk-alloc keepfd (make
+exportable, export the dma-buf fd, free, keep the fd; 256 MB blocks, same VM):
+with the first version of this patch all 24 blocks (6 GB) were kept past the
+2 GB budget; now the 7th is refused (1902 MB in use), and after the app ends
+the bytes come back. Guest Mesa (main) then crashes in vn_AllocateMemory: its
+memory report reads mem->base_bo of the failed export allocation (a guest
+Mesa bug in its error path, not fixed here).
+--- a/server/render_context.c
++++ b/server/render_context.c
+@@ -9,6 +9,7 @@
+ 
+ #include "util/u_thread.h"
+ #include "virgl_util.h"
++#include "virgl_gpu_budget.h"
+ 
+ #include "render_state.h"
+ 
+@@ -109,13 +110,22 @@ render_context_dispatch_create_resource(struct render_context *ctx,
+       .fd_type = VIRGL_RESOURCE_FD_INVALID,
+    };
+    int res_fd = -1;
++   struct virgl_gpu_charge *charge = NULL;
+    bool ok = render_state_create_resource(ctx->ctx_id, req->res_id, req->blob_id,
+                                           req->blob_size, req->blob_flags, &reply.fd_type,
+                                           &res_fd, &reply.res_ptr, &reply.map_info,
+-                                          &reply.vulkan_info);
++                                          &reply.vulkan_info, &charge);
+    if (!ok)
+       return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
+ 
++   /* Pingouin: the budget charge goes to the client's virgl_resource with the storage.
++    * A pointer only means something in this process; a forked server keeps its own
++    * count (the resource's charge then ends with this context's resource). */
++   if (ctx->in_process)
++      reply.charge = charge;
++   else
++      virgl_gpu_charge_unref(charge);
++
+    if (res_fd >= 0) {
+       ok =
+          render_socket_send_reply_with_fds(&ctx->socket, &reply, sizeof(reply), &res_fd, 1);
+@@ -130,6 +140,9 @@ render_context_dispatch_create_resource(struct render_context *ctx,
+       }
+       ok = render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
+    }
++   /* the client never got the reference */
++   if (!ok)
++      virgl_gpu_charge_unref(reply.charge);
+ 
+    return ok;
+ }
+--- a/server/render_protocol.h
++++ b/server/render_protocol.h
+@@ -152,6 +152,9 @@ struct render_context_op_create_resource_reply {
+    struct virgl_resource_vulkan_info vulkan_info;
+    /* When fd_type == VIRGL_RESOURCE_METAL_HEAP */
+    void *res_ptr;
++   /* Pingouin: in-process server only: a reference on the storage's GPU memory budget
++    * charge for the client's resource, or NULL */
++   struct virgl_gpu_charge *charge;
+    /* otherwise followed by 1 fd if not VIRGL_RESOURCE_FD_INVALID */
+ };
+ 
+--- a/server/render_state.c
++++ b/server/render_state.c
+@@ -227,12 +227,13 @@ render_state_create_resource(uint32_t ctx_id,
+                              int *out_res_fd,
+                              void **out_res_ptr,
+                              uint32_t *out_map_info,
+-                             struct virgl_resource_vulkan_info *out_vulkan_info)
++                             struct virgl_resource_vulkan_info *out_vulkan_info,
++                             struct virgl_gpu_charge **out_charge)
+ {
+    SCOPE_LOCK_RENDERER();
+    return vkr_renderer_create_resource(ctx_id, res_id, blob_id, blob_size, blob_flags,
+                                        out_fd_type, out_res_fd, out_res_ptr,
+-                                       out_map_info, out_vulkan_info);
++                                       out_map_info, out_vulkan_info, out_charge);
+ }
+ 
+ bool
+--- a/server/render_state.h
++++ b/server/render_state.h
+@@ -42,7 +42,8 @@ render_state_create_resource(uint32_t ctx_id,
+                              int *out_res_fd,
+                              void **out_res_ptr,
+                              uint32_t *out_map_info,
+-                             struct virgl_resource_vulkan_info *out_vulkan_info);
++                             struct virgl_resource_vulkan_info *out_vulkan_info,
++                             struct virgl_gpu_charge **out_charge);
+ 
+ bool
+ render_state_import_resource(uint32_t ctx_id,
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -13,6 +13,7 @@
+ #include "server/render_protocol.h"
+ #include "util/anon_file.h"
+ #include "util/bitscan.h"
++#include "virgl_gpu_budget.h"
+ 
+ #include "proxy_client.h"
+ 
+@@ -397,12 +398,14 @@ proxy_context_get_blob(struct virgl_context *base,
+       blob->u.metal_heap = reply.res_ptr;
+       blob->map_info = reply.map_info;
+       blob->vulkan_info = reply.vulkan_info;
++      blob->charge = reply.charge;
+ 
+       proxy_context_resource_add(ctx, res_id);
+ 
+       return 0;
+    } else if (!reply_fd_count) {
+       proxy_log("invalid reply for blob %" PRIu64, blob_id);
++      virgl_gpu_charge_unref(reply.charge);
+       return -1;
+    }
+ 
+@@ -427,12 +430,15 @@ proxy_context_get_blob(struct virgl_context *base,
+    if (!reply_fd_valid) {
+       proxy_log("invalid fd type %d for blob %" PRIu64, reply.fd_type, blob_id);
+       close(reply_fd);
++      virgl_gpu_charge_unref(reply.charge);
+       return -1;
+    }
+ 
+    blob->type = reply.fd_type;
+    blob->u.fd = reply_fd;
+    blob->map_info = reply.map_info;
++   /* Pingouin: the storage's budget charge (in-process server; else NULL) */
++   blob->charge = reply.charge;
+ 
+    if (reply.fd_type == VIRGL_RESOURCE_FD_OPAQUE)
+       blob->vulkan_info = reply.vulkan_info;
+--- a/src/venus/vkr_common.h
++++ b/src/venus/vkr_common.h
+@@ -34,6 +34,7 @@
+ #include "virglrenderer.h"
+ 
+ #include "vkr_renderer.h"
++#include "virgl_gpu_budget.h"
+ 
+ /* cap instance and device api versions to this */
+ #define VKR_MAX_API_VERSION VK_API_VERSION_1_4
+@@ -354,4 +355,13 @@ vkr_seqno_ge(uint32_t a, uint32_t b)
+    return (a - b) <= INT32_MAX;
+ }
+ 
++/*
++ * Pingouin: Venus memory charged against the guest GPU memory budget (virgl_gpu_budget.h):
++ * device memory and shm blobs, in whole pages. The charge goes with the storage: every
++ * object that keeps it alive holds a reference (virgl_gpu_charge_ref/unref).
++ * NULL when the budget refuses the bytes (logged at the 1st, 2nd, 4th ... refusal).
++ */
++struct virgl_gpu_charge *
++vkr_memory_charge_create(uint64_t bytes, const char *what);
++
+ #endif /* VKR_COMMON_H */
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -200,6 +200,7 @@ vkr_context_free_resource(struct hash_entry *entry)
+       CFRelease(res->u.metal_heap);
+    else if (res->u.fd >= 0)
+       close(res->u.fd);
++   virgl_gpu_charge_unref(res->charge);
+    free(res);
+ }
+ 
+@@ -241,6 +242,7 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
+    if (!res)
+       return false;
+ 
++   res->charge = NULL;
+    res->res_id = res_id;
+    res->fd_type = fd_type;
+    res->size = blob_size;
+@@ -289,22 +291,32 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
+ {
+    assert(!vkr_context_get_resource(ctx, res_id));
+ 
++   /* Pingouin: shared memory of the guest's size counts against the GPU memory budget */
++   struct virgl_gpu_charge *charge = vkr_memory_charge_create(blob_size, "Venus shared memory");
++   if (!charge)
++      return false;
++
+    int fd = os_create_anonymous_file(blob_size, "vkr-shmem");
+-   if (fd < 0)
++   if (fd < 0) {
++      virgl_gpu_charge_unref(charge);
+       return false;
++   }
+ 
+    void *mmap_ptr = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+    if (mmap_ptr == MAP_FAILED) {
++      virgl_gpu_charge_unref(charge);
+       close(fd);
+       return false;
+    }
+ 
+    if (!vkr_context_import_resource_internal(ctx, res_id, blob_size,
+                                              VIRGL_RESOURCE_FD_SHM, -1, mmap_ptr)) {
++      virgl_gpu_charge_unref(charge);
+       munmap(mmap_ptr, blob_size);
+       close(fd);
+       return false;
+    }
++   vkr_context_get_resource(ctx, res_id)->charge = charge;
+ 
+    *out_blob = (struct virgl_context_blob){
+       .type = VIRGL_RESOURCE_FD_SHM,
+@@ -329,6 +341,7 @@ vkr_context_import_resource_metal(struct vkr_context *ctx,
+    if (!res)
+       return false;
+ 
++   res->charge = NULL;
+    res->res_id = res_id;
+    res->fd_type = fd_type;
+    res->size = blob_size;
+@@ -363,7 +376,12 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+ 
+    if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
+       *out_blob = blob;
+-      return vkr_context_import_resource_metal(ctx, res_id, blob_size, blob.type, blob.u.metal_heap);
++      if (!vkr_context_import_resource_metal(ctx, res_id, blob_size, blob.type,
++                                             blob.u.metal_heap))
++         return false;
++      /* Pingouin: the heap lives on in the resource: it shares the memory's charge */
++      vkr_context_get_resource(ctx, res_id)->charge = virgl_gpu_charge_ref(mem->charge);
++      return true;
+    }
+ 
+    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
+@@ -386,6 +404,8 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+       close(blob.u.fd);
+       return false;
+    }
++   /* Pingouin: the exported storage lives on in the resource: it shares the charge */
++   vkr_context_get_resource(ctx, res_id)->charge = virgl_gpu_charge_ref(mem->charge);
+ 
+    *out_blob = blob;
+ 
+@@ -403,11 +423,19 @@ vkr_context_create_resource(struct vkr_context *ctx,
+    /* blob_id == 0 does not refer to an existing VkDeviceMemory, but implies a shm
+     * allocation. It is logically contiguous and it can be exported.
+     */
++   bool ok;
+    if (!blob_id && blob_flags == VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE)
+-      return vkr_context_create_resource_from_shm(ctx, res_id, blob_size, out_blob);
+-
+-   return vkr_context_create_resource_from_device_memory(ctx, res_id, blob_id, blob_size,
+-                                                         blob_flags, out_blob);
++      ok = vkr_context_create_resource_from_shm(ctx, res_id, blob_size, out_blob);
++   else
++      ok = vkr_context_create_resource_from_device_memory(ctx, res_id, blob_id, blob_size,
++                                                          blob_flags, out_blob);
++
++   /* Pingouin: the guest's blob (virgl_resource) keeps the storage after this context
++    * lets the resource go (DETACH at GEM close, while a dma-buf fd or mapping keeps the
++    * blob): it holds its own reference on the charge. The caller owns it. */
++   out_blob->charge = ok ? virgl_gpu_charge_ref(vkr_context_get_resource(ctx, res_id)->charge)
++                         : NULL;
++   return ok;
+ }
+ 
+ bool
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -34,6 +34,9 @@ struct vkr_resource {
+    } u;
+ 
+    size_t size;
++
++   /* Pingouin: shm blobs and exported device memory count against the GPU memory budget */
++   struct virgl_gpu_charge *charge;
+ };
+ 
+ enum vkr_context_validate_level {
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -288,6 +288,25 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+       }
+    }
+ 
++   /* Pingouin: new device memory counts against the guest GPU memory budget. Memory
++    * imported from a resource keeps that storage alive: it shares the resource's
++    * charge, or, for a resource with none (imported into this context), charges the
++    * storage's size itself, so no storage outlives every charge on it. */
++   struct virgl_gpu_charge *charge;
++   if (res_info) {
++      struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
++      charge = res->charge ? virgl_gpu_charge_ref(res->charge)
++                           : vkr_memory_charge_create(res->size, "imported Vulkan memory");
++   } else {
++      charge = vkr_memory_charge_create(alloc_info->allocationSize, "Vulkan device memory");
++   }
++   if (!charge) {
++      if (local_import_info.fd >= 0)
++         close(local_import_info.fd);
++      args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      return;
++   }
++
+    VkExportMemoryAllocateInfo *export_info =
+       vkr_find_struct(alloc_info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+ 
+@@ -380,8 +399,10 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+             args->ret = vkr_gbm_get_fd_info_from_allocation_info(
+                physical_dev, alloc_info, &gbm_bo, &local_import_info);
+          }
+-         if (args->ret != VK_SUCCESS)
++         if (args->ret != VK_SUCCESS) {
++            virgl_gpu_charge_unref(charge);
+             return;
++         }
+ 
+          alloc_info->pNext = &local_import_info;
+          valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
+@@ -416,6 +437,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+ 
+    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
+    if (!mem) {
++      virgl_gpu_charge_unref(charge);
+       if (local_import_info.fd >= 0)
+          close(local_import_info.fd);
+       if (gbm_bo)
+@@ -431,6 +453,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    mem->gbm_bo = gbm_bo;
+    mem->allocation_size = alloc_info->allocationSize;
+    mem->memory_type_index = mem_type_index;
++   mem->charge = charge;
+ }
+ 
+ static void
+@@ -549,9 +572,29 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
+       vkr_dispatch_vkGetMemoryResourcePropertiesMESA;
+ }
+ 
++struct virgl_gpu_charge *
++vkr_memory_charge_create(uint64_t bytes, const char *what)
++{
++   /* whole pages: many tiny allocations count too */
++   const uint64_t page = getpagesize();
++   bytes = bytes > UINT64_MAX - page ? UINT64_MAX : align64(bytes, page);
++
++   uint64_t n;
++   struct virgl_gpu_charge *charge = virgl_gpu_charge_create(bytes, &n);
++   /* the 1st, 2nd, 4th, 8th ... refusal: a guest in a loop cannot flood the log */
++   if (!charge && n && !(n & (n - 1)))
++      vkr_log("guest GPU memory budget of %" PRIu64 " MB reached: refused %" PRIu64
++              " KB of %s with %" PRIu64 " MB in use (%" PRIu64 " refused so far)",
++              virgl_gpu_budget_limit() >> 20, bytes >> 10, what,
++              virgl_gpu_budget_in_use() >> 20, n);
++   return charge;
++}
++
+ void
+ vkr_device_memory_release(struct vkr_device_memory *mem)
+ {
++   virgl_gpu_charge_unref(mem->charge);
++   mem->charge = NULL;
+    if (mem->gbm_bo)
+       vkr_gbm_bo_destroy(mem->gbm_bo);
+    if (mem->udmabuf_fd >= 0)
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -29,6 +29,9 @@ struct vkr_device_memory {
+    uint64_t allocation_size;
+    uint32_t memory_type_index;
+ 
++   /* Pingouin: this memory's charge against the guest GPU memory budget */
++   struct virgl_gpu_charge *charge;
++
+    bool exported;
+ };
+ VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -69,6 +69,7 @@ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs)
+       return false;
+ 
+    vkr_debug_init();
++   virgl_gpu_budget_init();
+ 
+    if (cbs->debug_logger)
+       virgl_log_set_handler(cbs->debug_logger, NULL, NULL);
+@@ -181,7 +182,8 @@ vkr_renderer_create_resource(uint32_t ctx_id,
+                              int *out_res_fd,
+                              void **out_res_ptr,
+                              uint32_t *out_map_info,
+-                             struct virgl_resource_vulkan_info *out_vulkan_info)
++                             struct virgl_resource_vulkan_info *out_vulkan_info,
++                             struct virgl_gpu_charge **out_charge)
+ {
+    TRACE_FUNC();
+ 
+@@ -195,6 +197,8 @@ vkr_renderer_create_resource(uint32_t ctx_id,
+    struct virgl_context_blob blob;
+    if (!vkr_context_create_resource(ctx, res_id, blob_id, blob_size, blob_flags, &blob))
+       return false;
++   /* Pingouin: the caller owns this reference on the storage's budget charge */
++   *out_charge = blob.charge;
+ 
+    assert(blob.type == VIRGL_RESOURCE_FD_SHM || blob.type == VIRGL_RESOURCE_FD_DMABUF ||
+           blob.type == VIRGL_RESOURCE_FD_OPAQUE || blob.type == VIRGL_RESOURCE_METAL_HEAP);
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -63,7 +63,8 @@ vkr_renderer_create_resource(uint32_t ctx_id,
+                              int *out_res_fd,
+                              void **out_res_ptr,
+                              uint32_t *out_map_info,
+-                             struct virgl_resource_vulkan_info *out_vulkan_info);
++                             struct virgl_resource_vulkan_info *out_vulkan_info,
++                             struct virgl_gpu_charge **out_charge);
+ 
+ bool
+ vkr_renderer_import_resource(uint32_t ctx_id,
+--- a/src/virgl_context.h
++++ b/src/virgl_context.h
+@@ -50,6 +50,10 @@ struct virgl_context_blob {
+    uint32_t map_info;
+ 
+    struct virgl_resource_vulkan_info vulkan_info;
++
++   /* Pingouin: a reference on the storage's GPU memory budget charge, or NULL; the
++    * virgl_resource made from the blob takes it over */
++   struct virgl_gpu_charge *charge;
+ };
+ 
+ struct virgl_context;
+--- /dev/null
++++ b/src/virgl_gpu_budget.h
+@@ -0,0 +1,36 @@
++/*
++ * Pingouin: the guest GPU memory budget (PINGOUIN_GPU_MEMORY_MB, default three quarters of the
++ * Mac's memory), shared by vrend resources and Venus device memory. Charges and refunds
++ * are atomic: Venus allocates on its ring threads. Defined in vrend/vrend_renderer.c.
++ */
++#ifndef VIRGL_GPU_BUDGET_H
++#define VIRGL_GPU_BUDGET_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* reads the budget once; later calls do nothing */
++void virgl_gpu_budget_init(void);
++/* 0 when the bytes were charged, else the number of this refusal (1, 2, 3 ...);
++ * display: screens and cursors may use the reserve past the budget */
++uint64_t virgl_gpu_budget_charge(uint64_t bytes, bool display);
++void virgl_gpu_budget_uncharge(uint64_t bytes);
++uint64_t virgl_gpu_budget_in_use(void);
++uint64_t virgl_gpu_budget_limit(void);
++
++/*
++ * A charge that goes with a piece of storage (Venus device memory, a shm blob): every
++ * object that keeps the storage alive holds a reference (the VkDeviceMemory, memory
++ * imported from it, the Venus context's resource and the virgl_resource the guest's
++ * blob is). The bytes come back when the last one is gone. Any thread.
++ */
++struct virgl_gpu_charge;
++
++/* NULL when the budget refuses the bytes; *refusal is then the number of this refusal
++ * (0 when only the small allocation failed) */
++struct virgl_gpu_charge *virgl_gpu_charge_create(uint64_t bytes, uint64_t *refusal);
++/* NULL stays NULL */
++struct virgl_gpu_charge *virgl_gpu_charge_ref(struct virgl_gpu_charge *charge);
++void virgl_gpu_charge_unref(struct virgl_gpu_charge *charge);
++
++#endif
+--- a/src/virgl_resource.c
++++ b/src/virgl_resource.c
+@@ -35,6 +35,7 @@
+ #include "util/u_pointer.h"
+ #include "virgl_util.h"
+ #include "virgl_context.h"
++#include "virgl_gpu_budget.h"
+ 
+ #ifdef __APPLE__
+ #include <CoreFoundation/CoreFoundation.h>
+@@ -58,6 +59,7 @@ virgl_resource_destroy_func(void *val)
+    else if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
+        (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
+       close(res->fd);
++   virgl_gpu_charge_unref(res->charge);
+ 
+    free(res);
+ }
+--- a/src/virgl_resource.h
++++ b/src/virgl_resource.h
+@@ -31,6 +31,7 @@
+ struct iovec;
+ struct pipe_resource;
+ struct virgl_context;
++struct virgl_gpu_charge;
+ 
+ enum virgl_resource_fd_type {
+    VIRGL_RESOURCE_FD_DMABUF,
+@@ -115,6 +116,11 @@ struct virgl_resource {
+    struct virgl_resource_vulkan_info vulkan_info;
+ 
+    void *private_data;
++
++   /* Pingouin: a reference on the GPU memory budget charge of the storage this resource
++    * keeps alive (Venus device memory and shm blobs), or NULL; dropped when the
++    * resource is destroyed */
++   struct virgl_gpu_charge *charge;
+ };
+ 
+ struct virgl_resource_pipe_callbacks {
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -61,6 +61,7 @@
+ #include "virgl_fence.h"
+ #include "virgl_resource.h"
+ #include "virgl_util.h"
++#include "virgl_gpu_budget.h"
+ 
+ struct global_state {
+    bool client_initialized;
+@@ -1251,7 +1252,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
+    TRACE_FUNC();
+    struct virgl_resource *res;
+    struct virgl_context *ctx;
+-   struct virgl_context_blob blob;
++   struct virgl_context_blob blob = { 0 };
+    bool has_host_storage;
+    bool has_guest_storage;
+    int ret;
+@@ -1314,12 +1315,8 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
+    if (blob.type == VIRGL_RESOURCE_OPAQUE_HANDLE) {
+       assert(!(args->blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_SHAREABLE));
+       res = virgl_resource_create_from_opaque_handle(ctx, args->res_handle, blob.u.opaque_handle);
+-      if (!res)
+-         return -ENOMEM;
+    } else if (blob.type == VIRGL_RESOURCE_METAL_HEAP) {
+       res = virgl_resource_create_from_metal_heap(ctx, args->res_handle, blob.u.metal_heap, &blob.vulkan_info);
+-      if (!res)
+-         return -ENOMEM;
+    } else if (blob.type != VIRGL_RESOURCE_FD_INVALID) {
+       res = virgl_resource_create_from_fd(args->res_handle,
+                                           blob.type,
+@@ -1327,17 +1324,19 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
+                                           args->iovecs,
+                                           args->num_iovs,
+                                           &blob.vulkan_info);
+-      if (!res)
+-         return -ENOMEM;
+    } else {
+       res = virgl_resource_create_from_pipe(args->res_handle,
+                                             blob.u.pipe_resource,
+                                             args->iovecs,
+                                             args->num_iovs);
+-      if (!res)
+-         return -ENOMEM;
++   }
++   if (!res) {
++      virgl_gpu_charge_unref(blob.charge);
++      return -ENOMEM;
+    }
+ 
++   /* Pingouin: the storage's budget charge now lasts as long as this resource */
++   res->charge = blob.charge;
+    res->map_info = blob.map_info;
+    res->map_size = args->size;
+ 
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -56,6 +56,8 @@
+ #include "vrend_blitter.h"
+ 
+ #include "virgl_util.h"
++#include "virgl_gpu_budget.h"
++#include "c11/threads.h"
+ 
+ #include "virgl_hw.h"
+ #include "virgl_resource.h"
+@@ -378,8 +380,9 @@ struct global_renderer_state {
+    float tess_factors[6];
+    int eventfd;
+ 
+-   /* Pingouin: estimated bytes of all live guest resources and their limit (0: none).
+-    * Only touched where resources are made and freed, on the renderer thread. */
++   /* Pingouin: estimated bytes of all live guest resources and Venus device memory, and
++    * their limit (0: none). resource_bytes and resource_refusals change atomically
++    * (virgl_gpu_budget_charge): Venus charges from its ring threads. */
+    uint64_t resource_bytes;
+    uint64_t resource_budget;
+    uint64_t resource_refusals;
+@@ -9953,7 +9956,7 @@ vrend_resource_estimated_size(const struct vrend_renderer_resource_create_args *
+    return MAX2(total, VREND_RESOURCE_MIN_CHARGE);
+ }
+ 
+-static void vrend_resource_budget_init(void)
++static void vrend_resource_budget_read(void)
+ {
+    const char *env = getenv("PINGOUIN_GPU_MEMORY_MB");
+    long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
+@@ -9971,9 +9974,6 @@ static void vrend_resource_budget_init(void)
+       }
+    }
+    vrend_state.resource_budget = budget;
+-   vrend_state.resource_bytes = 0;
+-   vrend_state.resource_refusals = 0;
+-   vrend_state.resource_peak_logged = 0;
+    if (budget)
+       virgl_info("guest GPU memory budget: %llu MB (%s)\n",
+                  (unsigned long long)(budget >> 20), from);
+@@ -9981,43 +9981,125 @@ static void vrend_resource_budget_init(void)
+       virgl_info("guest GPU memory budget: none (%s)\n", from);
+ }
+ 
++static once_flag vrend_resource_budget_once = ONCE_FLAG_INIT;
++
++void virgl_gpu_budget_init(void)
++{
++   call_once(&vrend_resource_budget_once, vrend_resource_budget_read);
++}
++
++static void vrend_resource_budget_init(void)
++{
++   virgl_gpu_budget_init();
++}
++
++uint64_t virgl_gpu_budget_limit(void)
++{
++   return vrend_state.resource_budget;
++}
++
++uint64_t virgl_gpu_budget_in_use(void)
++{
++   return __atomic_load_n(&vrend_state.resource_bytes, __ATOMIC_RELAXED);
++}
++
++uint64_t virgl_gpu_budget_charge(uint64_t bytes, bool display)
++{
++   uint64_t budget = vrend_state.resource_budget;
++   uint64_t limit = display ? budget_add(budget, VREND_RESOURCE_DISPLAY_RESERVE) : budget;
++   uint64_t used = __atomic_load_n(&vrend_state.resource_bytes, __ATOMIC_RELAXED);
++
++   do {
++      if (budget && (bytes > limit || used > limit - bytes))
++         return __atomic_add_fetch(&vrend_state.resource_refusals, 1, __ATOMIC_RELAXED);
++   } while (!__atomic_compare_exchange_n(&vrend_state.resource_bytes, &used,
++                                         budget_add(used, bytes), true,
++                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED));
++   return 0;
++}
++
++void virgl_gpu_budget_uncharge(uint64_t bytes)
++{
++   uint64_t used = __atomic_load_n(&vrend_state.resource_bytes, __ATOMIC_RELAXED);
++
++   while (!__atomic_compare_exchange_n(&vrend_state.resource_bytes, &used,
++                                       used - MIN2(bytes, used), true,
++                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED))
++      ;
++}
++
++struct virgl_gpu_charge {
++   uint64_t bytes;
++   uint32_t refs;
++};
++
++struct virgl_gpu_charge *virgl_gpu_charge_create(uint64_t bytes, uint64_t *refusal)
++{
++   uint64_t n = virgl_gpu_budget_charge(bytes, false);
++
++   *refusal = n;
++   if (n)
++      return NULL;
++
++   struct virgl_gpu_charge *charge = malloc(sizeof(*charge));
++   if (!charge) {
++      virgl_gpu_budget_uncharge(bytes);
++      return NULL;
++   }
++   charge->bytes = bytes;
++   charge->refs = 1;
++   return charge;
++}
++
++struct virgl_gpu_charge *virgl_gpu_charge_ref(struct virgl_gpu_charge *charge)
++{
++   if (charge)
++      __atomic_add_fetch(&charge->refs, 1, __ATOMIC_RELAXED);
++   return charge;
++}
++
++void virgl_gpu_charge_unref(struct virgl_gpu_charge *charge)
++{
++   if (charge && __atomic_sub_fetch(&charge->refs, 1, __ATOMIC_ACQ_REL) == 0) {
++      virgl_gpu_budget_uncharge(charge->bytes);
++      free(charge);
++   }
++}
++
+ static bool vrend_resource_charge(struct vrend_resource *gr,
+                                   const struct vrend_renderer_resource_create_args *args)
+ {
+    uint64_t size = vrend_resource_estimated_size(args);
+-   uint64_t budget = vrend_state.resource_budget;
+-   uint64_t limit = budget;
++   uint64_t n = virgl_gpu_budget_charge(size, args->bind & VREND_RESOURCE_DISPLAY_BINDS);
+ 
+-   if (budget && (args->bind & VREND_RESOURCE_DISPLAY_BINDS))
+-      limit = budget_add(budget, VREND_RESOURCE_DISPLAY_RESERVE);
+-   if (budget && (size > limit || vrend_state.resource_bytes > limit - size)) {
++   if (n) {
+       /* logged at the 1st, 2nd, 4th, 8th ... refusal: a guest in a loop cannot flood the log */
+-      uint64_t n = ++vrend_state.resource_refusals;
+       if (!(n & (n - 1)))
+          virgl_warn("guest GPU memory budget of %llu MB reached: refused a %ux%ux%u resource "
+                     "of %llu KB with %llu MB in use (%llu refused so far)\n",
+-                    (unsigned long long)(budget >> 20), args->width, args->height,
+-                    MAX2(args->depth, args->array_size), (unsigned long long)(size >> 10),
+-                    (unsigned long long)(vrend_state.resource_bytes >> 20),
++                    (unsigned long long)(vrend_state.resource_budget >> 20), args->width,
++                    args->height, MAX2(args->depth, args->array_size),
++                    (unsigned long long)(size >> 10),
++                    (unsigned long long)(virgl_gpu_budget_in_use() >> 20),
+                     (unsigned long long)n);
+       vrend_state.resource_refused_last = true;
+       return false;
+    }
+    gr->budget_bytes = size;
+-   vrend_state.resource_bytes += size;
+-   if (vrend_state.resource_bytes >= vrend_state.resource_peak_logged + VREND_RESOURCE_PEAK_STEP) {
+-      vrend_state.resource_peak_logged = vrend_state.resource_bytes / VREND_RESOURCE_PEAK_STEP *
+-                                         VREND_RESOURCE_PEAK_STEP;
++   /* the peak is read here, on the renderer thread, and includes Venus memory */
++   uint64_t in_use = virgl_gpu_budget_in_use();
++   if (in_use >= vrend_state.resource_peak_logged + VREND_RESOURCE_PEAK_STEP) {
++      vrend_state.resource_peak_logged = in_use / VREND_RESOURCE_PEAK_STEP * VREND_RESOURCE_PEAK_STEP;
+       virgl_info("guest GPU memory in use: %llu MB, a new peak (budget %llu MB)\n",
+-                 (unsigned long long)(vrend_state.resource_bytes >> 20),
+-                 (unsigned long long)(budget >> 20));
++                 (unsigned long long)(in_use >> 20),
++                 (unsigned long long)(vrend_state.resource_budget >> 20));
+    }
+    return true;
+ }
+ 
+ static void vrend_resource_uncharge(struct vrend_resource *gr)
+ {
+-   vrend_state.resource_bytes -= MIN2(gr->budget_bytes, vrend_state.resource_bytes);
++   virgl_gpu_budget_uncharge(gr->budget_bytes);
+    gr->budget_bytes = 0;
+ }
+ 
+@@ -10041,7 +10123,7 @@ void vrend_renderer_context_refused_resource(struct vrend_context *ctx, uint32_t
+    virgl_error("context %d (%s) made resource %u past the guest GPU memory budget "
+                "(%llu MB of %llu MB in use): the context is lost\n", ctx->ctx_id,
+                ctx->debug_name, res_handle,
+-               (unsigned long long)(vrend_state.resource_bytes >> 20),
++               (unsigned long long)(virgl_gpu_budget_in_use() >> 20),
+                (unsigned long long)(vrend_state.resource_budget >> 20));
+    vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, res_handle);
+ }

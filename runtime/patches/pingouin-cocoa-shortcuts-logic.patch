@@ -1,0 +1,253 @@
+From: OmacVM
+Subject: [PATCH] ui: when macOS's shortcuts go to the VM, and Apple's own key codes
+
+What: a header with no AppKit in it: when macOS's global shortcuts are off
+(the VM has the keyboard, and nothing says otherwise), which Linux key
+Apple's own top-row key codes become (Mission Control, Spotlight, Dictation,
+Do Not Disturb, Launchpad, Dashboard: the F-key they sit on), when macOS's
+globe-key shortcut is off and which Linux key the globe key becomes, and the
+escape combo. Used by pingouin-cocoa-system-shortcuts.patch (which explains the
+why), pingouin-cocoa-escape-combo-tap.patch and pingouin-cocoa-globe-key.patch.
+
+Why its own file: so the logic is tested against macOS's whole shortcut list
+without QEMU or a display (app/runtime/Tests/keys/test-shortcuts.sh applies
+this patch to an empty folder; at build time and in CI).
+
+Upstream: not applicable (OmacVM's keyboard policy).
+Test: app/runtime/Tests/keys/test-shortcuts.c.
+
+
+diff --git a/ui/pingouin-shortcuts.h b/ui/pingouin-shortcuts.h
+new file mode 100644
+index 0000000..57dac82
+--- /dev/null
++++ b/ui/pingouin-shortcuts.h
+@@ -0,0 +1,228 @@
++/*
++ * Pingouin: macOS's own shortcuts while the VM has the keyboard.
++ *
++ * No AppKit in here, so it is tested on its own
++ * (app/runtime/Tests/keys/test-shortcuts.c). ui/cocoa.m asks it when to switch
++ * macOS's shortcuts off and which Linux key a Mac-only key code becomes.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef PINGOUIN_SHORTCUTS_H
++#define PINGOUIN_SHORTCUTS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* macOS's global shortcut switch (CGSSetGlobalHotKeyOperatingMode). */
++enum { PINGOUIN_HOTKEYS_ON = 0, PINGOUIN_HOTKEYS_OFF = 1 };
++
++/*
++ * macOS's shortcuts are off while the VM has the keyboard: full grab on, our
++ * app in front and our window key (or the mouse grabbed). `mac_keeps`: the
++ * user asked to keep them (PINGOUIN_MAC_SHORTCUTS=1). `stalled`: the window's
++ * thread has not answered for a while, so a hung VM window never keeps
++ * them off.
++ */
++static inline bool pingouin_shortcuts_to_vm(bool full_grab, bool app_active,
++                                          bool keyboard_captured,
++                                          bool mac_keeps, bool stalled)
++{
++    return full_grab && app_active && keyboard_captured && !mac_keeps &&
++           !stalled;
++}
++
++/*
++ * The globe (fn) key pressed on its own. macOS turns that press into key
++ * code 0xb3 and its own shortcut 188 (no modifiers), which does what System
++ * Settings > Keyboard > "Press globe key to" says: Emoji & Symbols, input
++ * source, dictation. While the VM has the keyboard Pingouin switches that one
++ * shortcut off (in default mode too, where macOS keeps all its others), so
++ * the press reaches the VM, as KEY_PROG3 (XF86Launch3 in XKB; Pingouin's guest
++ * part binds it to Omarchy's emoji picker). A key below KEY_REPLY (232):
++ * QEMU's virtio keyboard offers no higher ones. fn as a modifier (fn+F1, fn
++ * plus an arrow) is no lone press and stays as it is.
++ * PINGOUIN_GLOBE_KEY=mac leaves the shortcut with macOS.
++ */
++#define PINGOUIN_GLOBE_HOTKEY 188
++#define PINGOUIN_GLOBE_LINUX_KEY 202      /* KEY_PROG3 */
++
++static inline bool pingouin_globe_to_vm(bool app_active, bool keyboard_captured,
++                                      bool mac_keeps, bool stalled)
++{
++    return app_active && keyboard_captured && !mac_keeps && !stalled;
++}
++
++/*
++ * What to do with macOS's globe shortcut now. `want_vm`: the above.
++ * `mac_on`: the shortcut is on in macOS right now. `ours`: this VM switched
++ * it off. It is only ever given back by the VM that took it, so one a user
++ * switched off stays off; another VM that gave it back while this one has
++ * the keyboard gets it switched off again.
++ */
++enum { PINGOUIN_GLOBE_KEEP = 0, PINGOUIN_GLOBE_TAKE = 1, PINGOUIN_GLOBE_GIVE_BACK = 2 };
++
++static inline int pingouin_globe_action(bool want_vm, bool mac_on, bool ours)
++{
++    if (want_vm) {
++        return mac_on ? PINGOUIN_GLOBE_TAKE : PINGOUIN_GLOBE_KEEP;
++    }
++    return ours ? PINGOUIN_GLOBE_GIVE_BACK : PINGOUIN_GLOBE_KEEP;
++}
++
++/*
++ * One globe press, one KEY_PROG3. With macOS's shortcut off, an app may see
++ * the press as fn going down and up with nothing between (a flagsChanged
++ * pair), as key code 0xb3, or as both. So a lone fn tap is sent as a
++ * KEY_PROG3 tap, a 0xb3 is passed on as KEY_PROG3, and when both come for
++ * one press only one goes to the VM: a 0xb3 while fn is held, or just before
++ * it went down, makes the fn tap no lone tap; a 0xb3 just after a sent fn
++ * tap (and its key-up) is dropped. fn with another key, modifier or click
++ * (fn+F1, fn+arrow) is no tap, and neither is fn with something our window
++ * never sees: media, volume and brightness keys (the Bridge takes them),
++ * shortcuts macOS keeps (fn+C), a scroll (ui/cocoa.m sends that as
++ * PINGOUIN_GLOBE_EV_OTHER, from macOS's event counters). fn held longer than
++ * PINGOUIN_GLOBE_TAP_MAX_MS is no tap either: held, then not used. Only while
++ * the VM has the globe key (macOS's shortcut off).
++ */
++typedef struct PingouinGlobeTap {
++    bool fn_down;       /* fn is held */
++    bool spoiled;       /* something else came while fn was held */
++    bool got_b3;        /* a 0xb3 came while fn was held */
++    bool b3_dropped;    /* the last 0xb3 down was dropped: drop its up too */
++    int64_t tap_ms;     /* when a fn tap was sent; -1: none waiting */
++    int64_t down_ms;    /* when fn went down */
++    int64_t b3_ms;      /* when a 0xb3 was last passed on; -1: none */
++} PingouinGlobeTap;
++
++#define PINGOUIN_GLOBE_TAP_INIT { false, false, false, false, -1, 0, -1 }
++#define PINGOUIN_GLOBE_SAME_PRESS_MS 500
++#define PINGOUIN_GLOBE_B3_FIRST_MS 200    /* a 0xb3 this soon before fn down: same press */
++#define PINGOUIN_GLOBE_TAP_MAX_MS 700
++
++enum {
++    PINGOUIN_GLOBE_EV_FN_DOWN, PINGOUIN_GLOBE_EV_FN_UP,
++    PINGOUIN_GLOBE_EV_B3_DOWN, PINGOUIN_GLOBE_EV_B3_UP,
++    PINGOUIN_GLOBE_EV_OTHER,  /* another key down, modifier, click, scroll, media key */
++    PINGOUIN_GLOBE_EV_RESET,  /* the VM lost the globe key */
++};
++enum {
++    PINGOUIN_GLOBE_DO_NOTHING,  /* the event goes on as it would */
++    PINGOUIN_GLOBE_DO_TAP,      /* send a KEY_PROG3 down and up */
++    PINGOUIN_GLOBE_DO_PASS,     /* the 0xb3 goes on as KEY_PROG3 */
++    PINGOUIN_GLOBE_DO_DROP,     /* the 0xb3 is used up: nothing to the VM */
++};
++
++/*
++ * What our window never sees but macOS counts (CGEventSourceCounterForEventType,
++ * HID level, also for events a tap took): ui/cocoa.m compares their counts at
++ * fn down and fn up, and a change is PINGOUIN_GLOBE_EV_OTHER. CGEventType
++ * numbers: key down 10, NX_SYSDEFINED 14 (media, volume, brightness keys),
++ * mouse downs 1, 3, 25, scroll 22. Not flags changed (12, fn itself) nor key
++ * up (11).
++ */
++static const int pingouin_globe_unseen_types[] = { 10, 14, 1, 3, 25, 22 };
++
++static inline int pingouin_globe_tap_step(PingouinGlobeTap *t, int ev, int64_t now_ms)
++{
++    switch (ev) {
++    case PINGOUIN_GLOBE_EV_FN_DOWN:
++        t->fn_down = true;
++        t->spoiled = false;
++        t->down_ms = now_ms;
++        /* The 0xb3 of this press came first. */
++        t->got_b3 = t->b3_ms >= 0 && now_ms - t->b3_ms < PINGOUIN_GLOBE_B3_FIRST_MS;
++        return PINGOUIN_GLOBE_DO_NOTHING;
++    case PINGOUIN_GLOBE_EV_FN_UP:
++        if (!t->fn_down) {
++            return PINGOUIN_GLOBE_DO_NOTHING;
++        }
++        t->fn_down = false;
++        if (t->spoiled || t->got_b3 || now_ms - t->down_ms > PINGOUIN_GLOBE_TAP_MAX_MS) {
++            return PINGOUIN_GLOBE_DO_NOTHING;
++        }
++        t->tap_ms = now_ms;
++        return PINGOUIN_GLOBE_DO_TAP;
++    case PINGOUIN_GLOBE_EV_B3_DOWN:
++        if (t->fn_down) {
++            t->got_b3 = true;
++            t->b3_dropped = false;
++            return PINGOUIN_GLOBE_DO_PASS;
++        }
++        if (t->tap_ms >= 0 && now_ms - t->tap_ms < PINGOUIN_GLOBE_SAME_PRESS_MS) {
++            t->tap_ms = -1;
++            t->b3_dropped = true;
++            return PINGOUIN_GLOBE_DO_DROP;
++        }
++        t->b3_dropped = false;
++        t->b3_ms = now_ms;
++        return PINGOUIN_GLOBE_DO_PASS;
++    case PINGOUIN_GLOBE_EV_B3_UP:
++        if (t->b3_dropped) {
++            t->b3_dropped = false;
++            return PINGOUIN_GLOBE_DO_DROP;
++        }
++        return PINGOUIN_GLOBE_DO_PASS;
++    case PINGOUIN_GLOBE_EV_OTHER:
++        if (t->fn_down) {
++            t->spoiled = true;
++        }
++        return PINGOUIN_GLOBE_DO_NOTHING;
++    default:
++        *t = (PingouinGlobeTap)PINGOUIN_GLOBE_TAP_INIT;
++        return PINGOUIN_GLOBE_DO_NOTHING;
++    }
++}
++
++/*
++ * Keys of Apple keyboards that macOS knows by their own key code (the top
++ * row without fn, older keyboards' Dashboard and Launchpad keys). With the
++ * shortcuts off they reach the VM as the F-key they sit on. The globe key
++ * pressed on its own (key code 0xb3, below) is PINGOUIN_GLOBE_LINUX_KEY.
++ * 0: no key for the guest (the power key; brightness, which the Bridge
++ * handles). -1: not one of these, the normal table applies.
++ * The Linux codes are the kernel's (input-event-codes.h): F3 61, F4 62,
++ * F5 63, F6 64.
++ */
++static inline int pingouin_special_key(int mac_keycode)
++{
++    switch (mac_keycode) {
++    case 0xa0:          /* Mission Control (F3) */
++        return 61;
++    case 0x81:          /* Spotlight, older keyboards (F4) */
++    case 0x82:          /* Dashboard (F4) */
++    case 0x83:          /* Launchpad (F4) */
++    case 0xb1:          /* Spotlight (F4) */
++        return 62;
++    case 0xb0:          /* Dictation (F5) */
++        return 63;
++    case 0xb2:          /* Do Not Disturb (F6) */
++        return 64;
++    case 0xb3:          /* the globe key on its own */
++        return PINGOUIN_GLOBE_LINUX_KEY;
++    case 0x7f:          /* the power key */
++    case 0x90:          /* brightness up as a key code */
++    case 0x91:          /* brightness down as a key code */
++        return 0;
++    default:
++        return -1;
++    }
++}
++
++/*
++ * The escape combo, Control+Option+Escape (Esc is key code 53), and through
++ * 3.0.x the old Control+Option+Command+Escape (removed in a later version).
++ * Exactly these modifiers: with Shift too it is an ordinary key. Pingouin
++ * Gestures takes it (our event tap lets it through to Gestures' tap); only
++ * when Gestures is not running does our window see it, and in full screen
++ * it then hands the keyboard back to macOS (the app hides), so nobody is
++ * ever stuck in the VM.
++ */
++static inline bool pingouin_is_escape_combo(int mac_keycode, bool control,
++                                          bool option, bool command,
++                                          bool shift)
++{
++    (void)command;   /* with or without: the old combo had it */
++    return mac_keycode == 53 && control && option && !shift;
++}
++
++#endif

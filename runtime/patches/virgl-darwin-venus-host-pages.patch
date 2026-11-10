@@ -1,0 +1,35 @@
+From: OmacVM
+Subject: [PATCH] vkr: Metal-exported memory in whole host pages
+
+Host-visible Venus memory on macOS is exported as a Metal heap and mapped
+into the guest through a blob. Its size was aligned to 4 KiB, but HVF maps
+guest memory in 16 KiB host pages, so a 4 KiB allocation became a blob
+that covers only part of a host page. QEMU used to round such a mapping up
+to the page, which hands the guest the rest of a page this allocation may
+not own; it now refuses it (qemu-virtio-gpu-blob-alignment.patch). Align
+the allocation to the host page instead: then the renderer owns every
+byte the guest can map.
+
+Upstream: could go upstream with the Metal export support (startergo's
+virglrenderer tap); the 4 KiB comes from Linux hosts.
+Test: Venus in an app VM with Mesa 26.2.4: vulkaninfo, vkcube and vkmark
+run, and QEMU (-d guest_errors) logs no "not whole host pages" blob.
+
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 382eaf1..ddd962b 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -387,8 +387,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+          valid_fd_types = 1 << VIRGL_RESOURCE_FD_DMABUF;
+       } else if (physical_dev->is_metal_export_supported) {
+          assert(physical_dev->is_dma_buf_emulated);
+-         /* Align to 4KiB, which is what Linux expects */
+-         alloc_info->allocationSize = align(alloc_info->allocationSize, 0x1000);
++         /* Align to the host page (16 KiB on Apple Silicon; Linux expects
++          * at least 4 KiB): the guest maps this memory in whole host pages,
++          * so the allocation must own every byte of its last page. */
++         alloc_info->allocationSize =
++            align(alloc_info->allocationSize, getpagesize());
+          if (!export_info) {
+             local_export_info = (const VkExportMemoryAllocateInfo){
+                .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,

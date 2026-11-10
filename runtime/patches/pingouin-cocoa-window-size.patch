@@ -1,0 +1,34 @@
+From: OmacVM
+Subject: [PATCH] cocoa: the window keeps its size
+
+Outside full screen the window no longer follows the guest's mode changes;
+after each change the guest is told the window size again (EDID), so it
+follows the window. Applies after pingouin-cocoa-notch.patch.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -808,6 +808,15 @@
+ 
+ - (void) resizeWindow
+ {
++    /*
++     * Pingouin: the window keeps its size when the guest changes mode
++     * (firmware, boot, desktop); the guest follows the window instead (EDID).
++     * Fitting the window to every new guest mode shrank it step by step.
++     */
++    if (!([[self window] styleMask] & NSWindowStyleMaskFullScreen)) {
++        return;
++    }
++
+     [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
+ 
+     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
+@@ -944,6 +953,8 @@
+         screen.height = h;
+         [self resizeWindow];
+         [self updateScale];
++        /* Pingouin: tell the guest the window's size again after it changed mode. */
++        [self updateUIInfo];
+     }
+ }
+ 

@@ -1,0 +1,1511 @@
+From: OmacVM
+Subject: [PATCH] cocoa: one window per Mac display
+
+In full screen every other Mac display gets a full-screen window (its own
+Space) showing the next virtio-gpu output, at that display's size, scale and
+refresh rate; displays plugged in or out come and go live, and leaving full
+screen closes them. The guest agrees and says where its outputs are over the
+virtio port app.pingouin.display (socket at PINGOUIN_DISPLAY_SOCKET); the one
+virtio tablet then points into the right output. PINGOUIN_TEST_SKIP_DISPLAYS and
+PINGOUIN_TEST_MAIN_DISPLAY test it on virtual displays without full screen
+or focus. A drag keeps the pointer while it crosses the strip between two
+displays (the menu bar above a full-screen window); it lets go after the
+button-up if that lands outside every window. An extra output is sized and
+placed from its window once that is in full screen. The layout names the
+output on the Mac's built-in display ("builtin"), which Omanotch follows.
+
+Upstream: not applicable (OmacVM's own guest port and layout).
+Test: a real external monitor above a notch MacBook: one output per display
+at native size, the macOS arrangement, pointer within 0.1 point on both,
+typing on both, Cmd-drag of a window across 6 of 6, plug and unplug by
+mirroring. Applies after qemu-cocoa-modifiers-input-only.patch.
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -449,10 +449,26 @@
+ - (void) endPinchLocked;
+ - (void) resetPinchLocked:(bool)running;
+ - (bool) handlePinchLocked:(NSEvent *)event;
++- (bool) pingouinQueuePointer:(NSEvent *)event view:(NSView *)view output:(int)output;
++- (void) pingouinHeadEvent:(NSEvent *)event view:(NSView *)view output:(int)output
++                  button:(int)button down:(bool)down;
++- (void) pingouinUngrabAfterDrag;
+ @end
+ 
+ QemuCocoaView *cocoaView;
+ static VMChangeStateEntry *pinch_vm_change;
++
++/* Pingouin: one window per Mac display (the code is further down). */
++#define PINGOUIN_MAX_OUTPUTS 8
++typedef struct PingouinBox { double x, y, w, h; } PingouinBox;
++static bool pingouin_map_pointer(int output, double u, double v,
++                               double *nx, double *ny);
++static int pingouin_active_outputs(void);
++static bool pingouin_is_our_window(NSWindow *w);
++static bool pingouin_pointer_over_ours(void);
++static bool pingouin_is_head_console(unsigned int index);
++static bool pingouin_test_mode(void);
++static void pingouin_displays_update(void);
+ 
+ /* VM state callbacks hold the BQL; this method only touches input state. */
+ static void cocoa_pinch_vm_change(void *opaque, bool running, RunState state)
+@@ -586,7 +602,8 @@
+ - (void) selectConsoleLocked:(unsigned int)index
+ {
+     QemuConsole *con = qemu_console_lookup_by_index(index);
+-    if (!con) {
++    if (!con || pingouin_is_head_console(index)) {
++        /* Pingouin: that output has its own window on another display. */
+         return;
+     }
+ 
+@@ -1520,7 +1537,10 @@
+     }
+ 
+     with_bql(^{
+-        if (isAbsoluteEnabled) {
++        if (isAbsoluteEnabled &&
++            [self pingouinQueuePointer:event view:self output:0]) {
++            /* Pingouin: placed within the guest's outputs */
++        } else if (isAbsoluteEnabled) {
+             CGFloat d = (CGFloat)screen.height / [self frame].size.height;
+             NSPoint p = [event locationInWindow];
+ 
+@@ -1538,7 +1558,23 @@
+ 
+ - (void) mouseExited:(NSEvent *)event
+ {
+-    if (isAbsoluteEnabled && isMouseGrabbed) {
++    /*
++     * Pingouin: with several outputs the pointer may just be on the next one,
++     * or crossing the strip between them in the middle of a drag (the
++     * button-up then comes here too).
++     */
++    if (isAbsoluteEnabled && isMouseGrabbed &&
++        (pingouin_active_outputs() < 2 ||
++         (!pingouin_pointer_over_ours() && ![NSEvent pressedMouseButtons]))) {
++        [self ungrabMouse];
++    }
++}
++
++/* Pingouin: a drag that ended outside every window of ours lets go of the pointer. */
++- (void) pingouinUngrabAfterDrag
++{
++    if (isMouseGrabbed && pingouin_active_outputs() >= 2 &&
++        ![NSEvent pressedMouseButtons] && !pingouin_pointer_over_ours()) {
+         [self ungrabMouse];
+     }
+ }
+@@ -1592,16 +1628,19 @@
+     }
+ 
+     [self handleMouseEvent:event button:INPUT_BUTTON_LEFT down:false];
++    [self pingouinUngrabAfterDrag];
+ }
+ 
+ - (void) rightMouseUp:(NSEvent *)event
+ {
+     [self handleMouseEvent:event button:INPUT_BUTTON_RIGHT down:false];
++    [self pingouinUngrabAfterDrag];
+ }
+ 
+ - (void) otherMouseUp:(NSEvent *)event
+ {
+     [self handleMouseEvent:event button:INPUT_BUTTON_MIDDLE down:false];
++    [self pingouinUngrabAfterDrag];
+ }
+ 
+ - (void) grabMouse
+@@ -1667,7 +1706,7 @@
+ - (BOOL) isKeyboardCaptured
+ {
+     return isMouseGrabbed ||
+-           (full_grab_enabled && [[self window] isKeyWindow]);
++           (full_grab_enabled && pingouin_is_our_window([NSApp keyWindow]));
+ }
+ 
+ /*
+@@ -1703,6 +1742,58 @@
+         qemu_input_queue_btn(dcl.con, INPUT_BUTTON_LEFT, false);
+         qemu_input_queue_btn(dcl.con, INPUT_BUTTON_RIGHT, false);
+         qemu_input_queue_btn(dcl.con, INPUT_BUTTON_MIDDLE, false);
++    });
++}
++
++/*
++ * Pingouin: the pointer in a window that shows one of several outputs, as the
++ * one tablet's position within the box around all the guest's outputs.
++ * With the BQL.
++ */
++- (bool) pingouinQueuePointer:(NSEvent *)event view:(NSView *)view output:(int)output
++{
++    NSPoint p = [view convertPoint:[event locationInWindow] fromView:nil];
++    NSSize size = [view bounds].size;
++    double nx, ny;
++
++    if (size.width <= 0 || size.height <= 0 ||
++        !pingouin_map_pointer(output, p.x / size.width, 1.0 - p.y / size.height,
++                            &nx, &ny)) {
++        return false;
++    }
++    qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, lround(nx * INPUT_EVENT_ABS_MAX),
++                         0, INPUT_EVENT_ABS_MAX);
++    qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, lround(ny * INPUT_EVENT_ABS_MAX),
++                         0, INPUT_EVENT_ABS_MAX);
++    return true;
++}
++
++/* Pingouin: mouse events from the window of another output (button < 0: a move). */
++- (void) pingouinHeadEvent:(NSEvent *)event view:(NSView *)view output:(int)output
++                  button:(int)button down:(bool)down
++{
++    if (!isMouseGrabbed) {
++        /*
++         * The pointer just passing over this display while another app is
++         * in front must not take the pointer and keyboard from that app.
++         * Only a click does (it also brings Pingouin.app to the front).
++         */
++        if (button < 0 && (!isAbsoluteEnabled || ![NSApp isActive])) {
++            return;
++        }
++        [self grabMouse];
++    }
++    with_bql(^{
++        if (button >= 0) {
++            qemu_input_queue_btn(dcl.con, button, down);
++        }
++        if (isAbsoluteEnabled) {
++            [self pingouinQueuePointer:event view:view output:output];
++        } else {
++            qemu_input_queue_rel(dcl.con, INPUT_AXIS_X, [event deltaX]);
++            qemu_input_queue_rel(dcl.con, INPUT_AXIS_Y, [event deltaY]);
++        }
++        qemu_input_event_sync();
+     });
+ }
+ @end
+@@ -1764,23 +1855,33 @@
+         notchSavedFrame = [w frame];
+         notchSavedMask = [w styleMask];
+         [w setStyleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskResizable];
+-        [NSApp setPresentationOptions:NSApplicationPresentationHideDock |
+-                                      NSApplicationPresentationHideMenuBar];
+-        [w setFrame:[target frame] display:YES];
+-        [w makeKeyAndOrderFront:nil];
++        if (pingouin_test_mode()) {
++            /* Pingouin test: no menu bar or Dock change, no focus. */
++            [w setFrame:[target frame] display:YES];
++            [w orderFront:nil];
++        } else {
++            [NSApp setPresentationOptions:NSApplicationPresentationHideDock |
++                                          NSApplicationPresentationHideMenuBar];
++            [w setFrame:[target frame] display:YES];
++            [w makeKeyAndOrderFront:nil];
++        }
+         [fullScreenMenuItem setTitle:@"Exit Full Screen"];
+         [cocoaView updateScale];
+         [cocoaView updateUIInfo];
+         [cocoaView grabMouse];
++        pingouin_displays_update();
+     } else {
+         notchFull = NO;
+-        [NSApp setPresentationOptions:NSApplicationPresentationDefault];
++        if (!pingouin_test_mode()) {
++            [NSApp setPresentationOptions:NSApplicationPresentationDefault];
++        }
+         [w setStyleMask:notchSavedMask];
+         [w setFrame:notchSavedFrame display:YES];
+         [fullScreenMenuItem setTitle:@"Enter Full Screen"];
+         [cocoaView updateScale];
+         [cocoaView updateUIInfo];
+         [cocoaView ungrabMouse];
++        pingouin_displays_update();
+     }
+ }
+ 
+@@ -1841,7 +1942,11 @@
+             ? [NSString stringWithUTF8String:qemu_name]
+             : @"QEMU"];
+         [window setContentView:cocoaView];
+-        [window makeKeyAndOrderFront:self];
++        if (pingouin_test_mode()) {
++            [window orderFront:self];   /* Pingouin test: never take the focus */
++        } else {
++            [window makeKeyAndOrderFront:self];
++        }
+         [window center];
+         [window setDelegate: self];
+ 
+@@ -1935,6 +2040,7 @@
+ {
+     [cocoaView updateScale];
+     [cocoaView updateUIInfo];
++    pingouin_displays_update();
+ }
+ 
+ - (void)windowDidChangeBackingProperties:(NSNotification *)notification
+@@ -1965,6 +2071,7 @@
+     [cocoaView updateScale];
+     [cocoaView updateUIInfo];
+     [cocoaView grabMouse];
++    pingouin_displays_update();
+ }
+ 
+ - (void)windowDidExitFullScreen:(NSNotification *)notification
+@@ -1975,6 +2082,7 @@
+     [cocoaView updateScale];
+     [cocoaView updateUIInfo];
+     [cocoaView ungrabMouse];
++    pingouin_displays_update();
+ }
+ 
+ - (void)windowDidResize:(NSNotification *)notification
+@@ -2029,7 +2137,8 @@
+ {
+     NSWindow *w = [cocoaView window];
+     /* Notch full screen only on a display with a notch; elsewhere macOS's own. */
+-    if (notchFull ||
++    /* Pingouin test mode: always the borderless kind (no Space). */
++    if (notchFull || pingouin_test_mode() ||
+         (pingouin_notch_mode() && !([w styleMask] & NSWindowStyleMaskFullScreen) &&
+          [[w screen] safeAreaInsets].top > 0)) {
+         pingouin_toggle_notch_full_screen();
+@@ -2420,12 +2529,15 @@
+ 
+     [menu addItem:[NSMenuItem separatorItem]];
+ 
+-    while (qemu_console_lookup_by_index(index) != NULL) {
++    for (; qemu_console_lookup_by_index(index) != NULL; index++) {
++        /* Pingouin: the outputs for other displays are not for this window. */
++        if (pingouin_is_head_console(index)) {
++            continue;
++        }
+         menuItem = [[[NSMenuItem alloc] initWithTitle: getConsoleName(qemu_console_lookup_by_index(index))
+                                                action: @selector(displayConsole:) keyEquivalent: @""] autorelease];
+         [menuItem setTag: index];
+         [menu addItem: menuItem];
+-        index++;
+     }
+ }
+ 
+@@ -2972,14 +3084,1185 @@
+     .dpy_gl_update          = cocoa_gl_scanout_flush,
+ };
+ 
++static bool pingouin_is_head_dcl(DisplayChangeListener *dcl);
++
+ static bool cocoa_gl_is_compatible_dcl(DisplayGLCtx *dgc,
+                                        DisplayChangeListener *dcl)
+ {
+-    return dcl->ops == &dcl_gl_ops;
++    return dcl->ops == &dcl_gl_ops || pingouin_is_head_dcl(dcl);
++}
++
++#endif
++
++/*
++ ------------------------------------------------------
++    Pingouin: one window per Mac display
++ ------------------------------------------------------
++ * With the window in full screen, every other Mac display gets a full-screen
++ * window of its own (its own Space) showing the next virtio-gpu output:
++ * Virtual-2, Virtual-3, ... in the guest, each at that display's size and
++ * scale. Displays plugged in or out while in full screen come and go live.
++ * Leaving full screen closes them: one window, one output.
++ *
++ * The guest says it can handle this (and whether it wants it: "Use external
++ * displays") over the virtio port app.pingouin.display, whose socket QEMU's
++ * chardev serves at PINGOUIN_DISPLAY_SOCKET. QEMU sends it the arrangement in
++ * points ({"layout": [...]}); the guest answers with where Hyprland put its
++ * outputs ({"monitors": [...]}), so the one virtio tablet can point at the
++ * right output: Hyprland maps an absolute pointer onto the box around all
++ * its outputs.
++ *
++ * Testing on virtual displays (PINGOUIN_TEST_SKIP_DISPLAYS=ID,ID,...: the real
++ * ones, left alone): full screen is a borderless window over the display (no
++ * Space, no menu bar change) and the app never takes the focus;
++ * PINGOUIN_TEST_MAIN_DISPLAY=ID puts the main window on that display.
++ */
++
++typedef struct PingouinHead {
++    DisplayChangeListener dcl;      /* first: the listener callbacks cast back */
++    int output;                     /* console index = virtio-gpu scanout */
++    DisplaySurface *surface;
++    DisplayGLTextureBorrower borrow;
++    uint32_t scanout_id;
++    bool dirty;
++    CGDirectDisplayID display;      /* the Mac display it is on; 0 = off */
++    NSWindow *window;
++    NSView *view;
++    bool want_full;                 /* waiting for macOS full screen */
++    bool full;                      /* in macOS full screen */
++    int full_tries;
++} PingouinHead;
++
++static PingouinHead pingouin_heads[PINGOUIN_MAX_OUTPUTS];   /* [0] = the main window */
++static int pingouin_outputs = 1;                         /* graphic consoles */
++static bool pingouin_external_enabled = true;
++
++/* Consoles 1..N-1 belong to the windows of the other displays. */
++static bool pingouin_is_head_console(unsigned int index)
++{
++    return index >= 1 && index < (unsigned int)pingouin_outputs;
++}
++static bool pingouin_guest_ready;                        /* the guest said hello */
++static bool pingouin_full_busy;
++static int pingouin_full_busy_output;              /* the window macOS is moving */
++static PingouinBox pingouin_mac_box[PINGOUIN_MAX_OUTPUTS];  /* points, top-left origin */
++static PingouinBox pingouin_mac_bounds;
++static int pingouin_mac_count = 1;
++static PingouinBox pingouin_guest_box[PINGOUIN_MAX_OUTPUTS];
++static PingouinBox pingouin_guest_bounds;
++static bool pingouin_guest_known;
++static NSString *pingouin_last_layout;
++
++static void pingouin_send_layout(void);
++static void pingouin_full_next(void);
++
++static bool pingouin_map_pointer(int output, double u, double v,
++                               double *nx, double *ny)
++{
++    const PingouinBox *b, *all;
++
++    if (output < 0 || output >= PINGOUIN_MAX_OUTPUTS) {
++        return false;
++    }
++    if (pingouin_guest_known && pingouin_guest_box[output].w > 0) {
++        b = &pingouin_guest_box[output];
++        all = &pingouin_guest_bounds;
++    } else if (pingouin_mac_count > 1 && pingouin_mac_box[output].w > 0) {
++        b = &pingouin_mac_box[output];
++        all = &pingouin_mac_bounds;
++    } else {
++        return false;
++    }
++    if (all->w <= 0 || all->h <= 0) {
++        return false;
++    }
++    *nx = MIN(1.0, MAX(0.0, (b->x + u * b->w - all->x) / all->w));
++    *ny = MIN(1.0, MAX(0.0, (b->y + v * b->h - all->y) / all->h));
++    return true;
++}
++
++static int pingouin_active_outputs(void)
++{
++    return pingouin_mac_count;
++}
++
++static CGDirectDisplayID pingouin_screen_id(NSScreen *s)
++{
++    return [[[s deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
++}
++
++static NSScreen *pingouin_screen_with_id(CGDirectDisplayID id)
++{
++    for (NSScreen *s in [NSScreen screens]) {
++        if (pingouin_screen_id(s) == id) {
++            return s;
++        }
++    }
++    return nil;
++}
++
++static bool pingouin_test_mode(void)
++{
++    const char *v = getenv("PINGOUIN_TEST_SKIP_DISPLAYS");
++    return v && *v;
++}
++
++/* In test mode the listed displays (the real ones) are left alone. */
++static bool pingouin_test_allows(CGDirectDisplayID id)
++{
++    const char *v = getenv("PINGOUIN_TEST_SKIP_DISPLAYS");
++    if (!v || !*v) {
++        return true;
++    }
++    for (NSString *s in [[NSString stringWithUTF8String:v]
++                         componentsSeparatedByString:@","]) {
++        if ((CGDirectDisplayID)[s longLongValue] == id) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool pingouin_is_our_window(NSWindow *w)
++{
++    if (!w) {
++        return false;
++    }
++    if (w == [cocoaView window]) {
++        return true;
++    }
++    for (int i = 1; i < pingouin_outputs; i++) {
++        if (pingouin_heads[i].window == w) {
++            return true;
++        }
++    }
++    return false;
++}
++
++/*
++ * A window of ours that is on screen now and under point p. A full-screen
++ * window in a Space that is not shown is occluded, though its frame still
++ * covers its display.
++ */
++static bool pingouin_window_under(NSWindow *w, NSPoint p)
++{
++    return w && [w isVisible] &&
++           ([w occlusionState] & NSWindowOcclusionStateVisible) &&
++           NSPointInRect(p, [w frame]);
++}
++
++static bool pingouin_pointer_over_ours(void)
++{
++    NSPoint p = [NSEvent mouseLocation];
++
++    if (![NSApp isActive]) {
++        return false;
++    }
++    if (pingouin_window_under([cocoaView window], p)) {
++        return true;
++    }
++    for (int i = 1; i < pingouin_outputs; i++) {
++        if (pingouin_window_under(pingouin_heads[i].window, p)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool pingouin_main_full_screen(void)
++{
++    return notchFull ||
++           ([[cocoaView window] styleMask] & NSWindowStyleMaskFullScreen);
++}
++
++/* A display's rectangle in points, top-left origin (CoreGraphics' global space). */
++static PingouinBox pingouin_display_box(NSScreen *s, bool below_notch)
++{
++    CGRect r = CGDisplayBounds(pingouin_screen_id(s));
++    PingouinBox b = { r.origin.x, r.origin.y, r.size.width, r.size.height };
++
++    if (below_notch) {
++        NSEdgeInsets in = [s safeAreaInsets];
++        b.x += in.left;
++        b.y += in.top;
++        b.w -= in.left + in.right;
++        b.h -= in.top + in.bottom;
++    }
++    return b;
+ }
+ 
++/* Where a view is on the Mac, in points, top-left origin like pingouin_display_box. */
++static PingouinBox pingouin_view_box(NSView *v)
++{
++    NSRect r = [[v window] convertRectToScreen:[v convertRect:[v bounds] toView:nil]];
++    NSArray *screens = [NSScreen screens];
++    CGFloat top = [screens count] ? NSMaxY([screens[0] frame]) : 0;
++
++    return (PingouinBox){ r.origin.x, top - NSMaxY(r), r.size.width, r.size.height };
++}
++
++/* An extra output's place: its window once in full screen, else a guess from its display. */
++static PingouinBox pingouin_head_box(PingouinHead *hd, NSScreen *s)
++{
++    if (hd->full && hd->view && pingouin_screen_id(s) == hd->display) {
++        return pingouin_view_box(hd->view);
++    }
++    return pingouin_display_box(s, true);
++}
++
++static void pingouin_update_mac_layout(void)
++{
++    NSWindow *mw = [cocoaView window];
++    double minx = 0, miny = 0, maxx = 0, maxy = 0;
++    bool first = true;
++
++    memset(pingouin_mac_box, 0, sizeof(pingouin_mac_box));
++    if (pingouin_main_full_screen() && [mw screen]) {
++        pingouin_mac_box[0] = pingouin_main_full_settled && !notchFull ?
++            pingouin_view_box(cocoaView) : pingouin_display_box([mw screen], !notchFull);
++    } else {
++        NSSize size = [cocoaView frame].size;
++        pingouin_mac_box[0] = (PingouinBox){ 0, 0, size.width, size.height };
++    }
++    for (int i = 1; i < pingouin_outputs; i++) {
++        NSScreen *s = pingouin_heads[i].display ?
++            pingouin_screen_with_id(pingouin_heads[i].display) : nil;
++        if (s) {
++            pingouin_mac_box[i] = pingouin_head_box(&pingouin_heads[i], s);
++        }
++    }
++    pingouin_mac_count = 0;
++    for (int i = 0; i < pingouin_outputs; i++) {
++        PingouinBox b = pingouin_mac_box[i];
++        if (b.w <= 0) {
++            continue;
++        }
++        pingouin_mac_count++;
++        if (first) {
++            minx = b.x; miny = b.y; maxx = b.x + b.w; maxy = b.y + b.h;
++            first = false;
++        } else {
++            minx = MIN(minx, b.x); miny = MIN(miny, b.y);
++            maxx = MAX(maxx, b.x + b.w); maxy = MAX(maxy, b.y + b.h);
++        }
++    }
++    for (int i = 0; i < pingouin_outputs; i++) {
++        if (pingouin_mac_box[i].w > 0) {
++            pingouin_mac_box[i].x -= minx;
++            pingouin_mac_box[i].y -= miny;
++        }
++    }
++    pingouin_mac_bounds = (PingouinBox){ 0, 0, maxx - minx, maxy - miny };
++}
++
++#ifdef CONFIG_OPENGL
++
++/* The listener of one extra output: draws into its own window. */
++
++static void pingouin_head_gfx_update(DisplayChangeListener *dcl,
++                                   int x, int y, int w, int h)
++{
++    PingouinHead *hd = (PingouinHead *)dcl;
++
++    with_gl_view_ctx(^{
++        surface_gl_update_texture(dgc.gls, hd->surface, x, y, w, h);
++    });
++    hd->dirty = true;
++}
++
++static void pingouin_head_gfx_switch(DisplayChangeListener *dcl,
++                                   DisplaySurface *new_surface)
++{
++    PingouinHead *hd = (PingouinHead *)dcl;
++
++    with_gl_view_ctx(^{
++        surface_gl_destroy_texture(dgc.gls, hd->surface);
++        if (new_surface) {
++            surface_gl_create_texture(dgc.gls, new_surface);
++        }
++    });
++    hd->surface = new_surface;
++    hd->dirty = true;
++}
++
++static void pingouin_head_refresh(DisplayChangeListener *dcl)
++{
++    PingouinHead *hd = (PingouinHead *)dcl;
++
++    qemu_console_hw_update(dcl->con);
++    if (hd->dirty && hd->display) {
++        int output = hd->output;
++        dispatch_async(dispatch_get_main_queue(), ^{
++            [[pingouin_heads[output].view layer] setNeedsDisplay];
++        });
++    }
++}
++
++static void pingouin_head_scanout_disable(DisplayChangeListener *dcl)
++{
++    PingouinHead *hd = (PingouinHead *)dcl;
++
++    hd->borrow = NULL;
++    hd->dirty = true;
++}
++
++static void pingouin_head_scanout_texture(DisplayChangeListener *dcl,
++                                        uint32_t backing_id,
++                                        DisplayGLTextureBorrower backing_borrow,
++                                        uint32_t x, uint32_t y,
++                                        uint32_t w, uint32_t h)
++{
++    PingouinHead *hd = (PingouinHead *)dcl;
++
++    hd->scanout_id = backing_id;
++    hd->borrow = backing_borrow;
++    hd->dirty = true;
++}
++
++static void pingouin_head_scanout_flush(DisplayChangeListener *dcl,
++                                      uint32_t x, uint32_t y,
++                                      uint32_t w, uint32_t h)
++{
++    ((PingouinHead *)dcl)->dirty = true;
++}
++
++static const DisplayChangeListenerOps pingouin_head_gl_ops = {
++    .dpy_name               = "cocoa-gl-head",
++    .dpy_gfx_update         = pingouin_head_gfx_update,
++    .dpy_gfx_switch         = pingouin_head_gfx_switch,
++    .dpy_gfx_check_format   = console_gl_check_format,
++    .dpy_refresh            = pingouin_head_refresh,
++    .dpy_gl_scanout_disable = pingouin_head_scanout_disable,
++    .dpy_gl_scanout_texture = pingouin_head_scanout_texture,
++    .dpy_gl_update          = pingouin_head_scanout_flush,
++};
++
++static bool pingouin_is_head_dcl(DisplayChangeListener *dcl)
++{
++    return dcl->ops == &pingouin_head_gl_ops;
++}
++
++/* With the BQL, in the layer's GL context. */
++static void pingouin_head_render(PingouinHead *hd, NSSize size)
++{
++    GLint filter = qatomic_read(&zoom_interpolation) ? GL_LINEAR : GL_NEAREST;
++
++    glViewport(0, 0, size.width, size.height);
++    if (hd->borrow) {
++        DisplayGLTexture texture = hd->borrow(hd->scanout_id);
++
++        glBindTexture(GL_TEXTURE_2D, texture.id);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
++        qemu_gl_run_texture_blit(dgc.gls, texture.y_0_top);
++    } else if (hd->surface && hd->surface->texture) {
++        glBindTexture(GL_TEXTURE_2D, hd->surface->texture);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
++        surface_gl_render_texture(dgc.gls, hd->surface);
++    } else {
++        glClearColor(0, 0, 0, 1);
++        glClear(GL_COLOR_BUFFER_BIT);
++    }
++    hd->dirty = false;
++}
++
++@interface PingouinHeadLayer : CAOpenGLLayer
++{
++@public
++    int output;
++}
++@end
++
++@implementation PingouinHeadLayer
++- (id)init
++{
++    self = [super init];
++    if (self) {
++        [self setAsynchronous:NO];
++    }
++    return self;
++}
++
++- (CGLContextObj)copyCGLContextForPixelFormat:(CGLPixelFormatObj)pf
++{
++    CGLContextObj ctx;
++    CGLCreateContext(pf, gl_view_ctx, &ctx);
++    return ctx;
++}
++
++- (CGLPixelFormatObj)copyCGLPixelFormatForDisplayMask:(uint32_t)mask
++{
++    CGLPixelFormatObj pix;
++    GLint npix;
++    CGLPixelFormatAttribute attribs[] = {
++        kCGLPFADisplayMask,
++        mask,
++        kCGLPFAOpenGLProfile,
++        (CGLPixelFormatAttribute)kCGLOGLPVersion_3_2_Core,
++        0
++    };
++
++    CGLChoosePixelFormat(attribs, &pix, &npix);
++    return pix;
++}
++
++- (void)drawInCGLContext:(CGLContextObj)ctx
++             pixelFormat:(CGLPixelFormatObj)pf
++            forLayerTime:(CFTimeInterval)t
++             displayTime:(const CVTimeStamp *)ts
++{
++    CGSize size = [self bounds].size;
++    CGFloat scale = [self contentsScale];
++
++    CGLSetCurrentContext(ctx);
++    {
++        BQL_LOCK_GUARD();
++        pingouin_head_render(&pingouin_heads[output],
++                           NSMakeSize(size.width * scale, size.height * scale));
++    }
++    [super drawInCGLContext:ctx pixelFormat:pf forLayerTime:t displayTime:ts];
++}
++@end
++
++#endif /* CONFIG_OPENGL */
++
++/* The view of an extra output: the pointer goes to the guest through the main view. */
++@interface PingouinHeadView : NSView
++{
++@public
++    int output;
++}
++@end
++
++@implementation PingouinHeadView
++- (id)initWithFrame:(NSRect)frame output:(int)index
++{
++    self = [super initWithFrame:frame];
++    if (self) {
++        output = index;
++        NSTrackingArea *area = [[NSTrackingArea alloc]
++            initWithRect:CGRectZero
++                 options:NSTrackingActiveAlways | NSTrackingMouseEnteredAndExited |
++                         NSTrackingMouseMoved | NSTrackingInVisibleRect
++                   owner:self
++                userInfo:nil];
++        [self addTrackingArea:area];
++        [area release];
++        [self setWantsLayer:YES];
++#ifdef CONFIG_OPENGL
++        PingouinHeadLayer *layer = [[PingouinHeadLayer alloc] init];
++        layer->output = index;
++        [self setLayer:layer];
++        [layer release];
+ #endif
++    }
++    return self;
++}
+ 
++- (BOOL)isOpaque { return YES; }
++- (BOOL)wantsUpdateLayer { return YES; }
++- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
++
++- (void)viewDidChangeBackingProperties
++{
++    [[self layer] setContentsScale:[[self window] backingScaleFactor]];
++}
++
++- (void)send:(NSEvent *)e button:(int)button down:(bool)down
++{
++    [cocoaView pingouinHeadEvent:e view:self output:output button:button down:down];
++}
++
++- (void)mouseEntered:(NSEvent *)e { [self send:e button:-1 down:false]; }
++- (void)mouseExited:(NSEvent *)e
++{
++    if ([cocoaView isMouseGrabbed] && !pingouin_pointer_over_ours() &&
++        ![NSEvent pressedMouseButtons]) {
++        [cocoaView ungrabMouse];
++    }
++}
++- (void)mouseMoved:(NSEvent *)e { [self send:e button:-1 down:false]; }
++- (void)mouseDragged:(NSEvent *)e { [self send:e button:-1 down:false]; }
++- (void)rightMouseDragged:(NSEvent *)e { [self send:e button:-1 down:false]; }
++- (void)otherMouseDragged:(NSEvent *)e { [self send:e button:-1 down:false]; }
++- (void)mouseDown:(NSEvent *)e { [self send:e button:INPUT_BUTTON_LEFT down:true]; }
++- (void)mouseUp:(NSEvent *)e
++{
++    [self send:e button:INPUT_BUTTON_LEFT down:false];
++    [cocoaView pingouinUngrabAfterDrag];
++}
++- (void)rightMouseDown:(NSEvent *)e { [self send:e button:INPUT_BUTTON_RIGHT down:true]; }
++- (void)rightMouseUp:(NSEvent *)e
++{
++    [self send:e button:INPUT_BUTTON_RIGHT down:false];
++    [cocoaView pingouinUngrabAfterDrag];
++}
++- (void)otherMouseDown:(NSEvent *)e { [self send:e button:INPUT_BUTTON_MIDDLE down:true]; }
++- (void)otherMouseUp:(NSEvent *)e
++{
++    [self send:e button:INPUT_BUTTON_MIDDLE down:false];
++    [cocoaView pingouinUngrabAfterDrag];
++}
++@end
++
++@interface PingouinHeadWindow : NSWindow
++@end
++
++@implementation PingouinHeadWindow
++- (BOOL)canBecomeKeyWindow { return YES; }
++- (BOOL)canBecomeMainWindow { return NO; }
++@end
++
++static PingouinHead *pingouin_head_for_window(NSWindow *w)
++{
++    for (int i = 1; i < pingouin_outputs; i++) {
++        if (pingouin_heads[i].window == w) {
++            return &pingouin_heads[i];
++        }
++    }
++    return NULL;
++}
++
++static void pingouin_heads_ui_info(void);
++
++/* The extra outputs changed size or place: tell the guest both. */
++static void pingouin_heads_moved(void)
++{
++    pingouin_heads_ui_info();
++    pingouin_update_mac_layout();
++    pingouin_send_layout();
++}
++
++@interface PingouinHeadDelegate : NSObject <NSWindowDelegate>
++@end
++
++@implementation PingouinHeadDelegate
++- (void)windowDidEnterFullScreen:(NSNotification *)note
++{
++    PingouinHead *hd = pingouin_head_for_window([note object]);
++    if (hd) {
++        hd->full = true;
++        hd->want_full = false;
++        [[hd->view layer] setContentsScale:[[note object] backingScaleFactor]];
++        pingouin_heads_moved();
++    }
++    pingouin_full_busy = false;
++    pingouin_full_next();
++}
++
++/* A display changed its resolution, or the window found its full-screen size. */
++- (void)windowDidResize:(NSNotification *)note
++{
++    PingouinHead *hd = pingouin_head_for_window([note object]);
++    if (hd && hd->full) {
++        pingouin_heads_moved();
++    }
++}
++
++- (void)windowDidFailToEnterFullScreen:(NSWindow *)window
++{
++    pingouin_full_busy = false;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2),
++                   dispatch_get_main_queue(), ^{ pingouin_full_next(); });
++}
++
++- (void)windowDidExitFullScreen:(NSNotification *)note
++{
++    PingouinHead *hd = pingouin_head_for_window([note object]);
++    if (hd) {
++        hd->full = false;
++        pingouin_heads_moved();
++    }
++}
++
++- (void)windowDidChangeBackingProperties:(NSNotification *)note
++{
++    PingouinHead *hd = pingouin_head_for_window([note object]);
++    if (hd) {
++        [[hd->view layer] setContentsScale:[[note object] backingScaleFactor]];
++        pingouin_heads_ui_info();
++    }
++}
++
++- (BOOL)windowShouldClose:(id)sender
++{
++    return NO;
++}
++
++/*
++ * A click on another display's window makes it key. The keyboard and the
++ * main window's pointer tracking belong to the main window: hand it back.
++ * The click itself still reaches this window's view.
++ */
++- (void)windowDidBecomeKey:(NSNotification *)note
++{
++    dispatch_async(dispatch_get_main_queue(), ^{
++        NSWindow *main = [cocoaView window];
++        if ([main isVisible] && [NSApp isActive] && ![main isKeyWindow]) {
++            [main makeKeyWindow];
++        }
++    });
++}
++@end
++
++static PingouinHeadDelegate *pingouin_head_delegate;
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++
++/*
++ * Tells the guest each output's size, scale and refresh rate, or that it is
++ * off: all in one go. The guest reads all outputs on one display event, and
++ * clears that event when done; a second event during its read would be lost.
++ */
++static void pingouin_heads_ui_info(void)
++{
++    QemuUIInfo infos[PINGOUIN_MAX_OUTPUTS];
++    uint32_t refresh[PINGOUIN_MAX_OUTPUTS];
++    QemuUIInfo *pinfos = infos;       /* blocks cannot capture arrays */
++    uint32_t *prefresh = refresh;     /* (with_bql runs the block right away) */
++
++    memset(infos, 0, sizeof(infos));
++    memset(refresh, 0, sizeof(refresh));
++    for (int i = 1; i < pingouin_outputs; i++) {
++        PingouinHead *hd = &pingouin_heads[i];
++        NSScreen *s = hd->display ? pingouin_screen_with_id(hd->display) : nil;
++        QemuUIInfo *info = &infos[i];
++
++        if (!s) {
++            continue;
++        }
++        PingouinBox b = pingouin_head_box(hd, s);
++        CGFloat k = [s backingScaleFactor];
++        CVDisplayLinkRef link;
++        uint32_t div = k > 1.75 ? 2 : k > 1.25 ? 3 : 1;
++
++        if (!CVDisplayLinkCreateWithCGDisplay(hd->display, &link)) {
++            CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link);
++            CVDisplayLinkRelease(link);
++            if (!(period.flags & kCVTimeIsIndefinite) &&
++                period.timeValue > 0 && period.timeScale > 0) {
++                refresh[i] = (int64_t)1000 * period.timeScale / period.timeValue;
++            }
++        }
++        if (!refresh[i] && [s maximumFramesPerSecond] > 0) {
++            refresh[i] = (uint32_t)[s maximumFramesPerSecond] * 1000;
++        }
++        info->refresh_rate = refresh[i];
++        /* Same density rule as the main window: 110 points per inch. */
++        info->width_mm = 10 * MIN(255, MAX(1, (int)lround(b.w * 2.54 / 110.0)));
++        info->height_mm = 10 * MIN(255, MAX(1, (int)lround(b.h * 2.54 / 110.0)));
++        info->width = MAX(div, (uint32_t)(b.w * k) / div * div);
++        info->height = MAX(div, (uint32_t)(b.h * k) / div * div);
++    }
++    with_bql(^{
++        for (int i = 1; i < pingouin_outputs; i++) {
++            if (prefresh[i]) {
++                qemu_console_listener_set_refresh(&pingouin_heads[i].dcl,
++                                                  MAX(1u, 1000000u / prefresh[i]));
++            }
++            qemu_console_set_ui_info(pingouin_heads[i].dcl.con, &pinfos[i], false);
++        }
++    });
++}
++
++#pragma clang diagnostic pop
++
++static void pingouin_head_on(PingouinHead *hd, NSScreen *s)
++{
++    NSRect frame = [s frame];
++    NSString *title = [NSString stringWithFormat:@"%@ (display %d)",
++                       pingouin_product_name(), hd->output + 1];
++
++    hd->display = pingouin_screen_id(s);
++    if (!hd->window) {
++        NSRect content = NSMakeRect(0, 0, 640, 400);
++        hd->view = [[PingouinHeadView alloc] initWithFrame:content output:hd->output];
++        hd->window = [[PingouinHeadWindow alloc]
++            initWithContentRect:content
++                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskResizable
++                        backing:NSBackingStoreBuffered
++                          defer:NO];
++        [hd->window setReleasedWhenClosed:NO];
++        [hd->window setAcceptsMouseMovedEvents:YES];
++        [hd->window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
++        [hd->window setContentView:hd->view];
++        [hd->window setBackgroundColor:[NSColor blackColor]];
++        [hd->window setDelegate:pingouin_head_delegate];
++    }
++    [hd->window setTitle:title];
++    if (pingouin_test_mode()) {
++        /* Borderless over the display, below the notch: no Space, no focus. */
++        NSEdgeInsets in = [s safeAreaInsets];
++        NSRect r = NSMakeRect(frame.origin.x + in.left, frame.origin.y + in.bottom,
++                              frame.size.width - in.left - in.right,
++                              frame.size.height - in.top - in.bottom);
++        [hd->window setStyleMask:NSWindowStyleMaskBorderless];
++        [hd->window setFrame:r display:YES];
++        [hd->window orderFront:nil];
++        hd->want_full = false;
++    } else {
++        [hd->window setFrame:NSInsetRect([s visibleFrame], 60, 60) display:NO];
++        [hd->window orderFront:nil];
++        hd->want_full = true;
++        hd->full_tries = 0;
++    }
++    [[hd->view layer] setContentsScale:[s backingScaleFactor]];
++    hd->dirty = true;
++}
++
++static void pingouin_head_off(PingouinHead *hd)
++{
++    if (pingouin_full_busy && pingouin_full_busy_output == hd->output) {
++        pingouin_full_busy = false;   /* its window goes: do not wait for it */
++    }
++    hd->display = 0;
++    hd->want_full = false;
++    hd->full = false;
++    if (hd->window) {
++        [hd->window orderOut:nil];
++        [hd->window setDelegate:nil];
++        [hd->window close];
++        [hd->window release];
++        hd->window = nil;
++        [hd->view release];
++        hd->view = nil;
++    }
++}
++
++/* macOS full screen, one window at a time: it ignores a second while one is moving. */
++static void pingouin_full_next(void)
++{
++    if (pingouin_full_busy) {
++        return;
++    }
++    for (int i = 1; i < pingouin_outputs; i++) {
++        PingouinHead *hd = &pingouin_heads[i];
++        if (!hd->window || !hd->want_full || hd->full) {
++            continue;
++        }
++        if ([hd->window styleMask] & NSWindowStyleMaskFullScreen) {
++            hd->full = true;
++            hd->want_full = false;
++            continue;
++        }
++        if (++hd->full_tries > 5) {
++            hd->want_full = false;
++            continue;
++        }
++        pingouin_full_busy = true;
++        pingouin_full_busy_output = i;
++        [hd->window toggleFullScreen:nil];
++        int output = i;
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
++                       dispatch_get_main_queue(), ^{
++            /* No word from macOS: try again (or the next one). */
++            if (pingouin_full_busy && pingouin_full_busy_output == output) {
++                pingouin_full_busy = false;
++                pingouin_full_next();
++            }
++        });
++        return;
++    }
++}
++
++/*
++ * Which Mac displays get a window: in full screen, with the guest's consent,
++ * every display but the main window's. Outputs keep their display while it
++ * stays; new displays take the lowest free output, left to right.
++ */
++static void pingouin_displays_update(void)
++{
++    NSWindow *mw = [cocoaView window];
++    NSScreen *ms = [mw screen];
++    CGDirectDisplayID main_id = ms ? pingouin_screen_id(ms) : 0;
++    bool want = pingouin_outputs > 1 && pingouin_guest_ready &&
++                pingouin_external_enabled && pingouin_main_full_screen() && ms;
++    NSMutableArray *screens = [NSMutableArray array];
++
++    if (want) {
++        for (NSScreen *s in [NSScreen screens]) {
++            CGDirectDisplayID id = pingouin_screen_id(s);
++            if (id != main_id && pingouin_test_allows(id)) {
++                [screens addObject:s];
++            }
++        }
++        [screens sortUsingComparator:^NSComparisonResult(NSScreen *a, NSScreen *b) {
++            CGRect ra = CGDisplayBounds(pingouin_screen_id(a));
++            CGRect rb = CGDisplayBounds(pingouin_screen_id(b));
++            if (ra.origin.x != rb.origin.x) {
++                return ra.origin.x < rb.origin.x ? NSOrderedAscending : NSOrderedDescending;
++            }
++            return ra.origin.y < rb.origin.y ? NSOrderedAscending :
++                   ra.origin.y > rb.origin.y ? NSOrderedDescending : NSOrderedSame;
++        }];
++    }
++    bool changed = false;
++    for (int i = 1; i < pingouin_outputs; i++) {
++        PingouinHead *hd = &pingouin_heads[i];
++        bool keep = false;
++        for (NSScreen *s in screens) {
++            keep |= hd->display && pingouin_screen_id(s) == hd->display;
++        }
++        if (hd->display && !keep) {
++            pingouin_head_off(hd);
++            changed = true;
++        }
++    }
++    for (NSScreen *s in screens) {
++        CGDirectDisplayID id = pingouin_screen_id(s);
++        bool has = false;
++        for (int i = 1; i < pingouin_outputs; i++) {
++            has |= pingouin_heads[i].display == id;
++        }
++        for (int i = 1; i < pingouin_outputs && !has; i++) {
++            if (!pingouin_heads[i].display) {
++                pingouin_head_on(&pingouin_heads[i], s);
++                has = true;
++                changed = true;
++            }
++        }
++    }
++    if (changed) {
++        /* The guest moves its outputs now; until it says where, use the Mac's layout. */
++        pingouin_guest_known = false;
++    }
++    if (changed) {
++        pingouin_heads_ui_info();
++    }
++    pingouin_update_mac_layout();
++    pingouin_send_layout();
++    pingouin_full_next();
++}
++
++/* The guest channel: app.pingouin.display (JSON lines). */
++
++static int pingouin_chan_fd = -1;
++static dispatch_source_t pingouin_chan_src;
++static NSMutableData *pingouin_chan_buf;
++static int pingouin_chan_tries;
++
++static void pingouin_chan_connect(void);
++
++static void pingouin_chan_write(NSString *line)
++{
++    NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
++    const char *p = [d bytes];
++    size_t left = [d length];
++
++    while (pingouin_chan_fd >= 0 && left) {
++        ssize_t n = write(pingouin_chan_fd, p, left);
++        if (n > 0) {
++            p += n;
++            left -= n;
++        } else if (n < 0 && errno == EINTR) {
++            continue;
++        } else {
++            /* The guest is not reading (port closed): it asks again with hello. */
++            break;
++        }
++    }
++}
++
++static void pingouin_send_layout(void)
++{
++    NSMutableArray *outputs = [NSMutableArray array];
++    NSWindow *mw = [cocoaView window];
++    NSString *builtin = nil;
++
++    if (pingouin_chan_fd < 0 || !pingouin_guest_ready) {
++        return;
++    }
++    for (int i = 0; i < pingouin_outputs; i++) {
++        PingouinBox b = pingouin_mac_box[i];
++        NSScreen *s = i ? pingouin_screen_with_id(pingouin_heads[i].display) : [mw screen];
++        NSString *name = [NSString stringWithFormat:@"Virtual-%d", i + 1];
++        if (b.w <= 0) {
++            continue;
++        }
++        /* The output on the Mac's own display (the notch), for Omanotch. */
++        if (s && !builtin && CGDisplayIsBuiltin(pingouin_screen_id(s))) {
++            builtin = name;
++        }
++        [outputs addObject:@{
++            @"output": name,
++            @"x": @(lround(b.x)), @"y": @(lround(b.y)),
++            @"width": @(lround(b.w)), @"height": @(lround(b.h)),
++            @"scale": @(s ? [s backingScaleFactor] : [mw backingScaleFactor]),
++        }];
++    }
++    NSMutableDictionary *msg = [NSMutableDictionary dictionaryWithDictionary:@{
++        @"layout": outputs,
++        @"external": @(pingouin_external_enabled),
++        @"fullscreen": @(pingouin_main_full_screen()),
++    }];
++    if (builtin) {
++        msg[@"builtin"] = builtin;
++    }
++    NSData *json = [NSJSONSerialization dataWithJSONObject:msg
++                                                   options:NSJSONWritingSortedKeys
++                                                     error:nil];
++    NSString *line = json ? [[[NSString alloc] initWithData:json
++                                                   encoding:NSUTF8StringEncoding] autorelease] : nil;
++    if (!line || [line isEqualToString:pingouin_last_layout]) {
++        return;
++    }
++    [pingouin_last_layout release];
++    pingouin_last_layout = [line retain];
++    if (getenv("PINGOUIN_DISPLAYS_DEBUG")) {
++        fprintf(stderr, "pingouin-displays: mac: %s\n", [line UTF8String]);
++    }
++    pingouin_chan_write(line);
++}
++
++/*
++ * A number from the guest's JSON. Anything else (null, a string, an array)
++ * would raise an exception on -doubleValue and abort QEMU, so it is refused.
++ */
++static bool pingouin_json_number(id v, double *out)
++{
++    if (![v isKindOfClass:[NSNumber class]]) {
++        return false;
++    }
++    *out = [v doubleValue];
++    return isfinite(*out) && fabs(*out) < 1e7;
++}
++
++/* Where Hyprland put its outputs (logical pixels), for the pointer. */
++static void pingouin_guest_monitors(NSArray *monitors)
++{
++    double minx = 0, miny = 0, maxx = 0, maxy = 0;
++    bool first = true;
++
++    memset(pingouin_guest_box, 0, sizeof(pingouin_guest_box));
++    pingouin_guest_known = false;
++    for (NSDictionary *m in monitors) {
++        if (![m isKindOfClass:[NSDictionary class]]) {
++            continue;
++        }
++        NSString *name = m[@"name"];
++        double x, y, w, h;
++        if (!pingouin_json_number(m[@"x"], &x) || !pingouin_json_number(m[@"y"], &y) ||
++            !pingouin_json_number(m[@"width"], &w) ||
++            !pingouin_json_number(m[@"height"], &h) || w <= 0 || h <= 0) {
++            continue;
++        }
++        if (first) {
++            minx = x; miny = y; maxx = x + w; maxy = y + h;
++            first = false;
++        } else {
++            minx = MIN(minx, x); miny = MIN(miny, y);
++            maxx = MAX(maxx, x + w); maxy = MAX(maxy, y + h);
++        }
++        if ([name isKindOfClass:[NSString class]] && [name hasPrefix:@"Virtual-"]) {
++            int index = [[name substringFromIndex:8] intValue] - 1;
++            if (index >= 0 && index < PINGOUIN_MAX_OUTPUTS) {
++                pingouin_guest_box[index] = (PingouinBox){ x, y, w, h };
++                pingouin_guest_known = true;
++            }
++        }
++    }
++    pingouin_guest_bounds = (PingouinBox){ minx, miny, maxx - minx, maxy - miny };
++}
++
++/*
++ * Changes the guest asks for open and close windows and move them in and
++ * out of full screen on the user's displays. At most one per second: a
++ * guest that flips "external" on and off quickly gets its last word applied.
++ */
++static void pingouin_guest_update(void)
++{
++    static CFAbsoluteTime last;
++    static bool pending;
++    CFAbsoluteTime wait = last + 1.0 - CFAbsoluteTimeGetCurrent();
++
++    if (pending) {
++        return;
++    }
++    if (wait <= 0) {
++        last = CFAbsoluteTimeGetCurrent();
++        pingouin_displays_update();
++        return;
++    }
++    pending = true;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++        pending = false;
++        last = CFAbsoluteTimeGetCurrent();
++        pingouin_displays_update();
++    });
++}
++
++static void pingouin_chan_line(NSData *data)
++{
++    if (getenv("PINGOUIN_DISPLAYS_DEBUG")) {
++        fprintf(stderr, "pingouin-displays: guest: %.*s\n", (int)[data length],
++                (const char *)[data bytes]);
++    }
++    @autoreleasepool {
++        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
++        if (![obj isKindOfClass:[NSDictionary class]]) {
++            return;
++        }
++        NSDictionary *d = obj;
++        bool update = false;
++        if (d[@"hello"]) {
++            pingouin_guest_ready = true;
++            [pingouin_last_layout release];
++            pingouin_last_layout = nil;
++            update = true;
++        }
++        if ([d[@"external"] isKindOfClass:[NSNumber class]] &&
++            [d[@"external"] boolValue] != pingouin_external_enabled) {
++            pingouin_external_enabled = [d[@"external"] boolValue];
++            update = true;
++        }
++        if ([d[@"monitors"] isKindOfClass:[NSArray class]]) {
++            pingouin_guest_monitors(d[@"monitors"]);
++        }
++        if (update) {
++            pingouin_guest_update();
++        }
++    }
++}
++
++static void pingouin_chan_close(void)
++{
++    if (pingouin_chan_src) {
++        dispatch_source_cancel(pingouin_chan_src);
++        dispatch_release(pingouin_chan_src);
++        pingouin_chan_src = NULL;
++    }
++    pingouin_chan_fd = -1;
++    pingouin_guest_ready = false;
++    pingouin_chan_tries = 0;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
++                   dispatch_get_main_queue(), ^{ pingouin_chan_connect(); });
++}
++
++static void pingouin_chan_read(void)
++{
++    char buf[4096];
++    ssize_t n = read(pingouin_chan_fd, buf, sizeof(buf));
++
++    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
++        pingouin_chan_close();
++        return;
++    }
++    if (n < 0) {
++        return;
++    }
++    [pingouin_chan_buf appendBytes:buf length:n];
++    for (;;) {
++        const char *p = [pingouin_chan_buf bytes];
++        const char *nl = memchr(p, '\n', [pingouin_chan_buf length]);
++        if (!nl) {
++            break;
++        }
++        NSUInteger len = nl - p;
++        pingouin_chan_line([pingouin_chan_buf subdataWithRange:NSMakeRange(0, len)]);
++        [pingouin_chan_buf replaceBytesInRange:NSMakeRange(0, len + 1) withBytes:NULL length:0];
++    }
++    if ([pingouin_chan_buf length] > 65536) {
++        [pingouin_chan_buf setLength:0];
++    }
++}
++
++static void pingouin_chan_connect(void)
++{
++    const char *path = getenv("PINGOUIN_DISPLAY_SOCKET");
++    struct sockaddr_un addr = { 0 };
++    int one = 1;
++
++    if (!path || !*path || pingouin_chan_fd >= 0 || strlen(path) >= sizeof(addr.sun_path)) {
++        return;
++    }
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd < 0) {
++        return;
++    }
++    addr.sun_family = AF_UNIX;
++    strcpy(addr.sun_path, path);
++    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
++    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
++        close(fd);
++        if (++pingouin_chan_tries < 120) {
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
++                           dispatch_get_main_queue(), ^{ pingouin_chan_connect(); });
++        }
++        return;
++    }
++    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
++    pingouin_chan_fd = fd;
++    if (!pingouin_chan_buf) {
++        pingouin_chan_buf = [[NSMutableData alloc] init];
++    }
++    [pingouin_chan_buf setLength:0];
++    pingouin_chan_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0,
++                                             dispatch_get_main_queue());
++    dispatch_source_set_event_handler(pingouin_chan_src, ^{ pingouin_chan_read(); });
++    dispatch_source_set_cancel_handler(pingouin_chan_src, ^{ close(fd); });
++    dispatch_resume(pingouin_chan_src);
++}
++
++/* Main thread, with the BQL (from cocoa_display_init). */
++static void pingouin_displays_init(void)
++{
++    pingouin_heads[0].output = 0;
++#ifdef CONFIG_OPENGL
++    if (display_opengl && gl_view_nsctx) {
++        for (int i = 1; i < PINGOUIN_MAX_OUTPUTS; i++) {
++            QemuConsole *con = qemu_console_lookup_by_index(i);
++            if (!con || !qemu_console_is_graphic(con)) {
++                break;
++            }
++            pingouin_heads[i].output = i;
++            qemu_console_register_listener(con, &pingouin_heads[i].dcl, &pingouin_head_gl_ops);
++            pingouin_outputs = i + 1;
++        }
++    }
++#endif
++    pingouin_head_delegate = [[PingouinHeadDelegate alloc] init];
++    [[NSNotificationCenter defaultCenter]
++        addObserverForName:NSApplicationDidChangeScreenParametersNotification
++                    object:nil
++                     queue:[NSOperationQueue mainQueue]
++                usingBlock:^(NSNotification *note) {
++        /* Displays settle for a moment after a plug or unplug. */
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2),
++                       dispatch_get_main_queue(), ^{ pingouin_displays_update(); });
++    }];
++    /*
++     * Another app came to the front: let go of the pointer and keyboard even
++     * when the main window was not the key one (windowDidResignKey: covers
++     * that case only).
++     */
++    [[NSNotificationCenter defaultCenter]
++        addObserverForName:NSApplicationDidResignActiveNotification
++                    object:nil
++                     queue:[NSOperationQueue mainQueue]
++                usingBlock:^(NSNotification *note) {
++        if ([cocoaView isMouseGrabbed]) {
++            [cocoaView ungrabMouse];
++        }
++    }];
++    pingouin_update_mac_layout();
++    pingouin_chan_connect();
++}
++
++/* Test mode: the main window starts on PINGOUIN_TEST_MAIN_DISPLAY. */
++static void pingouin_place_main_window(void)
++{
++    const char *v = getenv("PINGOUIN_TEST_MAIN_DISPLAY");
++    NSScreen *s = v && *v ? pingouin_screen_with_id((CGDirectDisplayID)atoll(v)) : nil;
++
++    if (s) {
++        NSRect r = NSInsetRect([s visibleFrame], 40, 40);
++        [[cocoaView window] setFrame:r display:YES];
++    }
++}
++
+ static void cocoa_display_early_init(DisplayOptions *o)
+ {
+     assert(o->type == DISPLAY_TYPE_COCOA);
+@@ -3024,10 +4307,16 @@
+     // Pull this console process up to being a fully-fledged graphical
+     // app with a menubar and Dock icon
+     ProcessSerialNumber psn = { 0, kCurrentProcess };
+-    TransformProcessType(&psn, kProcessTransformToForegroundApplication);
++    if (!pingouin_test_mode()) {
++        TransformProcessType(&psn, kProcessTransformToForegroundApplication);
++    }
+ 
+     [[NSProcessInfo processInfo] setProcessName:pingouin_product_name()];
+     [QemuApplication sharedApplication];
++    if (pingouin_test_mode()) {
++        /* Pingouin test: windows, but never the focus (the user works meanwhile). */
++        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
++    }
+     cocoa_set_product_icon();
+ 
+     dcl.con = qemu_console_lookup_default();
+@@ -3042,6 +4331,7 @@
+     controller = [[QemuCocoaAppController alloc] init];
+ #endif
+     [NSApp setDelegate:controller];
++    pingouin_place_main_window();
+ 
+     if (display_opengl) {
+ #ifdef CONFIG_OPENGL
+@@ -3094,6 +4384,8 @@
+         dcl.ops = &dcl_ops;
+     }
+ 
++    pingouin_displays_init();
++
+     full_grab_enabled = opts->u.cocoa.has_full_grab &&
+                         opts->u.cocoa.full_grab;
+     immersive_mode_enabled = !opts->u.cocoa.has_immersive ||

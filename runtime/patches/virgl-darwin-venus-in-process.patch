@@ -1,0 +1,26 @@
+From: OmacVM
+Subject: [PATCH] proxy: run the Venus render server in process on macOS
+
+Venus hands Metal heaps (process-local objects) from the render server to
+the renderer, so the server must be a thread of QEMU's process, not a
+forked one. Build with -Drender-server-worker=thread.
+
+Upstream: not sent (macOS only).
+Test: Venus in an app VM (vulkaninfo shows Virtio-GPU Venus).
+
+diff --git a/src/proxy/proxy_renderer.c b/src/proxy/proxy_renderer.c
+index 2c2d04b..24784ae 100644
+--- a/src/proxy/proxy_renderer.c
++++ b/src/proxy/proxy_renderer.c
+@@ -16,6 +16,11 @@ int
+ proxy_renderer_init(const struct proxy_renderer_cbs *cbs, uint32_t flags)
+ {
+    bool in_process = !(flags & VIRGL_RENDERER_RENDER_SERVER);
++#if defined(__APPLE__) && defined(ENABLE_RENDER_SERVER_WORKER_THREAD)
++   /* Metal heaps are process-local: the render server must run as a thread
++    * of this process, so blobs can be mapped into the guest. */
++   in_process = true;
++#endif
+ 
+    assert(flags & VIRGL_RENDERER_NO_VIRGL);
+ 

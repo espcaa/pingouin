@@ -1,0 +1,63 @@
+From: OmacVM
+Subject: [PATCH] cocoa: a window out of sight keeps the slow refresh tick
+
+What: while the window cannot be seen (hidden, minimised, wholly covered,
+another Space, closed with "Keep running"), a frame kept for it is no work
+for QEMU's refresh tick: the tick slows to 500 ms as on an idle desktop and
+no longer asks for the present again on every tick. The frame is drawn when
+the window shows again (pingouinWindowSeen schedules present_bh), as before.
+qemu.log's "N frames not drawn" now counts frames, not ticks.
+
+Why: pingouin-cocoa-present-unseen.patch keeps an unseen window's frame
+dirty, and qemu-cocoa-idle-refresh.patch takes a dirty frame as work, so
+once any frame came while the window was away the tick ran at the
+display's rate for as long as it stayed away: on the Mac mini (60 Hz) QEMU
+woke 142-151 times a second minimised against 88-94 with the window shown,
+its main loop four times busier (idle-power track, round 4). On a 120 Hz
+panel twice that.
+
+Upstream: not sent (both patches are OmacVM's).
+Test: app/runtime/Tests/display/test-idle-refresh-unseen.sh (the wiring in
+the patched ui/cocoa.m, with --self-test in CI); QEMU's wakeups minimised
+before and after (bench lock), the newest frame on screen at once after
+unminimise, a Space switch and reopening a window closed with Keep running.
+Applies after pingouin-cocoa-present-unseen.patch.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -7990,12 +7990,33 @@ - (void)tick:(CADisplayLink *)link
+ 
+ static void cocoa_refresh_tick(bool pending);
+ 
++/*
++ * Pingouin: the window cannot be seen, so cocoa_gl_present keeps the frame
++ * (pingouin-cocoa-present-unseen.patch; PINGOUIN_PRESENT_HIDDEN=1 draws anyway).
++ */
++static bool pingouin_present_held(void)
++{
++    static int always = -1;
++
++    if (always < 0) {
++        always = getenv("PINGOUIN_PRESENT_HIDDEN") != NULL;
++    }
++    return present_ctx && !qatomic_read(&pingouin_window_seen) && !always;
++}
++
+ static void cocoa_gl_refresh(DisplayChangeListener *dcl)
+ {
++    /*
++     * Pingouin: a frame kept for a window out of sight is no work for the
++     * tick. It is drawn when the window shows again (pingouinWindowSeen ->
++     * present_bh), not tried again on every tick at the display's rate.
++     */
++    bool held = pingouin_present_held();
++
+     cocoa_refresh(dcl);
+-    cocoa_refresh_tick(gl_dirty);
++    cocoa_refresh_tick(gl_dirty && !held);
+ 
+-    if (gl_dirty) {
++    if (gl_dirty && !held) {
+ 
+         if (cocoa_gl_trace_enabled()) {
+             cocoa_gl_log("refresh: triggering render dirty scanout=%d egl_surface=%d",

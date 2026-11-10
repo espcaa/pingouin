@@ -1,0 +1,174 @@
+From: OmacVM
+Subject: [PATCH] audio/sdl: the rules for the playback buffer size (#548)
+
+What: audio/pingouin-sdl-out-size.h, pure functions with no QEMU or SDL in
+them: the frames per callback to open the Mac's output with (the voice's
+own, raised to the launcher's size for that output or to a size that
+played after a refusal; a power of two, at most half the ring and 2048:
+a callback as large as the ring would need it full at every call), the
+next size after a refused start (twice as large, at least 512), which SDL
+errors a larger size may get past (only "CoreAudio error
+(AudioQueueStart): N"), the launcher's size file, and how long no new
+start is made after every size was refused (until the size file changes;
+30 s without one). The app writes the file anew when the Mac's output
+changes and after a coreaudiod restart (AudioLatencyWatch.swift), so
+`sudo killall coreaudiod` also ends that wait.
+
+Why: with AirPods (A2DP) as the Mac's output the VM had no sound on the
+sound's own thread (default since 3.1.17): AudioQueueStart returned -66681
+(kAudioQueueErr_CannotStart). SDL3 opens CoreAudio's queue at QEMU's rate
+(at least 44.1 kHz) with QEMU's frames per callback: 48 kHz, 6 x 256
+frames on the own thread; 44.1 kHz, 4 x 512 frames on QEMU's main loop,
+which played. qemu-sdl-audio-out-size.patch uses these rules.
+
+Upstream: OmacVM only (its own SDL audio patches).
+Test: app/runtime/Tests/audio/test-out-size.sh (CI) runs
+app/runtime/Tests/audio/test-out-size.c against this header.
+
+--- /dev/null
++++ b/audio/pingouin-sdl-out-size.h
+@@ -0,0 +1,144 @@
++/*
++ * Pingouin: the size of the buffers QEMU's SDL backend asks the Mac's output
++ * for (#548). SDL3 opens CoreAudio's AudioQueue at QEMU's rate (at least
++ * 44.1 kHz) with the frames per callback QEMU asks for (sdl2-compat's
++ * SDL_AUDIO_DEVICE_SAMPLE_FRAMES): 48 kHz and 256 frames (6 queue buffers)
++ * on the sound's own thread, 44.1 kHz and 512 frames (4 queue buffers) on
++ * QEMU's main loop. AirPods over A2DP refused to start the own thread's
++ * queue: AudioQueueStart returned kAudioQueueErr_CannotStart (-66681) and
++ * the VM had no sound; the main loop's played.
++ *
++ * Pure rules, no QEMU or SDL: app/runtime/Tests/audio/test-out-size.c.
++ */
++#ifndef PINGOUIN_SDL_OUT_SIZE_H
++#define PINGOUIN_SDL_OUT_SIZE_H
++
++#include <limits.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* The main loop path's frames per callback (at 44.1 kHz there), the size
++ * the reporter's AirPods played: the first step after a refused start. */
++#define PINGOUIN_SDL_OUT_MAIN_LOOP_FRAMES 512u
++/* Never more per callback: 43 ms at 48 kHz. */
++#define PINGOUIN_SDL_OUT_MAX_FRAMES 2048u
++
++/*
++ * The largest callback a ring of RING frames feeds: half of it, so the ring
++ * still holds a callback's worth while the guest writes the next one. A
++ * callback as large as the ring would need it full at every call: gaps.
++ */
++static inline unsigned pingouin_sdl_out_ring_cap(unsigned ring)
++{
++    return ring / 2;
++}
++
++/* The largest power of two <= n (0 for 0). */
++static inline unsigned pingouin_sdl_out_pow2_floor(unsigned n)
++{
++    unsigned p = 1;
++
++    if (!n) {
++        return 0;
++    }
++    while (p <= n / 2) {
++        p *= 2;
++    }
++    return p;
++}
++
++/*
++ * The frames per callback to open with: the voice's own (BASE), raised to
++ * WANT (the launcher's size for this output, or a size that worked after a
++ * refusal), rounded up to a power of two; never more than half the ring
++ * (RING frames, the callback reads from it) or PINGOUIN_SDL_OUT_MAX_FRAMES,
++ * and never less than BASE.
++ */
++static inline unsigned pingouin_sdl_out_frames(unsigned base, unsigned want,
++                                             unsigned ring)
++{
++    unsigned half = pingouin_sdl_out_ring_cap(ring);
++    unsigned cap = pingouin_sdl_out_pow2_floor(half < PINGOUIN_SDL_OUT_MAX_FRAMES ?
++                                             half : PINGOUIN_SDL_OUT_MAX_FRAMES);
++    unsigned f = base;
++
++    if (want > f) {
++        f = 1;
++        while (f < want && f < PINGOUIN_SDL_OUT_MAX_FRAMES) {
++            f *= 2;
++        }
++    }
++    if (cap && f > cap) {
++        f = cap > base ? cap : base;
++    }
++    return f;
++}
++
++/*
++ * After the Mac's output refused to start at FRAMES: the next size to try,
++ * twice as large and at least the main loop path's, or 0 when the ring
++ * (RING frames) cannot feed a larger one (more than half of it).
++ */
++static inline unsigned pingouin_sdl_out_next(unsigned frames, unsigned ring)
++{
++    unsigned next = frames * 2;
++
++    if (next < PINGOUIN_SDL_OUT_MAIN_LOOP_FRAMES) {
++        next = PINGOUIN_SDL_OUT_MAIN_LOOP_FRAMES;
++    }
++    if (next > pingouin_sdl_out_ring_cap(ring) ||
++        next > PINGOUIN_SDL_OUT_MAX_FRAMES) {
++        return 0;
++    }
++    return next;
++}
++
++/*
++ * Did the open fail in CoreAudio's queue start (SDL3: "CoreAudio error
++ * (AudioQueueStart): N"), which a larger size may get past? Not a missing
++ * device, a refused permission or a format SDL cannot open.
++ */
++static inline bool pingouin_sdl_out_start_refused(const char *sdl_error)
++{
++    return sdl_error && strstr(sdl_error, "(AudioQueueStart)") != NULL;
++}
++
++/*
++ * After the Mac's output refused every size: until when (monotonic, NOW and
++ * WAIT in the caller's unit) no new start is made. Each failed start may
++ * leave coreaudiod silent (#548). The launcher writes its size file anew at
++ * every change of the Mac's output and after a coreaudiod restart, and a new
++ * file ends the wait: with that file (SIZE_FILE) the wait lasts until it
++ * changes; without one (QEMU not started by the app) for WAIT.
++ */
++static inline long long pingouin_sdl_out_hold_until(bool size_file, long long now,
++                                                  long long wait)
++{
++    return size_file ? LLONG_MAX : now + wait;
++}
++
++/*
++ * The launcher's size for the Mac's output now (the file named by
++ * PINGOUIN_AUDIO_OUT_FRAMES_FILE: a number and a newline). 0: none, or text
++ * that is not a size from 1 to PINGOUIN_SDL_OUT_MAX_FRAMES.
++ */
++static inline unsigned pingouin_sdl_out_parse_hint(const char *text)
++{
++    char *end = NULL;
++    unsigned long v;
++
++    if (!text || *text < '0' || *text > '9') {
++        return 0;
++    }
++    v = strtoul(text, &end, 10);
++    while (end && (*end == '\n' || *end == '\r' || *end == ' ')) {
++        end++;
++    }
++    if (!end || *end || v < 1 || v > PINGOUIN_SDL_OUT_MAX_FRAMES) {
++        return 0;
++    }
++    return (unsigned)v;
++}
++
++#endif

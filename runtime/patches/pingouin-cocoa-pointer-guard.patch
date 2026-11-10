@@ -1,0 +1,454 @@
+From: OmacVM
+Subject: [PATCH] ui: the full-screen pointer guard's maths
+
+What: a header with no AppKit in it: where the guest's pointer goes for each
+mouse event while the Mac's cursor is kept off display corners and the
+Dock's edge, when to detach, warp and attach the cursor, and which of our
+windows has the pointer's place (and where in it). Used by
+pingouin-cocoa-fullscreen-edges.patch (which explains the why).
+
+Why its own file: so the motion maths is unit tested without QEMU or a
+display (app/runtime/Tests/display/test-pointer-guard.sh applies this patch
+to an empty folder and runs test-pointer-guard.c; at build time and in CI).
+
+Upstream: not applicable (OmacVM's display windows).
+Test: app/runtime/Tests/display/test-pointer-guard.c.
+
+diff --git a/ui/pingouin-pointer-guard.h b/ui/pingouin-pointer-guard.h
+new file mode 100644
+index 0000000..c1e0963
+--- /dev/null
++++ b/ui/pingouin-pointer-guard.h
+@@ -0,0 +1,432 @@
++/*
++ * Pingouin: the pointer maths of the full-screen guard (Dock and hot corners).
++ *
++ * No AppKit in here, so it is tested on its own
++ * (app/runtime/Tests/display/test-pointer-guard.c). ui/cocoa.m feeds it the
++ * mouse events and does what each step asks (detach, warp, attach).
++ *
++ * Coordinates are CoreGraphics' global space: points, top-left origin.
++ *
++ * While the VM has the pointer in full screen, the Mac's cursor must never
++ * reach a corner of its display (a macOS hot corner) or the Dock's edge.
++ * Near them (the zone: 200 points) the cursor is detached from the mouse and
++ * the pointer the guest sees moves on by each event's delta. That delta is
++ * the motion macOS itself moves the cursor by (after its acceleration, in
++ * points), so the pointer moves exactly as fast in the zone as outside it,
++ * and crossing the zone's border is not felt.
++ *
++ * A warp adds its own distance to the next event made after it, so every
++ * warp's distance is taken out of that event's delta again (as SDL and GLFW
++ * do on macOS). 2.8.0 to 2.9.0 RC4 warped the detached cursor along on every
++ * event without that, so each delta carried all the earlier ones and the
++ * pointer raced away near the corners.
++ *
++ * The let-go's warp too: when a button event (no motion, so it carries no
++ * warp) takes hold again first, as the button's release does after a click
++ * on another display's window (ui/cocoa.m lets go and grabs again when that
++ * window becomes key), the next motion still carries it. 3.0.0 to 3.2.5
++ * added it to the pointer there (since that let-go and grab at the click):
++ * after each click near a corner of an external display the pointer jumped
++ * by the way from the last click (reported by the user).
++ * Only a motion takes it out, never a button. When the next event is not at
++ * the let-go's warp, a motion the guard did not see (ungrabbed) carried it.
++ *
++ * When the guest draws its own pointer the detached cursor (hidden) stays
++ * where it is; the only warp then is the one that takes it off an outer edge
++ * when it got there in one go. When the Mac's cursor is the visible pointer
++ * (follow: VMs whose guest hides its pointer, show-cursor=on) it follows the
++ * guest's pointer, kept the gap off corners and the Dock's edge, with at most
++ * one warp in flight.
++ */
++#ifndef PINGOUIN_POINTER_GUARD_H
++#define PINGOUIN_POINTER_GUARD_H
++
++#include <math.h>
++#include <stdbool.h>
++#include <string.h>
++
++#define PINGOUIN_GUARD_ZONE 200.0   /* points from a corner or the Dock's edge */
++#define PINGOUIN_GUARD_GAP 3.0      /* the Mac's cursor stays this far off them */
++
++enum { PINGOUIN_DOCK_BOTTOM, PINGOUIN_DOCK_LEFT, PINGOUIN_DOCK_RIGHT };
++
++typedef struct PingouinRect {
++    double x, y, w, h;
++} PingouinRect;
++
++/* The Mac's displays and our full-screen windows on them. */
++typedef struct PingouinGuardScreens {
++    const PingouinRect *displays;
++    int ndisplays;
++    const PingouinRect *ours;
++    int nours;
++    int dock_edge;
++} PingouinGuardScreens;
++
++typedef struct PingouinGuard {
++    bool follow;        /* the Mac's cursor is the visible pointer (caller sets it) */
++    bool held;          /* the Mac's cursor is detached */
++    double x, y;        /* the pointer's place while held */
++    double cx, cy;      /* where the Mac's cursor is meanwhile */
++    bool warp_pending;  /* the next event made after a warp carries ... */
++    double wdx, wdy;    /* ... this distance; events made before it ... */
++    double ox, oy;      /* ... are still at this place */
++    bool let_go;        /* let go; events made before that are still ... */
++    double fx[2], fy[2];/* ... at one of the held cursor's places */
++    bool let_go_warp;   /* no motion since the let-go's warp: the next one ... */
++    double lwdx, lwdy;  /* ... carries this distance; the warp went ... */
++    double lwx, lwy;    /* ... here (the pointer's place, the gap off edges) */
++    bool lw_flight;     /* the warp in flight has the let-go's in it */
++    bool seen;          /* an event was handled ... */
++    double last_time;   /* ... with this time stamp ... */
++    bool last_place;    /* ... and the guest got (x, y) for it */
++} PingouinGuard;
++
++/*
++ * What the caller does after one event, in this order: warp, then (de)tach.
++ * place: the guest gets (x, y) of the guard for this event, not the event's
++ * location (held, or just let go). let_go_out (for the caller's debug log):
++ * the warp in flight taken out of this motion had the let-go's in it;
++ * (ldx, ldy) is the whole distance taken out.
++ */
++typedef struct PingouinGuardStep {
++    bool place;
++    bool warp;
++    double wx, wy;
++    bool detach;
++    bool attach;
++    bool let_go_out;
++    double ldx, ldy;
++} PingouinGuardStep;
++
++/* Top edge in, bottom edge out: CoreGraphics' pixel rows. */
++static inline bool pingouin_guard_in(const PingouinRect *r, double x, double y)
++{
++    return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
++}
++
++/*
++ * A window's frame in AppKit's space (bottom-left origin) in CoreGraphics'
++ * space; top is the top of the main display's frame (NSMaxY of the first
++ * NSScreen).
++ */
++static inline PingouinRect pingouin_guard_rect_from_cocoa(double top, double x,
++                                                      double y, double w,
++                                                      double h)
++{
++    PingouinRect r = { x, top - (y + h), w, h };
++
++    return r;
++}
++
++/*
++ * Which of our windows has the place (x, y), and the place in that window's
++ * own coordinates (AppKit's: bottom-left origin, points; the top row is y = h).
++ * Tested the guard's way (pingouin_guard_in), so the window's top row counts:
++ * the guard stops the pointer there. -1: in none.
++ */
++static inline int pingouin_guard_window_point(const PingouinGuardScreens *s,
++                                            double x, double y,
++                                            double *wx, double *wy)
++{
++    for (int i = 0; i < s->nours; i++) {
++        const PingouinRect *r = &s->ours[i];
++
++        if (pingouin_guard_in(r, x, y)) {
++            *wx = x - r->x;
++            *wy = r->h - (y - r->y);
++            return i;
++        }
++    }
++    return -1;
++}
++
++static inline int pingouin_guard_display_at(const PingouinGuardScreens *s,
++                                          double x, double y)
++{
++    for (int i = 0; i < s->ndisplays; i++) {
++        if (pingouin_guard_in(&s->displays[i], x, y)) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++static inline bool pingouin_guard_ours(const PingouinGuardScreens *s,
++                                     double x, double y)
++{
++    for (int i = 0; i < s->nours; i++) {
++        if (pingouin_guard_in(&s->ours[i], x, y)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++/*
++ * Keep (*x, *y) on display d. With gap, also keep it gap points off each
++ * outer edge (no display beyond it) that a corner or the Dock makes
++ * dangerous. Returns whether the place is in the zone.
++ */
++static inline bool pingouin_guard_fit(const PingouinGuardScreens *s, int d,
++                                    double *x, double *y, double gap)
++{
++    const PingouinRect *r = &s->displays[d];
++    double minx = r->x, maxx = r->x + r->w - 1;
++    double miny = r->y, maxy = r->y + r->h - 1;
++    double px = fmin(fmax(*x, minx), maxx);
++    double py = fmin(fmax(*y, miny), maxy);
++    bool outl = pingouin_guard_display_at(s, minx - 1, py) < 0;
++    bool outr = pingouin_guard_display_at(s, maxx + 1, py) < 0;
++    bool outt = pingouin_guard_display_at(s, px, miny - 1) < 0;
++    bool outb = pingouin_guard_display_at(s, px, maxy + 1) < 0;
++    bool corner = fmin(px - minx, maxx - px) < PINGOUIN_GUARD_ZONE &&
++                  fmin(py - miny, maxy - py) < PINGOUIN_GUARD_ZONE;
++    bool dock = (s->dock_edge == PINGOUIN_DOCK_BOTTOM && outb &&
++                 maxy - py < PINGOUIN_GUARD_ZONE) ||
++                (s->dock_edge == PINGOUIN_DOCK_LEFT && outl &&
++                 px - minx < PINGOUIN_GUARD_ZONE) ||
++                (s->dock_edge == PINGOUIN_DOCK_RIGHT && outr &&
++                 maxx - px < PINGOUIN_GUARD_ZONE);
++
++    if (gap > 0 && (corner || dock)) {
++        if (outl && (corner || s->dock_edge == PINGOUIN_DOCK_LEFT)) {
++            px = fmax(px, minx + gap);
++        }
++        if (outr && (corner || s->dock_edge == PINGOUIN_DOCK_RIGHT)) {
++            px = fmin(px, maxx - gap);
++        }
++        if (outt && corner) {
++            py = fmax(py, miny + gap);
++        }
++        if (outb && (corner || s->dock_edge == PINGOUIN_DOCK_BOTTOM)) {
++            py = fmin(py, maxy - gap);
++        }
++    }
++    *x = px;
++    *y = py;
++    return corner || dock;
++}
++
++/* A warp of the detached cursor to (x, y); the next event made after it carries it. */
++static inline void pingouin_guard_warp(PingouinGuard *g, PingouinGuardStep *step,
++                                     double x, double y)
++{
++    g->wdx = x - g->cx;
++    g->wdy = y - g->cy;
++    g->ox = g->cx;
++    g->oy = g->cy;
++    g->warp_pending = true;
++    g->cx = x;
++    g->cy = y;
++    step->warp = true;
++    step->wx = x;
++    step->wy = y;
++}
++
++/* Where the Mac's cursor goes when it is attached again: never on an edge. */
++static inline void pingouin_guard_release(PingouinGuard *g,
++                                        const PingouinGuardScreens *s,
++                                        PingouinGuardStep *step)
++{
++    double x = g->x, y = g->y;
++    int d = pingouin_guard_display_at(s, x, y);
++
++    if (d >= 0) {
++        pingouin_guard_fit(s, d, &x, &y, PINGOUIN_GUARD_GAP);
++    }
++    step->warp = true;
++    step->wx = x;
++    step->wy = y;
++    step->attach = true;
++    if (g->held) {
++        g->let_go = true;
++        g->fx[0] = g->fx[1] = g->cx;
++        g->fy[0] = g->fy[1] = g->cy;
++        if (g->warp_pending) {
++            g->fx[1] = g->ox;
++            g->fy[1] = g->oy;
++        }
++        /*
++         * A warp still in flight comes in the same next motion. Its own
++         * distance, not cx - ox: a hold taken by a button puts the let-go's
++         * warp in flight without moving the cursor.
++         */
++        g->let_go_warp = true;
++        g->lwdx = x - g->cx + (g->warp_pending ? g->wdx : 0);
++        g->lwdy = y - g->cy + (g->warp_pending ? g->wdy : 0);
++        g->lwx = x;
++        g->lwy = y;
++    }
++    g->held = false;
++    g->warp_pending = false;
++    g->lw_flight = false;
++}
++
++/*
++ * One mouse event: time is its time stamp, (lx, ly) its location, (dx, dy)
++ * its delta; (cur_x, cur_y) is where the Mac's cursor is now. While held, the
++ * guest gets (g->x, g->y); else the event's own location. With no windows of
++ * ours (s->nours == 0: guard off) it never takes hold, but still moves the
++ * pointer for events queued before the let-go.
++ */
++static inline void pingouin_guard_event(PingouinGuard *g,
++                                      const PingouinGuardScreens *s,
++                                      double time, double lx, double ly,
++                                      double dx, double dy,
++                                      double cur_x, double cur_y,
++                                      PingouinGuardStep *step)
++{
++    double px, py;
++    int d;
++
++    memset(step, 0, sizeof(*step));
++    /* AppKit can hand the same event to a view twice (tracking area and responder). */
++    if (g->seen && time == g->last_time) {
++        step->place = g->last_place;
++        return;
++    }
++    g->seen = true;
++    g->last_time = time;
++    g->last_place = false;
++
++    if (!g->held && g->let_go) {
++        if ((fabs(lx - g->fx[0]) < 0.5 && fabs(ly - g->fy[0]) < 0.5) ||
++            (fabs(lx - g->fx[1]) < 0.5 && fabs(ly - g->fy[1]) < 0.5)) {
++            /*
++             * Made while held, handled after the let-go (queued): its
++             * location is the held cursor's, not the pointer's. It moves the
++             * pointer by its delta and does not take hold again.
++             */
++            px = g->x + dx;
++            py = g->y + dy;
++            d = pingouin_guard_display_at(s, g->x, g->y);
++            if (pingouin_guard_display_at(s, px, py) >= 0) {
++                d = pingouin_guard_display_at(s, px, py);
++            }
++            if (d >= 0) {
++                pingouin_guard_fit(s, d, &px, &py, 0);
++                g->x = px;
++                g->y = py;
++            }
++            step->place = g->last_place = true;
++            return;
++        }
++        g->let_go = false;
++    }
++    /* A motion made after the let-go's warp carried it (its place is the cursor's). */
++    if (g->let_go_warp && (dx != 0 || dy != 0)) {
++        g->let_go_warp = false;
++    }
++
++    if (g->held) {
++        /*
++         * A motion made after the warp (it is at the warp's place) carries
++         * its distance; a button does not (it has no motion).
++         */
++        if (g->warp_pending && (dx != 0 || dy != 0) &&
++            fabs(lx - g->cx) < 0.5 && fabs(ly - g->cy) < 0.5) {
++            dx -= g->wdx;
++            dy -= g->wdy;
++            g->warp_pending = false;
++            if (g->lw_flight) {
++                step->let_go_out = true;
++                step->ldx = g->wdx;
++                step->ldy = g->wdy;
++                g->lw_flight = false;
++            }
++        }
++        px = g->x + dx;
++        py = g->y + dy;
++        d = pingouin_guard_display_at(s, px, py);
++        if (d < 0) {
++            /* Past an outer edge: it slides along the display it was on. */
++            d = pingouin_guard_display_at(s, g->x, g->y);
++            if (d < 0) {
++                pingouin_guard_release(g, s, step);
++                step->place = g->last_place = true;
++                return;
++            }
++        }
++    } else {
++        px = lx;
++        py = ly;
++        if (g->let_go_warp && (fabs(lx - g->lwx) >= 0.5 || fabs(ly - g->lwy) >= 0.5)) {
++            /* Not at the let-go's warp: a motion we did not see (ungrabbed) carried it. */
++            g->let_go_warp = false;
++        }
++        if (g->let_go_warp) {
++            /* A button at the let-go's warp: where the pointer is, not the gap off an edge. */
++            px = g->x;
++            py = g->y;
++            if (fabs(cur_x - g->lwx) >= 0.5 || fabs(cur_y - g->lwy) >= 0.5) {
++                /*
++                 * The cursor moved on since: motions made after this button
++                 * are queued, the first carries the warp. It does not take
++                 * hold; they come at the cursor's place and take it.
++                 */
++                step->place = g->last_place = true;
++                return;
++            }
++        }
++        d = pingouin_guard_display_at(s, px, py);
++        if (d < 0) {
++            return;
++        }
++    }
++    if (!pingouin_guard_fit(s, d, &px, &py, 0) || !pingouin_guard_ours(s, px, py)) {
++        if (g->held) {
++            /* Out of the zone, or off our windows: macOS moves it again. */
++            g->x = px;
++            g->y = py;
++            pingouin_guard_release(g, s, step);
++            step->place = g->last_place = true;
++        }
++        return;
++    }
++    if (!g->held) {
++        double fx = cur_x, fy = cur_y;
++        int fd = pingouin_guard_display_at(s, fx, fy);
++
++        g->held = true;
++        g->warp_pending = false;
++        g->lw_flight = false;
++        step->detach = true;
++        if (fd >= 0) {
++            pingouin_guard_fit(s, fd, &fx, &fy, PINGOUIN_GUARD_GAP);
++        }
++        g->cx = cur_x;
++        g->cy = cur_y;
++        if (fx != cur_x || fy != cur_y) {
++            /* Got onto an outer edge in one go: off it. */
++            pingouin_guard_warp(g, step, fx, fy);
++        }
++        if (g->let_go_warp) {
++            /* Taken by a button event: the next motion carries the let-go's warp too. */
++            if (!g->warp_pending) {
++                g->wdx = g->wdy = 0;
++                g->ox = g->cx;
++                g->oy = g->cy;
++                g->warp_pending = true;
++            }
++            g->wdx += g->lwdx;
++            g->wdy += g->lwdy;
++            g->let_go_warp = false;
++            g->lw_flight = true;
++        }
++    }
++    g->x = px;
++    g->y = py;
++    if (g->follow && !g->warp_pending) {
++        /* The visible cursor goes where the pointer is, the gap off the edges. */
++        double tx = round(px), ty = round(py);
++
++        pingouin_guard_fit(s, d, &tx, &ty, PINGOUIN_GUARD_GAP);
++        if (tx != g->cx || ty != g->cy) {
++            pingouin_guard_warp(g, step, tx, ty);
++        }
++    }
++    step->place = g->last_place = true;
++}
++
++#endif

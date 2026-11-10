@@ -1,0 +1,48 @@
+virglrenderer: a status query the GL does not answer reads as empty, not as stack bytes
+
+What: three values vrend reads after a GL query start set, as the link and compile
+status do since virgl-sysval-block-check.patch: the info logs of a failed compile and a
+failed link start empty (infolog[0] = 0), and a separable pipeline's validate status
+starts at GL_TRUE.
+Why: when the Mac's GL refuses calls of a context (#547: quickshell at desktop start
+while macOS reconfigured its displays), the status queries write nothing. A compile or
+link then counts as failed (right), but its log line printed whatever the 64 KB stack
+buffer held, and an unset validate status could read as 0 and report
+ILLEGAL_PROGRAM_PIPELINE, which stops the guest app's whole context. A real validate
+failure still reports it.
+Upstream: the same code is in upstream virglrenderer; not sent.
+Test: Tests/virgl/test-sysval-block.c with sysval-block-gl.c (status queries that write
+nothing after the stack was filled: empty "Shader failed to compile" and "Error linking
+program" logs, no context error, the pipeline draws; 4 FAIL without this patch).
+
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -1826,6 +1826,8 @@ static bool vrend_compile_shader(struct vrend_sub_cont
+    if (param == GL_FALSE) {
+       char infolog[65536];
+       int len;
++      /* Pingouin: empty when the GL writes nothing (a GL that refuses calls) */
++      infolog[0] = 0;
+       glGetShaderInfoLog(shader->id, 65536, &len, infolog);
+       shader->compile_failed = true;
+       if (vrend_report_shader_failure(sub_ctx->parent, "compile")) {
+@@ -2490,6 +2492,8 @@ static bool vrend_link(GLuint id)
+    if (lret == GL_FALSE) {
+       char infolog[65536];
+       int len;
++      /* Pingouin: empty when the GL writes nothing (a GL that refuses calls) */
++      infolog[0] = 0;
+       glGetProgramInfoLog(id, 65536, &len, infolog);
+       virgl_error("Error linking program:\n%s\n", infolog);
+       return false;
+@@ -2791,7 +2795,9 @@ static struct vrend_linked_shader_program *add_shader_
+        glUseProgramStages(pipeline_id, GL_FRAGMENT_SHADER_BIT, fs->program_id);
+ 
+        glValidateProgramPipeline(pipeline_id);
+-       GLint validation_status;
++       /* Pingouin: a query that writes nothing (a GL that refuses calls) is no proof of an
++        * invalid pipeline; the error would stop the guest's whole context */
++       GLint validation_status = GL_TRUE;
+        glGetProgramPipelineiv(pipeline_id, GL_VALIDATE_STATUS, &validation_status);
+        if (!validation_status) {
+            vrend_report_context_error(sub_ctx->parent, VIRGL_ERROR_CTX_ILLEGAL_PROGRAM_PIPELINE, 0);
