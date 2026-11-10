@@ -19,6 +19,14 @@ final class GesturesBridge {
         self.pid = qemuPID
     }
 
+    static func showPingouin() {
+        NSApp.activate()
+        if let w = NSApp.windows.first(where: { $0.canBecomeMain }) {
+            if w.isMiniaturized { w.deminiaturize(nil) }
+            w.makeKeyAndOrderFront(nil)
+        }
+    }
+
     static var hasAccessibility: Bool { pg_permissions() & Int32(PG_PERM_ACCESSIBILITY) != 0 }
     static var hasInputMonitoring: Bool { pg_permissions() & Int32(PG_PERM_INPUT_MONITORING) != 0 }
     static var hasPermissions: Bool { hasAccessibility && hasInputMonitoring }
@@ -97,6 +105,11 @@ final class GesturesBridge {
     }
 
     private func send(_ line: UnsafePointer<CChar>, _ len: Int) {
+        // Ctrl+Option+Esc let go of the VM ("S esc"): back to Pingouin's own
+        // window (macOS switches Space). The VM captures again once it's in front.
+        if len >= 5, strncmp(line, "S esc", 5) == 0 {
+            DispatchQueue.main.async { GesturesBridge.showPingouin() }
+        }
         lock.lock()
         defer { lock.unlock() }
         guard fd >= 0 else { return }

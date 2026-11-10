@@ -11,7 +11,10 @@ struct PingouinApp: App {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 640, minHeight: 400)
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                .onReceive(
+                    NotificationCenter.default.publisher(
+                        for: NSApplication.didBecomeActiveNotification)
+                ) { _ in
                     model.refreshPermissions()
                 }
         }
@@ -36,14 +39,18 @@ struct ContentView: View {
                     }
                 }
                 .contextMenu {
-                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([vm.dir]) }
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([vm.dir])
+                    }
                     Divider()
                     Button("Move to Trash…", role: .destructive) { deleting = vm }
                         .disabled(model.running[vm.config.name] != nil)
                 }
             }
             .safeAreaInset(edge: .bottom) {
-                Button { creating = true } label: {
+                Button {
+                    creating = true
+                } label: {
                     Label("New VM", systemImage: "plus.circle")
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
@@ -55,16 +62,20 @@ struct ContentView: View {
         } detail: {
             VStack(spacing: 0) {
                 if !model.hasGesturePermissions { PermissionBanner() }
-                if let name = selection, let vm = model.vms.first(where: { $0.config.name == name }) {
+                if let name = selection, let vm = model.vms.first(where: { $0.config.name == name })
+                {
                     VMDetail(vm: vm, deleting: $deleting).id(name)
                 } else {
-                    ContentUnavailableView("No VM selected", systemImage: "macwindow",
-                                           description: Text("Make one with New VM, then boot a Linux installer ISO."))
+                    ContentUnavailableView(
+                        "No VM selected", systemImage: "macwindow",
+                        description: Text("Make one with New VM, then boot a Linux installer ISO."))
                 }
             }
         }
-        .confirmationDialog("Move \"\(deleting?.config.name ?? "")\" to the Trash?",
-                            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
+        .confirmationDialog(
+            "Move \"\(deleting?.config.name ?? "")\" to the Trash?",
+            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })
+        ) {
             Button("Move to Trash", role: .destructive) {
                 if let vm = deleting {
                     model.delete(vm)
@@ -80,7 +91,9 @@ struct ContentView: View {
         }
         .alert("Pingouin", isPresented: .constant(model.error != nil)) {
             Button("OK") { model.error = nil }
-        } message: { Text(model.error ?? "") }
+        } message: {
+            Text(model.error ?? "")
+        }
         .onAppear { if selection == nil { selection = model.vms.first?.config.name } }
     }
 }
@@ -94,15 +107,19 @@ struct PermissionBanner: View {
             Text("Trackpad gestures and ⌘ shortcuts in the VM need two permissions:")
                 .font(.callout)
             if !model.hasAccessibility {
-                row("Accessibility", "lets Pingouin pass ⌘ shortcuts and gestures to the VM",
+                row(
+                    "Accessibility", "lets Pingouin pass ⌘ shortcuts and gestures to the VM",
                     GesturesBridge.requestAccessibility)
             }
             if !model.hasInputMonitoring {
-                row("Input Monitoring", "lets Pingouin read the trackpad's fingers",
+                row(
+                    "Input Monitoring", "lets Pingouin read the trackpad's fingers",
                     GesturesBridge.requestInputMonitoring)
             }
-            Text("Already on in System Settings? Remove Pingouin from that list with − and allow it again (a new build has a new signature).")
-                .font(.caption).foregroundStyle(.secondary)
+            Text(
+                "Already on there? Remove Pingouin from that list with the [−] button and put it back again (you're probably on a new build with a new signature)."
+            )
+            .font(.caption).foregroundStyle(.secondary)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -131,10 +148,12 @@ struct VMDetail: View {
     var body: some View {
         Form {
             Section {
-                Stepper("CPUs: \(vm.config.cpus)", value: $vm.config.cpus,
-                        in: 1...ProcessInfo.processInfo.activeProcessorCount)
-                Stepper("Memory: \(vm.config.memoryMiB / 1024) GiB", value: $vm.config.memoryMiB,
-                        in: 2048...Int(ProcessInfo.processInfo.physicalMemory >> 20), step: 1024)
+                Stepper(
+                    "CPUs: \(vm.config.cpus)", value: $vm.config.cpus,
+                    in: 1...ProcessInfo.processInfo.activeProcessorCount)
+                Stepper(
+                    "Memory: \(vm.config.memoryMiB / 1024) GiB", value: $vm.config.memoryMiB,
+                    in: 2048...Int(ProcessInfo.processInfo.physicalMemory >> 20), step: 1024)
                 Toggle("ISO keyboard (§ and < keys)", isOn: $vm.config.isoKeyboard)
                 Toggle("Full screen over the notch", isOn: $vm.config.fullPanel)
                 Toggle("Vulkan (needs Fedora's Mesa 26.2.4 or newer)", isOn: $vm.config.vulkan)
@@ -164,8 +183,10 @@ struct VMDetail: View {
 
             Section("Guest tools") {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Trackpad gestures, ⌘ shortcuts and the shared folder need Pingouin's tools in Linux. Once, in a terminal inside the VM:")
-                        .font(.callout)
+                    Text(
+                        "Trackpad gestures, ⌘ shortcuts and the shared folder need Pingouin's tools in Linux. Once, in a terminal inside the VM:"
+                    )
+                    .font(.callout)
                     HStack {
                         Text(guestInstallCommand)
                             .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
@@ -202,23 +223,27 @@ struct VMDetail: View {
                         Button("Boot Installer ISO…") { pickingISO = true }
                     }
                     Spacer()
-                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([vm.dir]) }
-                    Button("Move to Trash…", role: .destructive) { deleting = vm }.disabled(isRunning)
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([vm.dir])
+                    }
+                    Button("Move to Trash…", role: .destructive) { deleting = vm }.disabled(
+                        isRunning)
                 }
-            } footer: {
-                Text("After installing, shut the VM down (don't reboot) and press Start: the ISO is only attached for the run you boot it with.")
-                    .font(.footnote).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
         .navigationTitle(vm.config.name)
-        .fileImporter(isPresented: $pickingISO, allowedContentTypes: [UTType(filenameExtension: "iso") ?? .data]) { result in
+        .fileImporter(
+            isPresented: $pickingISO,
+            allowedContentTypes: [UTType(filenameExtension: "iso") ?? .data]
+        ) { result in
             if case .success(let url) = result { model.start(vm, iso: url) }
         }
     }
 }
 
-let guestInstallCommand = "sudo mount -t 9p -o trans=virtio,ro pingouin-tools /mnt && sudo bash /mnt/install.sh; sudo umount /mnt"
+let guestInstallCommand =
+    "sudo mount -t 9p -o trans=virtio,ro pingouin-tools /mnt && sudo bash /mnt/install.sh; sudo umount /mnt"
 
 extension VMDetail {
     func chooseFolder() {
@@ -241,9 +266,12 @@ struct NewVMSheet: View {
     var body: some View {
         Form {
             TextField("Name", text: $config.name)
-            Stepper("CPUs: \(config.cpus)", value: $config.cpus, in: 1...ProcessInfo.processInfo.activeProcessorCount)
-            Stepper("Memory: \(config.memoryMiB / 1024) GiB", value: $config.memoryMiB,
-                    in: 2048...Int(ProcessInfo.processInfo.physicalMemory >> 20), step: 1024)
+            Stepper(
+                "CPUs: \(config.cpus)", value: $config.cpus,
+                in: 1...ProcessInfo.processInfo.activeProcessorCount)
+            Stepper(
+                "Memory: \(config.memoryMiB / 1024) GiB", value: $config.memoryMiB,
+                in: 2048...Int(ProcessInfo.processInfo.physicalMemory >> 20), step: 1024)
             Stepper("Disk: \(config.diskGiB) GiB", value: $config.diskGiB, in: 16...2048, step: 16)
             Toggle("ISO keyboard (§ and < keys)", isOn: $config.isoKeyboard)
         }
@@ -253,7 +281,10 @@ struct NewVMSheet: View {
             ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
             ToolbarItem(placement: .confirmationAction) {
                 Button("Create") {
-                    if let vm = model.create(config) { created(vm); dismiss() }
+                    if let vm = model.create(config) {
+                        created(vm)
+                        dismiss()
+                    }
                 }
             }
         }
