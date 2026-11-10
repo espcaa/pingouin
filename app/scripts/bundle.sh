@@ -30,6 +30,24 @@ mkdir -p "$out/Contents/MacOS" "$out/Contents/Resources"
 cp "$bin" "$out/Contents/MacOS/Pingouin"
 sed -e "s/@BUNDLE_ID@/$bundle_id/" -e "s/@VERSION@/$version/" Resources/Info.plist > "$out/Contents/Info.plist"
 [[ -f Resources/Pingouin.icns ]] && cp Resources/Pingouin.icns "$out/Contents/Resources/"
+# the VM windows' Dock icon (QEMU sets it while running: flat only)
+[[ -f Resources/VM.icns ]] && cp Resources/VM.icns "$out/Contents/Resources/"
+# macOS 26 and later: the Liquid Glass icon, compiled from Resources/Pingouin.icon
+# (Icon Composer). That needs actool from Xcode 26+ (GitHub's macOS runners have
+# it); without it, and on older macOS, the app shows Pingouin.icns (flat).
+if [[ -d Resources/Pingouin.icon ]] && xcrun --find actool >/dev/null 2>&1; then
+  icon_tmp=$(mktemp -d)
+  if xcrun actool Resources/Pingouin.icon --compile "$out/Contents/Resources" \
+      --app-icon Pingouin --platform macosx --minimum-deployment-target 15.0 \
+      --output-partial-info-plist "$icon_tmp/icon.plist" >"$icon_tmp/actool.log" 2>&1; then
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string Pingouin" "$out/Contents/Info.plist" 2>/dev/null ||
+      /usr/libexec/PlistBuddy -c "Set :CFBundleIconName Pingouin" "$out/Contents/Info.plist"
+    echo "bundle: Liquid Glass icon compiled (actool)" >&2
+  else
+    echo "bundle: actool failed, flat icon only:" >&2; tail -5 "$icon_tmp/actool.log" >&2
+  fi
+  rm -rf "$icon_tmp"
+fi
 
 runtime=$root/runtime/.build/qemu-gpu-runtime
 if [[ -d $runtime ]]; then

@@ -27,6 +27,8 @@ final class AppModel: ObservableObject {
     @Published var phases: [String: RunningVM.Phase] = [:]
     @Published var error: String?
     @Published var creatingVM = false
+    /// Quitting: called once no VM runs any more (AppDelegate).
+    var onAllStopped: (() -> Void)?
     @Published var hasAccessibility = GesturesBridge.hasAccessibility
     @Published var hasInputMonitoring = GesturesBridge.hasInputMonitoring
     var hasGesturePermissions: Bool { hasAccessibility && hasInputMonitoring }
@@ -120,13 +122,15 @@ final class AppModel: ObservableObject {
         guard running[vm.config.name] == nil else { return }
         do {
             let launch = QEMULaunch(vm: vm, runtime: try Runtime.locate(),
-                                    iso: iso, icon: Bundle.main.url(forResource: "Pingouin", withExtension: "icns"),
+                                    iso: iso, icon: Bundle.main.url(forResource: "VM", withExtension: "icns")
+                                        ?? Bundle.main.url(forResource: "Pingouin", withExtension: "icns"),
                                     guestTools: GuestTools.locate())
             try? FileManager.default.removeItem(at: vm.gesturesSocket)
             try? FileManager.default.removeItem(at: vm.controlSocket)
             try? FileManager.default.removeItem(at: vm.displaySocket)
             try? FileManager.default.removeItem(at: vm.clipboardSocket)
             try? FileManager.default.removeItem(at: vm.displayNowURL)   // "now" is per run
+            try? FileManager.default.removeItem(at: vm.displayStateURL)
             FileManager.default.createFile(atPath: vm.logURL.path, contents: Data((launch.shellLine + "\n\n").utf8))
             let log = try FileHandle(forWritingTo: vm.logURL)
             log.seekToEndOfFile()
@@ -216,7 +220,13 @@ final class AppModel: ObservableObject {
         running[name]?.clipboard?.stop()
         running[name] = nil
         phases[name] = nil
+        if running.isEmpty, let done = onAllStopped {
+            onAllStopped = nil
+            done()
+            return
+        }
         guard let vm = vms.first(where: { $0.config.name == name }) else { return }
+        try? FileManager.default.removeItem(at: vm.displayStateURL)
         if phase == .restarting {
             start(vm)
         } else if status != 0 && phase != .forceStopping {

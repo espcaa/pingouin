@@ -60,7 +60,7 @@ public struct QEMULaunch: Equatable, Sendable {
             // show-cursor=off: no Mac arrow over the VM, the guest draws its own
             // pointer (any desktop). macCursor: the Mac's cursor shows the
             // guest's pointer image instead (pingouin-cocoa-hw-cursor.patch).
-            "-display", "cocoa,gl=on,show-cursor=\(c.macCursor ? "on" : "off"),zoom-to-fit=on,full-grab=on,swap-opt-cmd=off",
+            "-display", "cocoa,gl=on,show-cursor=\(c.macCursor ? "on" : "off"),full-screen=\(c.startFullScreen ? "on" : "off"),zoom-to-fit=on,full-grab=on,swap-opt-cmd=off",
             "-device", "virtio-keyboard-pci,romfile=", "-device", "virtio-tablet-pci,romfile=",
             "-audiodev", "sdl,id=snd", "-device", "intel-hda,romfile=", "-device", "hda-duplex,audiodev=snd",
             "-object", "rng-random,id=rng,filename=/dev/urandom", "-device", "virtio-rng-pci,rng=rng,romfile=",
@@ -93,7 +93,9 @@ public struct QEMULaunch: Equatable, Sendable {
         var env = [RuntimeEnv.productName: "Pingouin",
                    "PINGOUIN_DISPLAY_SOCKET": vm.displaySocket.path,
                    "PINGOUIN_DISPLAYS_CHOICES": vm.displayChoicesURL.path,
-                   "PINGOUIN_DISPLAYS_NOW": vm.displayNowURL.path]
+                   "PINGOUIN_DISPLAYS_NOW": vm.displayNowURL.path,
+                   "PINGOUIN_DISPLAYS_STATE": vm.displayStateURL.path]
+        if let d = c.startDisplay { env["PINGOUIN_START_DISPLAY"] = d }
         if let icon { env[RuntimeEnv.icon] = icon.path }
         if c.fullPanel { env[RuntimeEnv.fullPanel] = "1" }
         if c.isoKeyboard { env[RuntimeEnv.keyboard] = "iso" }

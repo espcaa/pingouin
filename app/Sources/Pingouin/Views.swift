@@ -210,7 +210,7 @@ struct VMDetail: View {
                     .font(.footnote).foregroundStyle(.secondary)
             }
 
-            DisplaysSection(vm: vm)
+            DisplaysSection(vm: $vm)
 
             GuestToolsSection(vm: vm)
 

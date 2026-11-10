@@ -25,11 +25,16 @@ public struct VMConfig: Codable, Equatable, Sendable {
     /// guest). Passwords never go to Linux.
     public var clipboardToLinux: Bool
     public var clipboardToMac: Bool
+    /// The display the VM's window opens on (a display UUID; nil: the built-in one).
+    public var startDisplay: String?
+    /// Go full screen right away, on that display.
+    public var startFullScreen: Bool
 
     public init(name: String, cpus: Int = VMConfig.defaultCPUs, memoryMiB: Int = VMConfig.defaultMemoryMiB,
                 diskGiB: Int = 80, isoKeyboard: Bool = false, fullPanel: Bool = true,
                 sharedFolder: String? = nil, guestUID: Int = 1000, vulkan: Bool = true,
-                macCursor: Bool = false, clipboardToLinux: Bool = true, clipboardToMac: Bool = true) {
+                macCursor: Bool = false, clipboardToLinux: Bool = true, clipboardToMac: Bool = true,
+                startDisplay: String? = nil, startFullScreen: Bool = false) {
         self.name = name
         self.cpus = cpus
         self.memoryMiB = memoryMiB
@@ -42,6 +47,8 @@ public struct VMConfig: Codable, Equatable, Sendable {
         self.macCursor = macCursor
         self.clipboardToLinux = clipboardToLinux
         self.clipboardToMac = clipboardToMac
+        self.startDisplay = startDisplay
+        self.startFullScreen = startFullScreen
     }
 
     /// Settings added later default when an older config.json lacks them.
@@ -59,6 +66,8 @@ public struct VMConfig: Codable, Equatable, Sendable {
         macCursor = try c.decodeIfPresent(Bool.self, forKey: .macCursor) ?? false
         clipboardToLinux = try c.decodeIfPresent(Bool.self, forKey: .clipboardToLinux) ?? true
         clipboardToMac = try c.decodeIfPresent(Bool.self, forKey: .clipboardToMac) ?? true
+        startDisplay = try c.decodeIfPresent(String.self, forKey: .startDisplay)
+        startFullScreen = try c.decodeIfPresent(Bool.self, forKey: .startFullScreen) ?? false
     }
 
     /// All cores but two: QEMU's GPU work (virgl) runs on the Mac side and needs some.
@@ -117,6 +126,9 @@ public struct VM: Sendable {
     /// Displays used or not this run only (the app's switches, ⌃⌥D): {"<UUID>": true|false},
     /// emptied at every start; a display not in it follows displays.json.
     public var displayNowURL: URL { dir.appendingPathComponent("displays-now.json") }
+    /// Written by QEMU while it runs: {"main": "<UUID>", "using": [...]}, the
+    /// display its window is on and the ones it uses.
+    public var displayStateURL: URL { dir.appendingPathComponent("displays-state.json") }
 
     private func socket(_ name: String) -> URL {
         let inDir = dir.appendingPathComponent("\(name).sock")

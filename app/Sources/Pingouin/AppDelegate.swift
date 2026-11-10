@@ -18,20 +18,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
 
-        model.shutDownAll()
-        let deadline = Date().addingTimeInterval(30)
-        waiting = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] t in
-            Task { @MainActor in
-                guard let self else { return }
-                if self.model.running.isEmpty {
-                    t.invalidate()
-                    NSApp.reply(toApplicationShouldTerminate: true)
-                } else if Date() > deadline {
-                    // Linux didn't shut down in 30 s: pull the plug.
-                    self.model.forceStopAll()
-                }
-            }
+        // Quit as soon as the last VM has stopped.
+        model.onAllStopped = { [weak self] in
+            self?.waiting?.invalidate()
+            NSApp.reply(toApplicationShouldTerminate: true)
         }
+        model.shutDownAll()
+        // Linux didn't shut down in 30 s: pull the plug. While AppKit waits
+        // (.terminateLater) its run loop is in the modal panel mode: a timer in
+        // the default mode never fired, and Pingouin never quit.
+        let t = Timer(timeInterval: 30, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.model.forceStopAll() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        waiting = t
         return .terminateLater
     }
 }
