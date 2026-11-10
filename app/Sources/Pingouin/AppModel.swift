@@ -52,11 +52,40 @@ final class AppModel: ObservableObject {
 
     /// VMs started before the permissions were there get their trackpad now.
     private func attachGestures() {
-        for (name, r) in running where r.gestures == nil {
-            guard let vm = vms.first(where: { $0.config.name == name }) else { continue }
-            let g = GesturesBridge(socketPath: vm.gesturesSocket.path, qemuPID: r.process.processIdentifier)
-            g.start()
-            r.gestures = g
+        for r in running.values { r.gestures?.startTrackpadIfAllowed() }
+    }
+
+    // MARK: guest tools
+
+    /// The guest tools this app carries (guest/build.sh writes VERSION).
+    let bundledToolsVersion: String? = GuestTools.locate().flatMap {
+        try? String(contentsOf: $0.appendingPathComponent("VERSION"), encoding: .utf8)
+    }?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    /// The guest tools a VM's pingouind last reported (kept in the VM's folder,
+    /// so a stopped VM still shows it): "" = tools from before versions.
+    @Published var seenTools: [String: String] = [:]
+    /// Running VMs whose pingouind hasn't answered for a while (not installed, or not running).
+    @Published var toolsSilent: Set<String> = []
+
+    enum ToolsStatus: Equatable { case unknown, checking, missing, installed, outdated }
+
+    func toolsStatus(_ vm: VM) -> ToolsStatus {
+        let name = vm.config.name
+        let seen = seenTools[name] ?? GuestToolsRecord.load(vm)
+        if running[name] != nil, seen == nil {
+            return toolsSilent.contains(name) ? .missing : .checking
+        }
+        guard let seen else { return .unknown }
+        return seen == bundledToolsVersion ? .installed : .outdated
+    }
+
+    private func toolsAnswered(_ vm: VM, version: String?) {
+        let v = version ?? ""
+        toolsSilent.remove(vm.config.name)
+        if seenTools[vm.config.name] != v {
+            seenTools[vm.config.name] = v
+            GuestToolsRecord.save(vm, version: v)
         }
     }
 
@@ -111,10 +140,18 @@ final class AppModel: ObservableObject {
             }
             try p.run()
 
-            var gestures: GesturesBridge?
-            if GesturesBridge.hasPermissions {
-                gestures = GesturesBridge(socketPath: vm.gesturesSocket.path, qemuPID: p.processIdentifier)
-                gestures?.start()
+            // Always: it also tells whether the guest tools are there; the
+            // trackpad only goes to the VM with the permissions.
+            let gestures = GesturesBridge(socketPath: vm.gesturesSocket.path, qemuPID: p.processIdentifier)
+            gestures.onTools = { [weak self] v in self?.toolsAnswered(vm, version: v) }
+            gestures.start()
+            seenTools[name] = nil
+            toolsSilent.remove(name)
+            // No answer after 2 minutes of running: say so (it keeps asking).
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(120))
+                guard let self, self.running[name]?.process === p, self.seenTools[name] == nil else { return }
+                self.toolsSilent.insert(name)
             }
             running[name] = RunningVM(process: p, gestures: gestures)
             phases[name] = .running
@@ -173,6 +210,24 @@ final class AppModel: ObservableObject {
             start(vm)
         } else if status != 0 && phase != .forceStopping {
             error = "\(name) stopped with status \(status). See \(vm.logURL.path)"
+        }
+    }
+}
+
+/// The last guest tools a VM reported, in its folder (guest-tools.json).
+enum GuestToolsRecord {
+    static func url(_ vm: VM) -> URL { vm.dir.appendingPathComponent("guest-tools.json") }
+
+    static func load(_ vm: VM) -> String? {
+        guard let d = try? Data(contentsOf: url(vm)),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
+        return o["version"] as? String
+    }
+
+    static func save(_ vm: VM, version: String) {
+        let o: [String: Any] = ["version": version, "seen": ISO8601DateFormatter().string(from: Date())]
+        if let d = try? JSONSerialization.data(withJSONObject: o, options: [.prettyPrinted, .sortedKeys]) {
+            try? d.write(to: url(vm), options: .atomic)
         }
     }
 }

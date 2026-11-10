@@ -6,14 +6,24 @@ import Foundation
 /// Mac trackpad -> the VM: lines from the gestures library go into QEMU's
 /// virtio-serial socket, and pingouind reads them in the guest.
 /// Only one VM can hold the trackpad at a time (the library is global).
+/// The channel is also how the app learns whether the guest tools are there:
+/// it asks ("Q", every 30 s) with or without the permissions, and pingouind
+/// answers "V <version>" then "D -" (versions before that: "D -" only).
 final class GesturesBridge {
     private let socketPath: String
     private let pid: pid_t
     private var fd: Int32 = -1
     private let lock = NSLock()
     private var connectTimer: Timer?
+    private var queryTimer: Timer?
+    private var reader: DispatchSourceRead?
+    private var inbox = Data()
+    private var lastVersion: String?
     private var started = false
     private var hinted = false   // main thread: the ⌃⌥Esc hint, once per run
+    /// Main thread: pingouind answered; its version, nil for tools from
+    /// before versions were reported.
+    var onTools: ((String?) -> Void)?
 
     init(socketPath: String, qemuPID: pid_t) {
         self.socketPath = socketPath
@@ -50,23 +60,75 @@ final class GesturesBridge {
     }
 
     /// Connects once QEMU has made the socket (it does so right at start),
-    /// then starts reading the trackpad.
+    /// asks for the guest tools, and reads the trackpad if it may.
     func start() {
         connectTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] t in
             guard let self else { t.invalidate(); return }
             if self.connect() {
                 t.invalidate()
-                self.startTrackpad()
+                self.listen()
+                self.startTrackpadIfAllowed()
             }
         }
     }
 
+    /// The permissions came (or were there): the trackpad goes to the VM.
+    func startTrackpadIfAllowed() {
+        guard !started, fd >= 0, GesturesBridge.hasPermissions else { return }
+        startTrackpad()
+    }
+
     func stop() {
         connectTimer?.invalidate()
+        queryTimer?.invalidate()
+        reader?.cancel()
+        reader = nil
         if started { pg_stop(); started = false }
         lock.lock()
         if fd >= 0 { close(fd); fd = -1 }
         lock.unlock()
+    }
+
+    /// Main thread: reads pingouind's lines, and asks until it answers (it
+    /// may start long after QEMU), then every 30 s (tools installed meanwhile).
+    private func listen() {
+        let r = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+        r.setEventHandler { [weak self] in self?.readLines() }
+        r.resume()
+        reader = r
+        query()
+        queryTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.query() }
+    }
+
+    private func query() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard fd >= 0 else { return }
+        _ = write(fd, "Q\n", 2)
+    }
+
+    private func readLines() {
+        var buf = [UInt8](repeating: 0, count: 1024)
+        let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+        guard n > 0 else { return }
+        inbox.append(contentsOf: buf[0..<n])
+        while let nl = inbox.firstIndex(of: UInt8(ascii: "\n")) {
+            let line = String(decoding: inbox[inbox.startIndex..<nl], as: UTF8.self)
+            inbox = Data(inbox[(nl + 1)...])
+            if line.hasPrefix("V ") {
+                lastVersion = String(line.dropFirst(2))
+            } else if line == "D -" {
+                onTools?(lastVersion)
+                lastVersion = nil
+                // answered: from now on only now and then
+                if queryTimer?.timeInterval != 30 {
+                    queryTimer?.invalidate()
+                    queryTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                        self?.query()
+                    }
+                }
+            }
+        }
     }
 
     private func connect() -> Bool {

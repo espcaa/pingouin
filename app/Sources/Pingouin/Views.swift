@@ -203,23 +203,7 @@ struct VMDetail: View {
 
             DisplaysSection(vm: vm)
 
-            Section("Guest tools") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(
-                        "Trackpad gestures, ⌘ shortcuts, external displays and the shared folder need Pingouin's tools in Linux. Once, in a terminal inside the VM:"
-                    )
-                    .font(.callout)
-                    HStack {
-                        Text(guestInstallCommand)
-                            .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
-                        Spacer()
-                        Button("Copy") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(guestInstallCommand, forType: .string)
-                        }
-                    }
-                }
-            }
+            GuestToolsSection(vm: vm)
 
             Section {
                 HStack {
