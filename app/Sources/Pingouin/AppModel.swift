@@ -136,6 +136,9 @@ final class AppModel: ObservableObject {
         r.process.terminate()
     }
 
+    func shutDownAll() { for vm in vms where running[vm.config.name] != nil { shutDown(vm) } }
+    func forceStopAll() { for vm in vms where running[vm.config.name] != nil { forceStop(vm) } }
+
     /// Resets the VM at once, like a reset button (no clean shutdown).
     func forceRestart(_ vm: VM) { qmp(vm, "system_reset") }
 
