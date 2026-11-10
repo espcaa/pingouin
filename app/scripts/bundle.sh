@@ -1,12 +1,23 @@
 #!/bin/bash
 # Builds Pingouin.app into dist/: the SwiftPM app, its Info.plist, and the QEMU
 # runtime from runtime/.build (when it's been built), signed.
-#   SIGN_ID="Developer ID Application: ..." scripts/bundle.sh   (default: ad-hoc)
+#   SIGN_ID="Developer ID Application: ..." scripts/bundle.sh   (default: the dev certificate, or ad-hoc)
 set -euo pipefail
 app_dir=$(cd "$(dirname "$0")/.." && pwd)
 root=$(cd "$app_dir/.." && pwd)
 out=$root/dist/Pingouin.app
-sign_id=${SIGN_ID:--}
+# SIGN_ID, else the dev certificate scripts/make-dev-cert.sh made (its name in
+# git config pingouin.devcert; macOS keeps the permissions across rebuilds),
+# else ad-hoc (permissions lost on every rebuild).
+dev_cert=$(git -C "$root" config pingouin.devcert || true)
+if [[ -n ${SIGN_ID:-} ]]; then
+  sign_id=$SIGN_ID
+elif [[ -n $dev_cert ]] && security find-identity -v -p codesigning 2>/dev/null | grep -qF "\"$dev_cert\""; then
+  sign_id=$dev_cert
+else
+  sign_id=-
+  echo "bundle: signing ad-hoc; run scripts/make-dev-cert.sh once to keep permissions across rebuilds" >&2
+fi
 bundle_id=${BUNDLE_ID:-app.pingouin.Pingouin}
 version=${VERSION:-0.1.0}
 
