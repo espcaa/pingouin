@@ -1,0 +1,46 @@
+From: Pingouin
+Subject: [PATCH] ui/cocoa: the window really starts on the Start on display
+
+What: pingouin-start-display.patch made the main window on the app's Start on
+display, but AppKit's -center (right after) put it back on the main display,
+and a full-screen start went full screen there. pingouin_place_main_window
+(the tests' main-display placement, before full screen) now moves the
+window onto PINGOUIN_START_DISPLAY, at its size, in the middle.
+Upstream: Pingouin only.
+---
+diff --color -Naur a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m	2026-11-10 21:44:11
++++ b/ui/cocoa.m	2026-11-10 21:44:11
+@@ -13046,12 +13046,31 @@
+     pingouin_chan_connect();
+ }
+ 
+-/* Test mode: the main window starts on PINGOUIN_TEST_MAIN_DISPLAY. */
++/*
++ * Test mode: the main window starts on PINGOUIN_TEST_MAIN_DISPLAY.
++ * Pingouin: else on the app's Start on display (PINGOUIN_START_DISPLAY,
++ * pingouin_start_screen), at its size, in the middle: the window was made
++ * there, but AppKit's -center put it back on the main display.
++ */
+ static void pingouin_place_main_window(void)
+ {
+     const char *v = getenv("PINGOUIN_TEST_MAIN_DISPLAY");
+     NSScreen *s = v && *v ? pingouin_screen_with_id((CGDirectDisplayID)atoll(v)) : nil;
+ 
++    if (!s && getenv("PINGOUIN_START_DISPLAY")) {
++        NSWindow *w = [cocoaView window];
++        NSScreen *want = pingouin_start_screen();
++        if (w && want && [w screen] != want) {
++            NSRect vf = [want visibleFrame], f = [w frame];
++            f.size.width = MIN(f.size.width, vf.size.width);
++            f.size.height = MIN(f.size.height, vf.size.height);
++            f.origin.x = floor(NSMidX(vf) - f.size.width / 2);
++            f.origin.y = floor(NSMidY(vf) - f.size.height / 2);
++            [w setFrame:f display:YES];
++            info_report("cocoa: the window starts on %s", [[want localizedName] UTF8String]);
++        }
++        return;
++    }
+     if (s) {
+         NSWindow *w = [cocoaView window];
+         NSRect r = NSInsetRect([s visibleFrame], 40, 40);

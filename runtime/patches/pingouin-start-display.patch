@@ -1,0 +1,125 @@
+From: Pingouin
+Subject: [PATCH] ui/cocoa: start on a chosen display, and tell the app where the VM is
+
+What: the main window opens on PINGOUIN_START_DISPLAY (a display UUID, the
+app's "Start on"; with full-screen=on it goes full screen there), else on
+the built-in display, else on the main one. And QEMU writes which display its
+window is on and which ones it uses to PINGOUIN_DISPLAYS_STATE ({"main":
+"<UUID>", "using": [...]}), when that changes: the app's Displays list leaves
+out the window's own display (the built-in one is a choice like any other
+when the VM runs on an external display).
+Upstream: Pingouin only.
+---
+diff --color -Naur a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m	2026-11-10 21:35:08
++++ b/ui/cocoa.m	2026-11-10 21:35:08
+@@ -1119,6 +1119,10 @@
+ static void pingouin_paste_as_typing(void);
+ static bool pingouin_typing_stop(void);
+ static id pingouin_paste_target(void);
++/* Pingouin: the display the VM starts on, and what the app is told (with the displays code). */
++static NSString *pingouin_display_uuid(CGDirectDisplayID id);
++static NSScreen *pingouin_start_screen(void);
++static void pingouin_write_display_state(void);
+ static void pingouin_pointer_init(void);
+ 
+ /*
+@@ -5224,7 +5228,8 @@
+ 
+ static NSRect cocoa_initial_window_frame(void)
+ {
+-    NSScreen *hostScreen = [NSScreen mainScreen];
++    /* Pingouin: on the display the app chose (PINGOUIN_START_DISPLAY) */
++    NSScreen *hostScreen = pingouin_start_screen();
+     if (!hostScreen) {
+         return NSMakeRect(0.0, 0.0, 1280.0, 720.0);
+     }
+@@ -5297,6 +5302,13 @@
+                                                  selector:@selector(pingouinWindowSeen:)
+                                                      name:NSWindowDidChangeOcclusionStateNotification
+                                                    object:window];
++        /* Pingouin: the app shows which display the VM's window is on */
++        [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowDidChangeScreenNotification
++                                                          object:window
++                                                           queue:[NSOperationQueue mainQueue]
++                                                      usingBlock:^(NSNotification *n) {
++            pingouin_write_display_state();
++        }];
+ 
+         /* Used for displaying pause on the screen */
+         pauseLabel = [NSTextField new];
+@@ -10932,6 +10944,66 @@
+     return false;
+ }
+ 
++
++/*
++ * Pingouin: the display the VM's window opens on (and goes full screen on,
++ * with full-screen=on): PINGOUIN_START_DISPLAY, a display UUID from the app's
++ * "Start on". Not connected (or not set): the built-in display, else the
++ * main one.
++ */
++static NSScreen *pingouin_start_screen(void)
++{
++    const char *want = getenv("PINGOUIN_START_DISPLAY");
++    NSScreen *builtin = nil;
++
++    for (NSScreen *s in [NSScreen screens]) {
++        CGDirectDisplayID id = [[[s deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
++        if (want && *want && [pingouin_display_uuid(id) isEqualToString:[NSString stringWithUTF8String:want]]) {
++            return s;
++        }
++        if (!builtin && CGDisplayIsBuiltin(id)) {
++            builtin = s;
++        }
++    }
++    if (want && *want) {
++        info_report("cocoa: the start display isn't connected: %s", builtin ? "the built-in one" : "the main one");
++    }
++    return builtin ?: [NSScreen mainScreen];
++}
++
++/*
++ * Pingouin: tells the app (PINGOUIN_DISPLAYS_STATE, a JSON file it reads)
++ * which display the VM's window is on and which ones it uses, so its Displays
++ * list leaves out the window's own: {"main": "<UUID>", "using": ["<UUID>"...]}.
++ */
++static void pingouin_write_display_state(void)
++{
++    const char *p = getenv("PINGOUIN_DISPLAYS_STATE");
++    NSScreen *ms = [[cocoaView window] screen];
++    NSMutableArray *using = [NSMutableArray array];
++    static NSData *last;
++
++    if (!p || !*p) {
++        return;
++    }
++    for (int i = 1; i < pingouin_outputs; i++) {
++        NSString *u = pingouin_heads[i].display ? pingouin_display_uuid(pingouin_heads[i].display) : nil;
++        if (u) {
++            [using addObject:u];
++        }
++    }
++    NSString *main = ms ? pingouin_display_uuid(pingouin_screen_id(ms)) : nil;
++    NSData *json = [NSJSONSerialization dataWithJSONObject:@{ @"main": main ?: @"", @"using": using }
++                                                   options:NSJSONWritingSortedKeys
++                                                     error:nil];
++    if (!json || [json isEqualToData:last]) {
++        return;
++    }
++    [last release];
++    last = [json retain];
++    [json writeToFile:[NSString stringWithUTF8String:p] atomically:YES];
++}
++
+ static void pingouin_choice_toggle(void)
+ {
+     NSPoint at = [NSEvent mouseLocation];
+@@ -11358,6 +11430,7 @@
+     pingouin_update_mac_layout();
+     pingouin_send_layout();
+     pingouin_full_next();
++    pingouin_write_display_state();
+     return retry;
+ }
+ 

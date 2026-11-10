@@ -13,7 +13,7 @@ libslirp-darwin-icmp-matching.patch          # ICMP (ping) replies matched corre
 libslirp-ipv4-udp-translation.patch          # IPv4 UDP reply address translation fix
 libslirp-nonblocking-datagram-sockets.patch  # non-blocking UDP/ICMP: a send macOS can't take is dropped, VM doesn't freeze
 
-[qemu]   # 108 patches
+[qemu]   # 110 patches
 qemu-texture-borrowing-11.1.patch            # base: Cocoa GL display / virgl texture borrowing (startergo)
 qemu-gpu-spike-resolution-fix.patch          # GL dirty flag cleared after render (CPU spike fix)
 qemu-cocoa-product-identity.patch            # base identity hooks (Dock/app name); later cocoa patches build on it
@@ -122,6 +122,8 @@ pingouin-edid-vendor.patch                     # virtual monitors named after th
 pingouin-paste-as-typing.patch                 # ⌃⌥V types the Mac's clipboard into the VM
 pingouin-notice-style.patch                    # QEMU's notices shaped like the app's (no hard outline)
 pingouin-displays-now.patch                    # a display used this run only (the app's switch), beside its rule
+pingouin-start-display.patch                   # start on a chosen display; tell the app where the VM is
+pingouin-start-display-place.patch             # ...and really move the window there (AppKit's center moved it back)
 
 [virglrenderer]   # 131 patches (OpenGL + Venus/Vulkan on MoltenVK; no video, no KosmicKrisp)
 TAP:virglrenderer-macos-unified.patch                   # tap base: virglrenderer on macOS (CGL)
