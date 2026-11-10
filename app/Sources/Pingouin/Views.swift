@@ -157,13 +157,17 @@ struct VMDetail: View {
         Form {
             Section {
                 NumberRow(title: "CPUs", value: $vm.config.cpus, range: cpuRange)
-                NumberRow(title: "Memory", value: gib($vm.config.memoryMiB), range: memoryGiBRange, unit: "GiB")
+                NumberRow(
+                    title: "Memory", value: gib($vm.config.memoryMiB), range: memoryGiBRange,
+                    unit: "GiB")
                 Toggle("ISO keyboard (§ and < keys)", isOn: $vm.config.isoKeyboard)
                 Toggle("Full screen over the notch", isOn: $vm.config.fullPanel)
                 Toggle("Vulkan (needs Fedora's Mesa 26.2.4 or newer)", isOn: $vm.config.vulkan)
                 Toggle(isOn: $vm.config.macCursor) {
                     Text("Smoother pointer")
-                    Text("macOS draws Linux's pointer. For GNOME and KDE; other desktops may show two pointers.")
+                    Text(
+                        "macOS draws Linux's pointer. For GNOME and KDE; other desktops may show two pointers."
+                    )
                 }
                 LabeledContent("Disk", value: "\(vm.config.diskGiB) GiB (grows as used)")
             }
@@ -185,7 +189,7 @@ struct VMDetail: View {
                 }
                 .disabled(isRunning)
             } footer: {
-                Text("Shows up as ~/Mac inside Linux (after installing the guest tools below).")
+                Text("Shows up as ~/Mac inside Linux.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
 
@@ -194,7 +198,7 @@ struct VMDetail: View {
             Section("Guest tools") {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(
-                        "Trackpad gestures, ⌘ shortcuts and the shared folder need Pingouin's tools in Linux. Once, in a terminal inside the VM:"
+                        "Trackpad gestures, ⌘ shortcuts, external displays and the shared folder need Pingouin's tools in Linux. Once, in a terminal inside the VM:"
                     )
                     .font(.callout)
                     HStack {
@@ -277,9 +281,11 @@ struct NewVMSheet: View {
         Form {
             TextField("Name", text: $config.name)
             NumberRow(title: "CPUs", value: $config.cpus, range: cpuRange)
-            NumberRow(title: "Memory", value: gib($config.memoryMiB), range: memoryGiBRange, unit: "GiB")
-            NumberRow(title: "Disk", value: $config.diskGiB, range: 16...2048, step: 16, unit: "GiB",
-                      slider: false)
+            NumberRow(
+                title: "Memory", value: gib($config.memoryMiB), range: memoryGiBRange, unit: "GiB")
+            NumberRow(
+                title: "Disk", value: $config.diskGiB, range: 16...2048, step: 16, unit: "GiB",
+                slider: false)
             Toggle("ISO keyboard (§ and < keys)", isOn: $config.isoKeyboard)
         }
         .formStyle(.grouped)
@@ -324,9 +330,13 @@ struct NumberRow: View {
         LabeledContent(title) {
             HStack(spacing: 8) {
                 if slider {
-                    Slider(value: Binding(get: { Double(value) }, set: { clamped.wrappedValue = Int($0.rounded()) }),
-                           in: Double(range.lowerBound)...Double(range.upperBound), step: Double(step))
-                        .frame(minWidth: 180)
+                    Slider(
+                        value: Binding(
+                            get: { Double(value) },
+                            set: { clamped.wrappedValue = Int($0.rounded()) }),
+                        in: Double(range.lowerBound)...Double(range.upperBound), step: Double(step)
+                    )
+                    .frame(minWidth: 180)
                 }
                 TextField(title, value: clamped, format: .number)
                     .labelsHidden()
@@ -334,7 +344,9 @@ struct NumberRow: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 60)
                 Stepper(title, value: clamped, in: range, step: step).labelsHidden()
-                if !unit.isEmpty { Text(unit).foregroundStyle(.secondary).frame(width: 28, alignment: .leading) }
+                if !unit.isEmpty {
+                    Text(unit).foregroundStyle(.secondary).frame(width: 28, alignment: .leading)
+                }
             }
         }
     }

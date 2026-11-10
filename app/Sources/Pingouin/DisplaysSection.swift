@@ -7,7 +7,7 @@ import SwiftUI
 @MainActor
 final class DisplayChoices: ObservableObject {
     struct Display: Identifiable {
-        let id: String      // the display's UUID
+        let id: String  // the display's UUID
         let name: String
         let builtin: Bool
     }
@@ -35,29 +35,65 @@ final class DisplayChoices: ObservableObject {
         if let observer { NotificationCenter.default.removeObserver(observer) }
     }
 
+    /// Names of displays seen before, so a remembered one that isn't plugged
+    /// in still shows by name (UUID -> name, for every VM).
+    private static let namesKey = "displayNames"
+    private var names: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: Self.namesKey) as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: Self.namesKey) }
+    }
+
+    /// Choices for displays that aren't connected now.
+    var remembered: [(id: String, name: String, use: Bool)] {
+        let connected = Set(displays.map(\.id))
+        return choices.filter { !connected.contains($0.key) }
+            .map { (id: $0.key, name: names[$0.key] ?? "A display not connected", use: $0.value) }
+            .sorted { $0.name < $1.name }
+    }
+
     func refresh() {
         displays = NSScreen.screens.compactMap { s in
-            guard let n = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
-                  let uuid = CGDisplayCreateUUIDFromDisplayID(n.uint32Value)?.takeRetainedValue()
+            guard
+                let n = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                let uuid = CGDisplayCreateUUIDFromDisplayID(n.uint32Value)?.takeRetainedValue()
             else { return nil }
-            return Display(id: CFUUIDCreateString(nil, uuid) as String, name: s.localizedName,
-                           builtin: CGDisplayIsBuiltin(n.uint32Value) != 0)
+            return Display(
+                id: CFUUIDCreateString(nil, uuid) as String, name: s.localizedName,
+                builtin: CGDisplayIsBuiltin(n.uint32Value) != 0)
         }
+        var n = names
+        for d in displays where n[d.id] != d.name { n[d.id] = d.name }
+        if n != names { names = n }
         loadChoices()
     }
 
     func loadChoices() {
-        let c = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode([String: Bool].self, from: $0) } ?? [:]
+        let c =
+            (try? Data(contentsOf: url)).flatMap {
+                try? JSONDecoder().decode([String: Bool].self, from: $0)
+            } ?? [:]
         if c != choices { choices = c }
     }
 
     func binding(_ d: Display) -> Binding<Bool> {
-        Binding(get: { self.choices[d.id] == true }, set: { on in
-            self.choices[d.id] = on
-            let enc = JSONEncoder()
-            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try? enc.encode(self.choices).write(to: self.url, options: .atomic)
-        })
+        Binding(
+            get: { self.choices[d.id] == true },
+            set: { on in
+                self.choices[d.id] = on
+                self.save()
+            })
+    }
+
+    /// Forgets a display: next time it's there, the VM asks again (the notice).
+    func forget(_ id: String) {
+        choices[id] = nil
+        save()
+    }
+
+    private func save() {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try? enc.encode(choices).write(to: url, options: .atomic)
     }
 }
 
@@ -83,8 +119,38 @@ struct DisplaysSection: View {
         } header: {
             Text("Displays")
         } footer: {
-            Text("In full screen, \(vm.config.name) also uses the displays switched on here (not the one its window is on). ⌃ + ⌥ + D toggles the display under the pointer. Needs the guest tools.")
-                .font(.footnote).foregroundStyle(.secondary)
+            if model.remembered.isEmpty { explanation }
         }
+
+        if !model.remembered.isEmpty {
+            Section {
+                ForEach(model.remembered, id: \.id) { r in
+                    HStack {
+                        Text(r.name)
+                        Text(r.use ? "used" : "not used").foregroundStyle(.secondary)
+                        Spacer()
+                        Button(role: .destructive) {
+                            model.forget(r.id)
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .help(
+                            "Forget \(r.name): \(vm.config.name) asks again next time it's plugged in"
+                        )
+                    }
+                }
+            } header: {
+                Text("Displays remembered")
+            } footer: {
+                explanation
+            }
+        }
+    }
+
+    private var explanation: some View {
+        Text(
+            "Forget a remembered display and it will ask again next time."
+        )
+        .font(.footnote).foregroundStyle(.secondary)
     }
 }
