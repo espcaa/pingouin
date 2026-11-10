@@ -1,0 +1,120 @@
+From: Pingouin
+Subject: [PATCH] virtio-gpu, ui/cocoa: the virtual monitor carries the Mac display's maker
+
+What: QemuUIInfo gets the display's maker (vendor, an EDID PNP ID), and
+virtio-gpu puts it in the output's EDID instead of QEMU's "RHT". cocoa fills
+it from CGDisplayVendorNumber for the main window and every extra display.
+Linux desktops name a monitor by maker and size: GNOME showed "Red Hat, Inc.
+16"" for every screen; now the MacBook's is "Apple" and an LG's "LG". The
+size stays the made-up one that keeps the guest's scale (110 points per inch).
+A different maker is a different monitor to the guest: it may ask to arrange
+or scale it again once.
+Upstream: maybe (a UI's display maker in the EDID is generic).
+---
+diff --color -Naur a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
+--- a/hw/display/virtio-gpu-base.c	2026-11-10 12:23:53
++++ b/hw/display/virtio-gpu-base.c	2026-11-10 12:23:53
+@@ -66,7 +66,14 @@
+         .prefy = g->req_state[scanout].height,
+         .refresh_rate = g->req_state[scanout].refresh_rate,
+     };
++    const char *v = g->req_state[scanout].vendor;
+ 
++    /* The UI's display maker: three capitals, else QEMU's ("RHT"). */
++    if (v[0] >= 'A' && v[0] <= 'Z' && v[1] >= 'A' && v[1] <= 'Z' &&
++        v[2] >= 'A' && v[2] <= 'Z' && !v[3]) {
++        info.vendor = v;
++    }
++
+     for (output_idx = 0, node = g->conf.outputs;
+          output_idx <= scanout && node; output_idx++, node = node->next) {
+         if (output_idx == scanout && node->value->name) {
+@@ -113,6 +120,8 @@
+     g->req_state[idx].height = info->height;
+     g->req_state[idx].width_mm = info->width_mm;
+     g->req_state[idx].height_mm = info->height_mm;
++    memcpy(g->req_state[idx].vendor, info->vendor, sizeof(g->req_state[idx].vendor));
++    g->req_state[idx].vendor[sizeof(g->req_state[idx].vendor) - 1] = 0;
+ 
+     if (info->width && info->height) {
+         g->enabled_output_bitmask |= (1 << idx);
+diff --color -Naur a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+--- a/include/hw/virtio/virtio-gpu.h	2026-11-10 12:23:53
++++ b/include/hw/virtio/virtio-gpu.h	2026-11-10 12:23:53
+@@ -88,6 +88,7 @@
+     uint32_t width, height;
+     uint32_t refresh_rate;
+     int x, y;
++    char vendor[4];   /* QemuUIInfo.vendor */
+ };
+ 
+ enum virtio_gpu_base_conf_flags {
+diff --color -Naur a/include/ui/console.h b/include/ui/console.h
+--- a/include/ui/console.h	2026-11-10 12:23:53
++++ b/include/ui/console.h	2026-11-10 12:23:53
+@@ -122,6 +122,8 @@
+     uint32_t  width;
+     uint32_t  height;
+     uint32_t  refresh_rate;
++    /* the display's maker (EDID PNP ID, 3 capitals); "": QEMU's own */
++    char      vendor[4];
+ } QemuUIInfo;
+ 
+ /* cursor data format is 32bit RGBA */
+diff --color -Naur a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m	2026-11-10 12:23:53
++++ b/ui/cocoa.m	2026-11-10 12:23:53
+@@ -249,6 +249,29 @@
+                             DisplaySurface *new_surface);
+ 
+ static void cocoa_gl_render(void);
++
++/*
++ * Pingouin: a Mac display's maker as an EDID PNP ID ("APP", "GSM"...), for the
++ * guest's virtual monitor: Linux names a monitor by its maker and size, and
++ * every QEMU monitor said "Red Hat, Inc.". "" when macOS doesn't know it.
++ */
++static void pingouin_edid_vendor(CGDirectDisplayID id, char out[4])
++{
++    uint32_t v = CGDisplayVendorNumber(id);
++    char c[3] = { '@' + ((v >> 10) & 0x1f), '@' + ((v >> 5) & 0x1f), '@' + (v & 0x1f) };
++
++    out[0] = 0;
++    if (v == 0 || v > 0xffff) {   /* 0, or kDisplayVendorIDUnknown ('unkn') */
++        return;
++    }
++    for (int i = 0; i < 3; i++) {
++        if (c[i] < 'A' || c[i] > 'Z') {
++            return;
++        }
++    }
++    memcpy(out, c, 3);
++    out[3] = 0;
++}
+ /* Pingouin boot splash: the main view's size in pixels (BQL). */
+ static void pingouin_splash_view_size(uint32_t w, uint32_t h);
+ /* GL frames are shown as IOSurfaces (the view's layer is a plain CALayer). */
+@@ -1907,6 +1930,7 @@
+ 
+ - (void) updateUIInfoLocked
+ {
++    /* (Pingouin: info.vendor below is the display's maker, pingouin_edid_vendor.) */
+     /* Must be called with the BQL, i.e. via updateUIInfo */
+     NSSize frameSize;
+     QemuUIInfo info = { 0 };
+@@ -1921,6 +1945,7 @@
+         NSDictionary *description = [[[self window] screen] deviceDescription];
+         CGDirectDisplayID display = [[description objectForKey:@"NSScreenNumber"] unsignedIntValue];
+         bool isFullscreen = ([[self window] styleMask] & NSWindowStyleMaskFullScreen) != 0;
++        pingouin_edid_vendor(display, info.vendor);
+         CVDisplayLinkRef displayLink;
+         uint32_t refreshRate = 0;
+ 
+@@ -10397,6 +10422,7 @@
+         }
+         PingouinBox b = pingouin_head_box(hd, s);
+         CGFloat k = [s backingScaleFactor];
++        pingouin_edid_vendor(hd->display, info->vendor);
+         CVDisplayLinkRef link;
+         uint32_t div = k > 1.75 ? 2 : k > 1.25 ? 3 : 1;
+ 

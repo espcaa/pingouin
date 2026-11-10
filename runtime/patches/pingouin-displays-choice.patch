@@ -1,0 +1,341 @@
+From: Pingouin
+Subject: [PATCH] ui/cocoa: the user picks the displays the VM uses (⌃⌥D), remembered
+
+What: in full screen, upstream gave every other Mac display a window of its
+own (pingouin-cocoa-displays.patch). Now only displays chosen for the VM do.
+The choice is remembered per display (its UUID) in a JSON file the app edits
+too (PINGOUIN_DISPLAYS_CHOICES: {"<UUID>": true|false}; changes are picked up
+live). A display with no choice yet gets a notice once a run ("X connected.
+Press ⌃ + ⌥ + D to use it for <vm>."); one chosen yes is used at once, with a
+notice. ⌃⌥D on a display in use stops using it (remembered no); anywhere else
+it uses the next display not in use (the one under the pointer first).
+The notices take no click and no focus: the pointer goes through to the VM.
+Why: the user decides when the VM takes a second screen; a choice made once
+holds, whether the display is plugged in before or after the VM starts.
+Upstream: Pingouin only.
+---
+diff --color -Naur a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m	2026-11-10 11:39:47
++++ b/ui/cocoa.m	2026-11-10 11:39:47
+@@ -1090,6 +1090,8 @@
+ static bool pingouin_is_head_console(unsigned int index);
+ static bool pingouin_test_mode(void);
+ static void pingouin_displays_update(void);
++/* Pingouin: ⌃⌥D, which displays the VM uses (the code is with pingouin_displays_apply). */
++static void pingouin_choice_toggle(void);
+ static void pingouin_pointer_init(void);
+ 
+ /*
+@@ -2504,6 +2506,16 @@
+                 }
+                 return true;
+             }
++            /* Pingouin: ⌃⌥D in full screen adds or removes a display (pingouin_choice_toggle). */
++            if ([event keyCode] == kVK_ANSI_D && (modifiers & NSEventModifierFlagControl) &&
++                (modifiers & NSEventModifierFlagOption) &&
++                !(modifiers & (NSEventModifierFlagCommand | NSEventModifierFlagShift)) &&
++                pingouin_window_full_screen([self window])) {
++                if (![event isARepeat]) {
++                    dispatch_async(dispatch_get_main_queue(), ^{ pingouin_choice_toggle(); });
++                }
++                return true;
++            }
+             keycode = cocoa_keycode_to_linux([event keyCode]);
+ 
+             // Keep Command chords with the host unless the focused guest
+@@ -10603,6 +10615,277 @@
+ }
+ 
+ /*
++ * Pingouin: which Mac displays the VM uses, remembered per display. The
++ * choices are a JSON file the app edits too, {"<display UUID>": true|false},
++ * at PINGOUIN_DISPLAYS_CHOICES (without it: for this run only). Only a display
++ * chosen yes gets a window. One with no choice yet gets a notice, once a run,
++ * when it is there in full screen: ⌃⌥D adds it (and remembers yes). ⌃⌥D on a
++ * display in use stops using it (remembers no); on the main window's display
++ * it adds the next display not in use. Main thread.
++ */
++static NSDictionary *pingouin_choices;
++static NSMutableSet *pingouin_choice_told;   /* UUIDs: the "connected" notice this run */
++static NSMutableSet *pingouin_choice_using;  /* UUIDs: the "using" notice this run */
++static NSPanel *pingouin_notice_panel;
++
++static NSString *pingouin_display_uuid(CGDirectDisplayID id)
++{
++    CFUUIDRef u = CGDisplayCreateUUIDFromDisplayID(id);
++    if (!u) {
++        return nil;
++    }
++    NSString *s = (NSString *)CFUUIDCreateString(NULL, u);
++    CFRelease(u);
++    return [s autorelease];
++}
++
++static NSString *pingouin_vm_name(void)
++{
++    return qemu_name && *qemu_name ? [NSString stringWithUTF8String:qemu_name] : @"the VM";
++}
++
++static void pingouin_choices_load(void)
++{
++    const char *p = getenv("PINGOUIN_DISPLAYS_CHOICES");
++    NSDictionary *d = nil;
++
++    if (p && *p) {
++        NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:p]];
++        id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
++        if ([obj isKindOfClass:[NSDictionary class]]) {
++            d = obj;
++        }
++    }
++    [pingouin_choices release];
++    pingouin_choices = [(d ? d : @{}) copy];
++}
++
++/* 1: use it, 0: don't, -1: not chosen yet. */
++static int pingouin_choice(NSString *uuid)
++{
++    id v = uuid ? pingouin_choices[uuid] : nil;
++    return [v isKindOfClass:[NSNumber class]] ? [v boolValue] : -1;
++}
++
++static void pingouin_choice_set(NSString *uuid, bool use)
++{
++    const char *p = getenv("PINGOUIN_DISPLAYS_CHOICES");
++    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:pingouin_choices];
++
++    if (!uuid) {
++        return;
++    }
++    d[uuid] = @(use);
++    [pingouin_choices release];
++    pingouin_choices = [d copy];
++    if (p && *p) {
++        NSData *json = [NSJSONSerialization dataWithJSONObject:d
++                                                       options:NSJSONWritingPrettyPrinted |
++                                                               NSJSONWritingSortedKeys
++                                                         error:nil];
++        [json writeToFile:[NSString stringWithUTF8String:p] atomically:YES];
++    }
++}
++
++/* The app changed the file (its Displays switches): look again. */
++static void pingouin_choices_watch(void)
++{
++    const char *p = getenv("PINGOUIN_DISPLAYS_CHOICES");
++    static dispatch_source_t src;
++
++    pingouin_choices_load();
++    pingouin_choice_told = [[NSMutableSet alloc] init];
++    pingouin_choice_using = [[NSMutableSet alloc] init];
++    if (!p || !*p || src) {
++        return;
++    }
++    /* The folder: the app replaces the file (an atomic write is a rename). */
++    NSString *dir = [[NSString stringWithUTF8String:p] stringByDeletingLastPathComponent];
++    int fd = open([dir fileSystemRepresentation], O_EVTONLY);
++    if (fd < 0) {
++        return;
++    }
++    src = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE, fd, DISPATCH_VNODE_WRITE,
++                                 dispatch_get_main_queue());
++    dispatch_source_set_event_handler(src, ^{
++        NSDictionary *old = [pingouin_choices retain];
++        pingouin_choices_load();
++        if (![old isEqual:pingouin_choices]) {
++            info_report("cocoa: displays: the choices changed");
++            pingouin_displays_update();
++        }
++        [old release];
++    });
++    dispatch_source_set_cancel_handler(src, ^{ close(fd); });
++    dispatch_resume(src);
++}
++
++/*
++ * A notice at the top of a display, like the app's: it takes no click and no
++ * focus (the pointer goes through to the VM), on every Space, over full screen.
++ */
++static void pingouin_notice(NSScreen *screen, NSString *text, double seconds)
++{
++    NSTextField *label = [NSTextField labelWithString:text];
++    NSPanel *p;
++
++    if (!screen) {
++        screen = [[cocoaView window] screen] ?: [NSScreen mainScreen];
++    }
++    [pingouin_notice_panel orderOut:nil];
++    [pingouin_notice_panel release];
++    pingouin_notice_panel = nil;
++
++    [label setFont:[NSFont systemFontOfSize:15]];
++    [label setTextColor:[NSColor whiteColor]];
++    [label sizeToFit];
++    NSSize ls = [label frame].size;
++    NSSize sz = NSMakeSize(ceil(ls.width) + 40, ceil(ls.height) + 24);
++    NSRect f = [screen frame];
++    NSRect r = NSMakeRect(floor(NSMidX(f) - sz.width / 2), NSMaxY(f) - sz.height - 60,
++                          sz.width, sz.height);
++    p = [[NSPanel alloc] initWithContentRect:r
++                                   styleMask:NSWindowStyleMaskBorderless |
++                                             NSWindowStyleMaskNonactivatingPanel
++                                     backing:NSBackingStoreBuffered
++                                       defer:NO];
++    NSVisualEffectView *v = [[[NSVisualEffectView alloc]
++                              initWithFrame:NSMakeRect(0, 0, sz.width, sz.height)] autorelease];
++    [v setMaterial:NSVisualEffectMaterialHUDWindow];
++    [v setState:NSVisualEffectStateActive];
++    [v setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameVibrantDark]];
++    [v setWantsLayer:YES];
++    [[v layer] setCornerRadius:sz.height / 2];
++    [[v layer] setMasksToBounds:YES];
++    [label setFrame:NSMakeRect(20, 12, ceil(ls.width), ceil(ls.height))];
++    [v addSubview:label];
++    [p setContentView:v];
++    [p setOpaque:NO];
++    [p setBackgroundColor:[NSColor clearColor]];
++    [p setHasShadow:YES];
++    [p setLevel:NSStatusWindowLevel];
++    [p setIgnoresMouseEvents:YES];
++    [p setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces |
++                             NSWindowCollectionBehaviorFullScreenAuxiliary |
++                             NSWindowCollectionBehaviorTransient |
++                             NSWindowCollectionBehaviorIgnoresCycle];
++    [p orderFrontRegardless];
++    pingouin_notice_panel = p;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++        if (pingouin_notice_panel == p) {
++            [p orderOut:nil];
++            [p release];
++            pingouin_notice_panel = nil;
++        }
++    });
++}
++
++static NSString *pingouin_screen_name(NSScreen *s)
++{
++    NSString *n = [s localizedName];
++    return [n length] ? n : @"The display";
++}
++
++static bool pingouin_display_in_use(CGDirectDisplayID id)
++{
++    for (int i = 1; i < pingouin_outputs; i++) {
++        if (pingouin_heads[i].display == id) {
++            return true;
++        }
++    }
++    return false;
++}
++
++/*
++ * From pingouin_displays_apply, for a settled display other than the main
++ * window's: does it get a window? Tells the user about a new one, once a run.
++ */
++static bool pingouin_choice_allows(NSScreen *s)
++{
++    NSString *uuid = pingouin_display_uuid(pingouin_screen_id(s));
++    int c = pingouin_choice(uuid);
++
++    if (c == 1) {
++        if (uuid && ![pingouin_choice_using containsObject:uuid] &&
++            !pingouin_display_in_use(pingouin_screen_id(s))) {
++            [pingouin_choice_using addObject:uuid];
++            pingouin_notice(s, [NSString stringWithFormat:
++                                @"%@ is using %@. Press ⌃ + ⌥ + D on this screen to stop.",
++                                pingouin_vm_name(), pingouin_screen_name(s)], 8);
++        }
++        return true;
++    }
++    if (c < 0 && uuid && ![pingouin_choice_told containsObject:uuid]) {
++        [pingouin_choice_told addObject:uuid];
++        info_report("cocoa: displays: %s has no choice yet: notice", [pingouin_screen_name(s) UTF8String]);
++        pingouin_notice(nil, [NSString stringWithFormat:
++                              @"%@ connected. Press ⌃ + ⌥ + D to use it for %@.",
++                              pingouin_screen_name(s), pingouin_vm_name()], 20);
++    }
++    return false;
++}
++
++static void pingouin_choice_toggle(void)
++{
++    NSPoint at = [NSEvent mouseLocation];
++    NSScreen *ms = [[cocoaView window] screen], *here = nil;
++    CGDirectDisplayID main_id = ms ? pingouin_screen_id(ms) : 0;
++
++    if (pingouin_outputs < 2) {
++        pingouin_notice(nil, @"This VM has one screen.", 5);
++        return;
++    }
++    if (!pingouin_guest_ready) {
++        pingouin_notice(nil, [NSString stringWithFormat:
++                              @"More screens need Pingouin's guest tools in %@.",
++                              pingouin_vm_name()], 8);
++        return;
++    }
++    for (NSScreen *s in [NSScreen screens]) {
++        if (NSPointInRect(at, [s frame])) {
++            here = s;
++        }
++    }
++    /* On a display in use: stop using it. */
++    if (here && pingouin_screen_id(here) != main_id &&
++        pingouin_display_in_use(pingouin_screen_id(here))) {
++        NSString *uuid = pingouin_display_uuid(pingouin_screen_id(here));
++        pingouin_choice_set(uuid, false);
++        info_report("cocoa: displays: ⌃⌥D: stop using %s", [pingouin_screen_name(here) UTF8String]);
++        pingouin_notice(ms, [NSString stringWithFormat:
++                             @"%@ stopped using %@. Press ⌃ + ⌥ + D to use it again.",
++                             pingouin_vm_name(), pingouin_screen_name(here)], 6);
++        pingouin_displays_update();
++        return;
++    }
++    /* Elsewhere: use the next display not in use (the one under the pointer first). */
++    NSMutableArray *order = [NSMutableArray array];
++    if (here) {
++        [order addObject:here];
++    }
++    [order addObjectsFromArray:[NSScreen screens]];
++    for (NSScreen *s in order) {
++        CGDirectDisplayID id = pingouin_screen_id(s);
++        if (id == main_id || pingouin_display_in_use(id)) {
++            continue;
++        }
++        NSString *uuid = pingouin_display_uuid(id);
++        pingouin_choice_set(uuid, true);
++        if (uuid) {
++            [pingouin_choice_using addObject:uuid];
++        }
++        info_report("cocoa: displays: ⌃⌥D: use %s", [pingouin_screen_name(s) UTF8String]);
++        pingouin_notice(s, [NSString stringWithFormat:
++                            @"%@ is using %@. Press ⌃ + ⌥ + D on this screen to stop.",
++                            pingouin_vm_name(), pingouin_screen_name(s)], 8);
++        pingouin_displays_update();
++        return;
++    }
++    pingouin_notice(nil, @"No other display to add.", 5);
++}
++
++/*
+  * Which Mac displays get a window: in full screen, with the guest's consent,
+  * every display but the main window's. Outputs keep their display while it
+  * stays; new displays take the lowest free output, left to right.
+@@ -10645,7 +10928,8 @@
+             if (left > 0) {
+                 /* Not settled yet: no window for it until then. */
+                 retry = retry > 0 ? MIN(retry, left) : left;
+-            } else if (left == 0) {
++            } else if (left == 0 && pingouin_choice_allows(s)) {
++                /* Pingouin: only displays the user chose for the VM. */
+                 [screens addObject:s];
+             }
+         }
+@@ -12276,6 +12560,7 @@
+ #endif
+     pingouin_head_delegate = [[PingouinHeadDelegate alloc] init];
+     pingouin_ds_watch_lock();
++    pingouin_choices_watch();
+     /* Another Space: the detached cursor must move there (see pingouin_guard_corners). */
+     [[[NSWorkspace sharedWorkspace] notificationCenter]
+         addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification
