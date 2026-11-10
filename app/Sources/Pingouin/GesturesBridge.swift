@@ -1,3 +1,5 @@
+import AppKit
+import ApplicationServices
 import CPingouinGestures
 import Foundation
 
@@ -17,12 +19,26 @@ final class GesturesBridge {
         self.pid = qemuPID
     }
 
-    static var hasPermissions: Bool {
-        let need = Int32(PG_PERM_ACCESSIBILITY | PG_PERM_INPUT_MONITORING)
-        return pg_permissions() & need == need
+    static var hasAccessibility: Bool { pg_permissions() & Int32(PG_PERM_ACCESSIBILITY) != 0 }
+    static var hasInputMonitoring: Bool { pg_permissions() & Int32(PG_PERM_INPUT_MONITORING) != 0 }
+    static var hasPermissions: Bool { hasAccessibility && hasInputMonitoring }
+
+    /// macOS's prompt (shown once per app), then the Settings pane: after a
+    /// first "Deny", or a rebuild with a new signature, only the pane works.
+    static func requestAccessibility() {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        if !AXIsProcessTrustedWithOptions(opts) { openSettings("Privacy_Accessibility") }
     }
 
-    static func requestPermissions() { pg_request_permissions() }
+    static func requestInputMonitoring() {
+        if !CGRequestListenEventAccess() { openSettings("Privacy_ListenEvent") }
+    }
+
+    private static func openSettings(_ pane: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") {
+            NSWorkspace.shared.open(url)
+        }
+    }
 
     /// Connects once QEMU has made the socket (it does so right at start),
     /// then starts reading the trackpad.

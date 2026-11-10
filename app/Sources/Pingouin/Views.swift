@@ -35,8 +35,15 @@ struct ContentView: View {
                     }
                 }
             }
-            .toolbar {
-                Button { creating = true } label: { Label("New VM", systemImage: "plus") }
+            .safeAreaInset(edge: .bottom) {
+                Button { creating = true } label: {
+                    Label("New VM", systemImage: "plus.circle")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
             }
         } detail: {
             VStack(spacing: 0) {
@@ -45,7 +52,7 @@ struct ContentView: View {
                     VMDetail(vm: vm).id(name)
                 } else {
                     ContentUnavailableView("No VM selected", systemImage: "macwindow",
-                                           description: Text("Make one with + and boot a Linux installer ISO."))
+                                           description: Text("Make one with New VM, then boot a Linux installer ISO."))
                 }
             }
         }
@@ -59,17 +66,38 @@ struct ContentView: View {
     }
 }
 
+/// One row per permission still missing; each goes away once it's allowed.
 struct PermissionBanner: View {
+    @EnvironmentObject var model: AppModel
+
     var body: some View {
-        HStack {
-            Image(systemName: "hand.raised")
-            Text("Trackpad gestures and ⌘ shortcuts in the VM need Accessibility and Input Monitoring.")
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Trackpad gestures and ⌘ shortcuts in the VM need two permissions:")
                 .font(.callout)
-            Spacer()
-            Button("Allow…") { GesturesBridge.requestPermissions() }
+            if !model.hasAccessibility {
+                row("Accessibility", "lets Pingouin pass ⌘ shortcuts and gestures to the VM",
+                    GesturesBridge.requestAccessibility)
+            }
+            if !model.hasInputMonitoring {
+                row("Input Monitoring", "lets Pingouin read the trackpad's fingers",
+                    GesturesBridge.requestInputMonitoring)
+            }
+            Text("Already on in System Settings? Remove Pingouin from that list with − and allow it again (a new build has a new signature).")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(.yellow.opacity(0.15))
+    }
+
+    private func row(_ name: String, _ why: String, _ allow: @escaping () -> Void) -> some View {
+        HStack {
+            Image(systemName: "hand.raised")
+            Text(name).bold() + Text(": \(why)")
+            Spacer()
+            Button("Allow \(name)…", action: allow)
+        }
+        .font(.callout)
     }
 }
 

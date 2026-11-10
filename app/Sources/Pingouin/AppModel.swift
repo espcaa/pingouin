@@ -7,7 +7,7 @@ import PingouinCore
 /// Pingouin.app's Accessibility grant) plus its gestures bridge.
 final class RunningVM {
     let process: Process
-    let gestures: GesturesBridge?
+    var gestures: GesturesBridge?
 
     init(process: Process, gestures: GesturesBridge?) {
         self.process = process
@@ -20,15 +20,39 @@ final class AppModel: ObservableObject {
     @Published var vms: [VM] = []
     @Published var running: [String: RunningVM] = [:]
     @Published var error: String?
-    @Published var hasGesturePermissions = GesturesBridge.hasPermissions
+    @Published var hasAccessibility = GesturesBridge.hasAccessibility
+    @Published var hasInputMonitoring = GesturesBridge.hasInputMonitoring
+    var hasGesturePermissions: Bool { hasAccessibility && hasInputMonitoring }
 
     let store = VMStore.default
+    private var permissionTimer: Timer?
 
-    init() { reload() }
+    init() {
+        reload()
+        // System Settings doesn't tell us when a switch flips: look every second.
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshPermissions() }
+        }
+    }
 
     func reload() { vms = store.list() }
 
-    func refreshPermissions() { hasGesturePermissions = GesturesBridge.hasPermissions }
+    func refreshPermissions() {
+        let a = GesturesBridge.hasAccessibility, i = GesturesBridge.hasInputMonitoring
+        if a != hasAccessibility { hasAccessibility = a }
+        if i != hasInputMonitoring { hasInputMonitoring = i }
+        if a && i { attachGestures() }
+    }
+
+    /// VMs started before the permissions were there get their trackpad now.
+    private func attachGestures() {
+        for (name, r) in running where r.gestures == nil {
+            guard let vm = vms.first(where: { $0.config.name == name }) else { continue }
+            let g = GesturesBridge(socketPath: vm.gesturesSocket.path, qemuPID: r.process.processIdentifier)
+            g.start()
+            r.gestures = g
+        }
+    }
 
     /// Is the Mac's keyboard an ISO one (French, UK, German...)?
     static var macHasISOKeyboard: Bool {
