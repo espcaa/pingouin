@@ -15,6 +15,8 @@ public let gesturesPortName = "org.pingouin.gestures"
 /// The display channel's port: pingouind displays says where the guest put
 /// its screens (pingouin-cocoa-displays.patch).
 public let displayPortName = "app.pingouin.display"
+/// The clipboard channel's port (pingouind clipboard).
+public let clipboardPortName = "app.pingouin.clipboard"
 /// Screens a VM can have: the main window plus one per chosen Mac display.
 public let maxOutputs = 4
 
@@ -70,6 +72,8 @@ public struct QEMULaunch: Equatable, Sendable {
             "-device", "virtserialport,bus=vser.0,chardev=gestures,name=\(gesturesPortName)",
             "-chardev", "socket,id=display,path=\(file(vm.displaySocket)),server=on,wait=off",
             "-device", "virtserialport,bus=vser.0,chardev=display,name=\(displayPortName)",
+            "-chardev", "socket,id=clipboard,path=\(file(vm.clipboardSocket)),server=on,wait=off",
+            "-device", "virtserialport,bus=vser.0,chardev=clipboard,name=\(clipboardPortName)",
             "-serial", "file:\(vm.dir.appendingPathComponent("serial.log").path)",
             "-qmp", "unix:\(file(vm.controlSocket)),server=on,wait=off",
         ]

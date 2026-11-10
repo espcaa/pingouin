@@ -21,11 +21,15 @@ public struct VMConfig: Codable, Equatable, Sendable {
     /// smoother, but only for desktops that use virtio-gpu's cursor plane
     /// (GNOME, KDE). Off: the guest draws it, which works everywhere.
     public var macCursor: Bool
+    /// Clipboard sharing, each way on its own (pingouind clipboard in the
+    /// guest). Passwords never go to Linux.
+    public var clipboardToLinux: Bool
+    public var clipboardToMac: Bool
 
     public init(name: String, cpus: Int = VMConfig.defaultCPUs, memoryMiB: Int = VMConfig.defaultMemoryMiB,
                 diskGiB: Int = 80, isoKeyboard: Bool = false, fullPanel: Bool = true,
                 sharedFolder: String? = nil, guestUID: Int = 1000, vulkan: Bool = true,
-                macCursor: Bool = false) {
+                macCursor: Bool = false, clipboardToLinux: Bool = true, clipboardToMac: Bool = true) {
         self.name = name
         self.cpus = cpus
         self.memoryMiB = memoryMiB
@@ -36,6 +40,8 @@ public struct VMConfig: Codable, Equatable, Sendable {
         self.guestUID = guestUID
         self.vulkan = vulkan
         self.macCursor = macCursor
+        self.clipboardToLinux = clipboardToLinux
+        self.clipboardToMac = clipboardToMac
     }
 
     /// Settings added later default when an older config.json lacks them.
@@ -51,6 +57,8 @@ public struct VMConfig: Codable, Equatable, Sendable {
         guestUID = try c.decodeIfPresent(Int.self, forKey: .guestUID) ?? 1000
         vulkan = try c.decodeIfPresent(Bool.self, forKey: .vulkan) ?? true
         macCursor = try c.decodeIfPresent(Bool.self, forKey: .macCursor) ?? false
+        clipboardToLinux = try c.decodeIfPresent(Bool.self, forKey: .clipboardToLinux) ?? true
+        clipboardToMac = try c.decodeIfPresent(Bool.self, forKey: .clipboardToMac) ?? true
     }
 
     /// All cores but two: QEMU's GPU work (virgl) runs on the Mac side and needs some.
@@ -101,6 +109,8 @@ public struct VM: Sendable {
     public var controlSocket: URL { socket("qmp") }
     /// The display channel (pingouind displays in the guest; QEMU's window connects).
     public var displaySocket: URL { socket("display") }
+    /// The clipboard channel (pingouind clipboard in the guest; the app connects).
+    public var clipboardSocket: URL { socket("clipboard") }
     /// Which Mac displays this VM uses: {"<display UUID>": true|false}, edited
     /// by the app and by QEMU (⌃⌥D, pingouin-displays-choice.patch).
     public var displayChoicesURL: URL { dir.appendingPathComponent("displays.json") }

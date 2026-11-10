@@ -175,6 +175,12 @@ struct VMDetail: View {
             .onChange(of: vm.config) { model.save(vm) }
 
             Section {
+                // live: they can change while the VM runs (need the guest tools)
+                Toggle(isOn: $vm.config.clipboardToLinux) {
+                    Text("Clipboard: Mac → Linux")
+                    Text("What you copy on the Mac can be pasted in Linux. Passwords never are.")
+                }
+                Toggle("Clipboard: Linux → Mac", isOn: $vm.config.clipboardToMac)
                 LabeledContent("Shared folder") {
                     HStack {
                         if let f = vm.config.sharedFolder {

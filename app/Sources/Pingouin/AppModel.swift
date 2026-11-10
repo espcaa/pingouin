@@ -10,6 +10,7 @@ final class RunningVM {
 
     let process: Process
     var gestures: GesturesBridge?
+    var clipboard: ClipboardBridge?
     var phase = Phase.running
 
     init(process: Process, gestures: GesturesBridge?) {
@@ -124,6 +125,7 @@ final class AppModel: ObservableObject {
             try? FileManager.default.removeItem(at: vm.gesturesSocket)
             try? FileManager.default.removeItem(at: vm.controlSocket)
             try? FileManager.default.removeItem(at: vm.displaySocket)
+            try? FileManager.default.removeItem(at: vm.clipboardSocket)
             FileManager.default.createFile(atPath: vm.logURL.path, contents: Data((launch.shellLine + "\n\n").utf8))
             let log = try FileHandle(forWritingTo: vm.logURL)
             log.seekToEndOfFile()
@@ -154,6 +156,13 @@ final class AppModel: ObservableObject {
                 self.toolsSilent.insert(name)
             }
             running[name] = RunningVM(process: p, gestures: gestures)
+            // The clipboard: its mode is read live (it can change while running).
+            let clipboard = ClipboardBridge(socketPath: vm.clipboardSocket.path) { [weak self] in
+                let c = self?.vms.first(where: { $0.config.name == name })?.config
+                return (c?.clipboardToLinux ?? false, c?.clipboardToMac ?? false)
+            }
+            clipboard.start()
+            running[name]?.clipboard = clipboard
             phases[name] = .running
         } catch {
             self.error = "\(error)"
@@ -203,6 +212,7 @@ final class AppModel: ObservableObject {
     private func stopped(_ name: String, status: Int32) {
         let phase = running[name]?.phase
         running[name]?.gestures?.stop()
+        running[name]?.clipboard?.stop()
         running[name] = nil
         phases[name] = nil
         guard let vm = vms.first(where: { $0.config.name == name }) else { return }
