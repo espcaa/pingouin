@@ -5,7 +5,8 @@
 #   sudo bash install.sh --uninstall  remove everything this added
 #
 # Pingouin shows this folder to every VM:
-#   sudo mount -t 9p -o trans=virtio,ro pingouin-tools /mnt && sudo bash /mnt/install.sh; sudo umount /mnt
+#   sudo mkdir -p /mnt && sudo mount -t 9p -o trans=virtio,ro pingouin-tools /mnt && sudo bash /mnt/install.sh; sudo umount /mnt
+#   (mkdir: NixOS has no /mnt)
 #
 # What it sets up (nothing to download, no package manager):
 #   - pingouind, a system service: Mac trackpad gestures and ⌘ shortcuts

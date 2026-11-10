@@ -19,6 +19,15 @@ in
       example = "alice";
       description = "The user who sees the Mac's shared folder as ~/Mac (null: no ~/Mac).";
     };
+    home = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = if cfg.user == null then null else "/home/${cfg.user}";
+      defaultText = lib.literalExpression ''"/home/''${config.services.pingouin.user}"'';
+      description = ''
+        That user's home folder. Not read from users.users: fileSystems can't
+        depend on users.users (NixOS evaluates users from file systems: infinite recursion).
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
@@ -45,7 +54,7 @@ in
     }
     (lib.mkIf (cfg.user != null) {
       # the shared folder, owned by this user (Pingouin's "Linux user ID" must be theirs)
-      fileSystems."${config.users.users.${cfg.user}.home}/Mac" = {
+      fileSystems."${cfg.home}/Mac" = {
         device = "pingouin";
         fsType = "9p";
         options = [ "trans=virtio" "version=9p2000.L" "msize=524288" "nofail"

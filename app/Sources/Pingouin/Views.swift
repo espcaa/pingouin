@@ -265,7 +265,7 @@ struct VMDetail: View {
 }
 
 let guestInstallCommand =
-    "sudo mount -t 9p -o trans=virtio,ro pingouin-tools /mnt && sudo bash /mnt/install.sh; sudo umount /mnt"
+    "sudo mkdir -p /mnt && sudo mount -t 9p -o trans=virtio,ro pingouin-tools /mnt && sudo bash /mnt/install.sh; sudo umount /mnt"
 
 extension VMDetail {
     func chooseFolder() {

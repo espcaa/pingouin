@@ -19,28 +19,36 @@ enum EscapeHint {
     /// The VM went full screen (Settings can turn this one off).
     static func show() {
         guard enabled else { return }
-        notice(Text("Press ") + Text("⌃ + ⌥ + Esc").bold()
-               + Text(" to let go of the VM, then swipe with three fingers to get back to your desktop"),
-               icon: "keyboard", seconds: 20)
+        notice(
+            Text("Press ") + Text("⌃ + ⌥ + Esc").bold()
+                + Text(
+                    " to let go of the VM, then swipe with three fingers to get back to your desktop"
+                ),
+            icon: "keyboard", seconds: 20)
     }
 
     /// ⌃⌥Esc let go of the VM.
     static func released() {
-        notice(Text("macOS has the trackpad and keyboard again"),
-               icon: "hand.point.up.left", seconds: 5)
+        notice(
+            Text("macOS has the trackpad again, you can swipe with three fingers to exit."),
+            icon: "hand.point.up.left", seconds: 5)
     }
 
     private static func notice(_ text: Text, icon: String, seconds: Double) {
         guard let screen = NSScreen.main else { return }
-        if let old = panel { panel = nil; old.orderOut(nil) }
+        if let old = panel {
+            panel = nil
+            old.orderOut(nil)
+        }
         hideTask?.cancel()
         let view = NSHostingView(rootView: HintView(text: text, icon: icon, dismiss: { hide() }))
         let size = view.fittingSize
         let f = screen.frame
         // Below the notch strip (full-panel mode draws there).
         let origin = NSPoint(x: f.midX - size.width / 2, y: f.maxY - size.height - 60)
-        let p = NSPanel(contentRect: NSRect(origin: origin, size: size),
-                        styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: false)
+        let p = NSPanel(
+            contentRect: NSRect(origin: origin, size: size),
+            styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: false)
         p.contentView = view
         p.isOpaque = false
         p.backgroundColor = .clear
@@ -49,7 +57,10 @@ enum EscapeHint {
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
         p.alphaValue = 0
         p.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { $0.duration = 0.25; p.animator().alphaValue = 1 }
+        NSAnimationContext.runAnimationGroup {
+            $0.duration = 0.25
+            p.animator().alphaValue = 1
+        }
         panel = p
         hideTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(seconds))
@@ -61,8 +72,12 @@ enum EscapeHint {
         hideTask?.cancel()
         guard let p = panel else { return }
         panel = nil
-        NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; p.animator().alphaValue = 0 },
-                                             completionHandler: { p.orderOut(nil) })
+        NSAnimationContext.runAnimationGroup(
+            {
+                $0.duration = 0.3
+                p.animator().alphaValue = 0
+            },
+            completionHandler: { p.orderOut(nil) })
     }
 }
 
