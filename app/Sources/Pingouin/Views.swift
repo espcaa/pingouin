@@ -155,12 +155,8 @@ struct VMDetail: View {
     var body: some View {
         Form {
             Section {
-                Stepper(
-                    "CPUs: \(vm.config.cpus)", value: $vm.config.cpus,
-                    in: 1...ProcessInfo.processInfo.activeProcessorCount)
-                Stepper(
-                    "Memory: \(vm.config.memoryMiB / 1024) GiB", value: $vm.config.memoryMiB,
-                    in: 2048...Int(ProcessInfo.processInfo.physicalMemory >> 20), step: 1024)
+                NumberRow(title: "CPUs", value: $vm.config.cpus, range: cpuRange)
+                NumberRow(title: "Memory", value: gib($vm.config.memoryMiB), range: memoryGiBRange, unit: "GiB")
                 Toggle("ISO keyboard (§ and < keys)", isOn: $vm.config.isoKeyboard)
                 Toggle("Full screen over the notch", isOn: $vm.config.fullPanel)
                 Toggle("Vulkan (needs Fedora's Mesa 26.2.4 or newer)", isOn: $vm.config.vulkan)
@@ -273,13 +269,10 @@ struct NewVMSheet: View {
     var body: some View {
         Form {
             TextField("Name", text: $config.name)
-            Stepper(
-                "CPUs: \(config.cpus)", value: $config.cpus,
-                in: 1...ProcessInfo.processInfo.activeProcessorCount)
-            Stepper(
-                "Memory: \(config.memoryMiB / 1024) GiB", value: $config.memoryMiB,
-                in: 2048...Int(ProcessInfo.processInfo.physicalMemory >> 20), step: 1024)
-            Stepper("Disk: \(config.diskGiB) GiB", value: $config.diskGiB, in: 16...2048, step: 16)
+            NumberRow(title: "CPUs", value: $config.cpus, range: cpuRange)
+            NumberRow(title: "Memory", value: gib($config.memoryMiB), range: memoryGiBRange, unit: "GiB")
+            NumberRow(title: "Disk", value: $config.diskGiB, range: 16...2048, step: 16, unit: "GiB",
+                      slider: false)
             Toggle("ISO keyboard (§ and < keys)", isOn: $config.isoKeyboard)
         }
         .formStyle(.grouped)
@@ -293,6 +286,48 @@ struct NewVMSheet: View {
                         dismiss()
                     }
                 }
+            }
+        }
+    }
+}
+
+let cpuRange = 1...ProcessInfo.processInfo.activeProcessorCount
+let memoryGiBRange = 2...max(2, Int(ProcessInfo.processInfo.physicalMemory >> 30))
+
+/// A MiB setting shown and edited in whole GiB.
+func gib(_ mib: Binding<Int>) -> Binding<Int> {
+    Binding(get: { mib.wrappedValue / 1024 }, set: { mib.wrappedValue = $0 * 1024 })
+}
+
+/// A number you can drag (slider), type (field) or nudge (stepper);
+/// whatever is typed is clamped to `range`.
+struct NumberRow: View {
+    let title: String
+    @Binding var value: Int
+    let range: ClosedRange<Int>
+    var step = 1
+    var unit = ""
+    var slider = true
+
+    private var clamped: Binding<Int> {
+        Binding(get: { value }, set: { value = min(max($0, range.lowerBound), range.upperBound) })
+    }
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 8) {
+                if slider {
+                    Slider(value: Binding(get: { Double(value) }, set: { clamped.wrappedValue = Int($0.rounded()) }),
+                           in: Double(range.lowerBound)...Double(range.upperBound), step: Double(step))
+                        .frame(minWidth: 180)
+                }
+                TextField(title, value: clamped, format: .number)
+                    .labelsHidden()
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 60)
+                Stepper(title, value: clamped, in: range, step: step).labelsHidden()
+                if !unit.isEmpty { Text(unit).foregroundStyle(.secondary).frame(width: 28, alignment: .leading) }
             }
         }
     }
