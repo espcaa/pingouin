@@ -1,0 +1,7 @@
+.build/
+*.qcow2
+*.iso
+.DS_Store
+guest/pingouind/pingouind
+guest/pingouind-*
+dist/
