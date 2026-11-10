@@ -129,8 +129,10 @@ func TestHandleLines(t *testing.T) {
 	}
 	handle(strings.Fields("F 2 1 x 0.1"), a, pad, keys, logf) // malformed: skipped, no panic
 	go handle([]string{"Q"}, a, pad, keys, logf)
-	line, _ := bufio.NewReader(b).ReadString('\n')
-	if line != "D -\n" {
-		t.Fatalf("Q answered %q", line)
+	r := bufio.NewReader(b)
+	v, _ := r.ReadString('\n')
+	line, _ := r.ReadString('\n')
+	if v != "V "+version+"\n" || line != "D -\n" {
+		t.Fatalf("Q answered %q %q", v, line)
 	}
 }

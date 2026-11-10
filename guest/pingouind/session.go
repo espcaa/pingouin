@@ -106,7 +106,9 @@ func handle(p []string, w io.Writer, pad *Touchpad, keys *Keys, logf func(string
 			return keys.Release()
 		}
 	case "Q":
-		_, err := w.Write([]byte("D -\n"))
+		// "V": which guest tools these are (the app compares them with its
+		// own, Resources/guest/VERSION); older pingouinds only said "D -".
+		_, err := w.Write([]byte("V " + version + "\nD -\n"))
 		return err
 	}
 	return nil
