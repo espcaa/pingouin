@@ -109,7 +109,7 @@ final class GesturesBridge {
         // Ctrl+Option+Esc let go of the VM ("S esc"): back to Pingouin's own
         // window (macOS switches Space). The VM captures again once it's in front.
         if len >= 5, strncmp(line, "S esc", 5) == 0 {
-            DispatchQueue.main.async { EscapeHint.hide(); GesturesBridge.showPingouin() }
+            DispatchQueue.main.async { EscapeHint.released(); GesturesBridge.showPingouin() }
         }
         // Capture went on: the VM is full screen and in front.
         if len >= 4, strncmp(line, "S on", 4) == 0 {

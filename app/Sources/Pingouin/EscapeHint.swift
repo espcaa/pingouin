@@ -1,9 +1,10 @@
 import AppKit
 import SwiftUI
 
-/// "Press ⌃⌥Esc to get back to your Mac": a small notice over a VM that just
-/// went full screen, the first time each run. It doesn't take focus: the VM
-/// keeps the keyboard, the button still takes a click.
+/// Small notices at the top of the screen that don't take focus (the VM keeps
+/// the keyboard; the ✕ still takes a click), on every Space, full screen too:
+/// - entering a VM's full screen, the first time each run: how to get out;
+/// - after ⌃⌥Esc: macOS has the keyboard and trackpad again.
 @MainActor
 enum EscapeHint {
     static let defaultsKey = "showEscapeHint"
@@ -15,9 +16,25 @@ enum EscapeHint {
     private static var panel: NSPanel?
     private static var hideTask: Task<Void, Never>?
 
+    /// The VM went full screen (Settings can turn this one off).
     static func show() {
-        guard enabled, panel == nil, let screen = NSScreen.main else { return }
-        let view = NSHostingView(rootView: HintView(dismiss: { hide() }))
+        guard enabled else { return }
+        notice(Text("Press ") + Text("⌃ + ⌥ + Esc").bold()
+               + Text(" to let go of the VM, then swipe with three fingers to get back to your desktop"),
+               icon: "keyboard", seconds: 20)
+    }
+
+    /// ⌃⌥Esc let go of the VM.
+    static func released() {
+        notice(Text("macOS has the trackpad and keyboard again"),
+               icon: "hand.point.up.left", seconds: 5)
+    }
+
+    private static func notice(_ text: Text, icon: String, seconds: Double) {
+        guard let screen = NSScreen.main else { return }
+        if let old = panel { panel = nil; old.orderOut(nil) }
+        hideTask?.cancel()
+        let view = NSHostingView(rootView: HintView(text: text, icon: icon, dismiss: { hide() }))
         let size = view.fittingSize
         let f = screen.frame
         // Below the notch strip (full-panel mode draws there).
@@ -35,7 +52,7 @@ enum EscapeHint {
         NSAnimationContext.runAnimationGroup { $0.duration = 0.25; p.animator().alphaValue = 1 }
         panel = p
         hideTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(20))
+            try? await Task.sleep(for: .seconds(seconds))
             if !Task.isCancelled { hide() }
         }
     }
@@ -50,13 +67,14 @@ enum EscapeHint {
 }
 
 private struct HintView: View {
+    var text: Text
+    var icon: String
     var dismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 14) {
-            (Text("Press ") + Text("⌃ + ⌥ + Esc").bold()
-             + Text(" to let go of the VM, then swipe with three fingers to get back to your desktop"))
-                .font(.system(size: 15))
+        HStack(spacing: 12) {
+            Image(systemName: icon).font(.system(size: 15))
+            text.font(.system(size: 15))
             Button(action: dismiss) { Image(systemName: "xmark") }
                 .buttonStyle(.borderless).controlSize(.small)
         }
