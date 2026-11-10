@@ -162,7 +162,10 @@ struct VMDetail: View {
                     unit: "GiB")
                 Toggle("ISO keyboard (§ and < keys)", isOn: $vm.config.isoKeyboard)
                 Toggle("Full screen over the notch", isOn: $vm.config.fullPanel)
-                Toggle("Vulkan (needs Fedora's Mesa 26.2.4 or newer)", isOn: $vm.config.vulkan)
+                Toggle(isOn: $vm.config.vulkan) {
+                    Text("Vulkan")
+                    Text("Needs Mesa 26.2.4 or newer in Linux (OpenGL works either way).")
+                }
                 Toggle(isOn: $vm.config.macCursor) {
                     Text("Smoother pointer")
                     Text(
@@ -303,7 +306,8 @@ struct NewVMSheet: View {
 }
 
 let cpuRange = 1...ProcessInfo.processInfo.activeProcessorCount
-let memoryGiBRange = 2...max(2, Int(ProcessInfo.processInfo.physicalMemory >> 30))
+/// Up to 4 GiB below the Mac's memory: macOS and QEMU's GPU work need some.
+let memoryGiBRange = 2...max(2, Int(ProcessInfo.processInfo.physicalMemory >> 30) - 4)
 
 /// A MiB setting shown and edited in whole GiB.
 func gib(_ mib: Binding<Int>) -> Binding<Int> {

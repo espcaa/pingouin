@@ -126,6 +126,7 @@ final class AppModel: ObservableObject {
             try? FileManager.default.removeItem(at: vm.controlSocket)
             try? FileManager.default.removeItem(at: vm.displaySocket)
             try? FileManager.default.removeItem(at: vm.clipboardSocket)
+            try? FileManager.default.removeItem(at: vm.displayNowURL)   // "now" is per run
             FileManager.default.createFile(atPath: vm.logURL.path, contents: Data((launch.shellLine + "\n\n").utf8))
             let log = try FileHandle(forWritingTo: vm.logURL)
             log.seekToEndOfFile()

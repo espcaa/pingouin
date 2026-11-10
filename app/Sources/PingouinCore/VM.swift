@@ -114,6 +114,9 @@ public struct VM: Sendable {
     /// Which Mac displays this VM uses: {"<display UUID>": true|false}, edited
     /// by the app and by QEMU (⌃⌥D, pingouin-displays-choice.patch).
     public var displayChoicesURL: URL { dir.appendingPathComponent("displays.json") }
+    /// Displays used or not this run only (the app's switches, ⌃⌥D): {"<UUID>": true|false},
+    /// emptied at every start; a display not in it follows displays.json.
+    public var displayNowURL: URL { dir.appendingPathComponent("displays-now.json") }
 
     private func socket(_ name: String) -> URL {
         let inDir = dir.appendingPathComponent("\(name).sock")

@@ -1,0 +1,116 @@
+From: Pingouin
+Subject: [PATCH] ui/cocoa: displays used this run only (the app's switch), beside the rule
+
+What: next to each display's rule (PINGOUIN_DISPLAYS_CHOICES: auto connect or
+not), a choice for this run only, PINGOUIN_DISPLAYS_NOW (a JSON file the app
+empties at every start, and writes from its "use now" switch): true uses the
+display now, false doesn't, absent follows the rule. ⌃⌥D sets both. Changes
+to either file are picked up live.
+Upstream: Pingouin only.
+---
+diff --color -Naur a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m	2026-11-10 21:20:19
++++ b/ui/cocoa.m	2026-11-10 21:20:19
+@@ -10678,6 +10678,8 @@
+  * it adds the next display not in use. Main thread.
+  */
+ static NSDictionary *pingouin_choices;
++/* this run only (PINGOUIN_DISPLAYS_NOW, the app's switches and ⌃⌥D): wins over the rule */
++static NSDictionary *pingouin_choices_now;
+ static NSMutableSet *pingouin_choice_told;   /* UUIDs: the "connected" notice this run */
+ static NSMutableSet *pingouin_choice_using;  /* UUIDs: the "using" notice this run */
+ static NSPanel *pingouin_notice_panel;
+@@ -10698,22 +10700,35 @@
+     return qemu_name && *qemu_name ? [NSString stringWithUTF8String:qemu_name] : @"the VM";
+ }
+ 
+-static void pingouin_choices_load(void)
++static NSDictionary *pingouin_choices_read(const char *env)
+ {
+-    const char *p = getenv("PINGOUIN_DISPLAYS_CHOICES");
+-    NSDictionary *d = nil;
++    const char *p = getenv(env);
+ 
+     if (p && *p) {
+         NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:p]];
+         id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+         if ([obj isKindOfClass:[NSDictionary class]]) {
+-            d = obj;
++            return [[obj copy] autorelease];
+         }
+     }
++    return @{};
++}
++
++static void pingouin_choices_load(void)
++{
+     [pingouin_choices release];
+-    pingouin_choices = [(d ? d : @{}) copy];
++    pingouin_choices = [pingouin_choices_read("PINGOUIN_DISPLAYS_CHOICES") retain];
++    [pingouin_choices_now release];
++    pingouin_choices_now = [pingouin_choices_read("PINGOUIN_DISPLAYS_NOW") retain];
+ }
+ 
++/* This run: 1 use it, 0 don't, -1 as its rule says. */
++static int pingouin_choice_now(NSString *uuid)
++{
++    id v = uuid ? pingouin_choices_now[uuid] : nil;
++    return [v isKindOfClass:[NSNumber class]] ? [v boolValue] : -1;
++}
++
+ /* 1: use it, 0: don't, -1: not chosen yet. */
+ static int pingouin_choice(NSString *uuid)
+ {
+@@ -10739,6 +10754,19 @@
+                                                          error:nil];
+         [json writeToFile:[NSString stringWithUTF8String:p] atomically:YES];
+     }
++    /* ⌃⌥D sets the rule and this run alike (the app's switch shows it) */
++    const char *np = getenv("PINGOUIN_DISPLAYS_NOW");
++    NSMutableDictionary *n = [NSMutableDictionary dictionaryWithDictionary:pingouin_choices_now];
++    n[uuid] = @(use);
++    [pingouin_choices_now release];
++    pingouin_choices_now = [n copy];
++    if (np && *np) {
++        NSData *json = [NSJSONSerialization dataWithJSONObject:n
++                                                       options:NSJSONWritingPrettyPrinted |
++                                                               NSJSONWritingSortedKeys
++                                                         error:nil];
++        [json writeToFile:[NSString stringWithUTF8String:np] atomically:YES];
++    }
+ }
+ 
+ /* The app changed the file (its Displays switches): look again. */
+@@ -10762,13 +10790,14 @@
+     src = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE, fd, DISPATCH_VNODE_WRITE,
+                                  dispatch_get_main_queue());
+     dispatch_source_set_event_handler(src, ^{
+-        NSDictionary *old = [pingouin_choices retain];
++        NSDictionary *old = [pingouin_choices retain], *old_now = [pingouin_choices_now retain];
+         pingouin_choices_load();
+-        if (![old isEqual:pingouin_choices]) {
++        if (![old isEqual:pingouin_choices] || ![old_now isEqual:pingouin_choices_now]) {
+             info_report("cocoa: displays: the choices changed");
+             pingouin_displays_update();
+         }
+         [old release];
++        [old_now release];
+     });
+     dispatch_source_set_cancel_handler(src, ^{ close(fd); });
+     dispatch_resume(src);
+@@ -10877,9 +10906,13 @@
+ static bool pingouin_choice_allows(NSScreen *s)
+ {
+     NSString *uuid = pingouin_display_uuid(pingouin_screen_id(s));
+-    int c = pingouin_choice(uuid);
++    int c = pingouin_choice(uuid), now = pingouin_choice_now(uuid);
+ 
+-    if (c == 1) {
++    /* this run's switch first, then the rule */
++    if (now == 0) {
++        return false;
++    }
++    if (now == 1 || c == 1) {
+         if (uuid && ![pingouin_choice_using containsObject:uuid] &&
+             !pingouin_display_in_use(pingouin_screen_id(s))) {
+             [pingouin_choice_using addObject:uuid];

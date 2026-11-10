@@ -92,7 +92,8 @@ public struct QEMULaunch: Equatable, Sendable {
 
         var env = [RuntimeEnv.productName: "Pingouin",
                    "PINGOUIN_DISPLAY_SOCKET": vm.displaySocket.path,
-                   "PINGOUIN_DISPLAYS_CHOICES": vm.displayChoicesURL.path]
+                   "PINGOUIN_DISPLAYS_CHOICES": vm.displayChoicesURL.path,
+                   "PINGOUIN_DISPLAYS_NOW": vm.displayNowURL.path]
         if let icon { env[RuntimeEnv.icon] = icon.path }
         if c.fullPanel { env[RuntimeEnv.fullPanel] = "1" }
         if c.isoKeyboard { env[RuntimeEnv.keyboard] = "iso" }

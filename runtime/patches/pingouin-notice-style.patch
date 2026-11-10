@@ -1,0 +1,56 @@
+From: Pingouin
+Subject: [PATCH] ui/cocoa: notices shaped like the app's (no hard outline)
+
+What: QEMU's notices (pingouin-displays-choice.patch: a display connected,
+in use, ⌃⌥D) rounded their glass with a layer corner radius; the window
+server kept the panel's edge and shadow rectangular, a hard outline around
+the pill. A capsule mask image shapes edge and shadow too, as the app's own
+notices (a transparent window with a capsule) are. Also dark glass (DarkAqua,
+not the deprecated VibrantDark) and the app's 0.25 s fade in.
+Upstream: Pingouin only.
+---
+diff --color -Naur a/ui/cocoa.m b/ui/cocoa.m
+--- a/ui/cocoa.m	2026-11-10 21:15:39
++++ b/ui/cocoa.m	2026-11-10 21:15:39
+@@ -10807,10 +10807,23 @@
+                               initWithFrame:NSMakeRect(0, 0, sz.width, sz.height)] autorelease];
+     [v setMaterial:NSVisualEffectMaterialHUDWindow];
+     [v setState:NSVisualEffectStateActive];
+-    [v setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameVibrantDark]];
+-    [v setWantsLayer:YES];
+-    [[v layer] setCornerRadius:sz.height / 2];
+-    [[v layer] setMasksToBounds:YES];
++    [v setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
++    /*
++     * A capsule mask, not a layer corner radius: the window server shapes the
++     * window's edge and shadow from the mask, while a clipped layer left them
++     * rectangular (a hard outline around the pill). Same look as the app's.
++     */
++    CGFloat radius = sz.height / 2;
++    NSImage *mask = [NSImage imageWithSize:NSMakeSize(2 * radius + 1, 2 * radius + 1)
++                                   flipped:NO
++                            drawingHandler:^BOOL(NSRect rect) {
++        [[NSColor blackColor] setFill];
++        [[NSBezierPath bezierPathWithRoundedRect:rect xRadius:radius yRadius:radius] fill];
++        return YES;
++    }];
++    [mask setCapInsets:NSEdgeInsetsMake(radius, radius, radius, radius)];
++    [mask setResizingMode:NSImageResizingModeStretch];
++    [v setMaskImage:mask];
+     [label setFrame:NSMakeRect(20, 12, ceil(ls.width), ceil(ls.height))];
+     [v addSubview:label];
+     [p setContentView:v];
+@@ -10823,7 +10836,13 @@
+                              NSWindowCollectionBehaviorFullScreenAuxiliary |
+                              NSWindowCollectionBehaviorTransient |
+                              NSWindowCollectionBehaviorIgnoresCycle];
++    [p setAlphaValue:0];
+     [p orderFrontRegardless];
++    [p invalidateShadow];
++    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
++        [ctx setDuration:0.25];
++        [[p animator] setAlphaValue:1];
++    } completionHandler:nil];
+     pingouin_notice_panel = p;
+     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)),
+                    dispatch_get_main_queue(), ^{
