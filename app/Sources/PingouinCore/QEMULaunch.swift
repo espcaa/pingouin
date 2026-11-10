@@ -73,9 +73,10 @@ public struct QEMULaunch: Equatable, Sendable {
             "-serial", "file:\(vm.dir.appendingPathComponent("serial.log").path)",
             "-qmp", "unix:\(file(vm.controlSocket)),server=on,wait=off",
         ]
-        // Files the guest writes are made by QEMU, so they're the Mac user's.
+        // Files the guest writes are made by QEMU, so they're the Mac user's;
+        // the guest sees the Mac user's files as its user's (qemu-9p-guest-owner).
         if let folder = c.sharedFolder {
-            a += ["-virtfs", "local,id=share,path=\(file(URL(fileURLWithPath: folder))),mount_tag=\(sharedFolderTag),security_model=none"]
+            a += ["-virtfs", "local,id=share,path=\(file(URL(fileURLWithPath: folder))),mount_tag=\(sharedFolderTag),security_model=none,guest_owner_uid=\(c.guestUID),guest_owner_gid=\(c.guestUID)"]
         }
         if let guestTools {
             a += ["-virtfs", "local,id=tools,path=\(file(guestTools)),mount_tag=\(guestToolsTag),security_model=none,readonly=on"]

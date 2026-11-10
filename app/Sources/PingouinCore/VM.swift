@@ -12,6 +12,9 @@ public struct VMConfig: Codable, Equatable, Sendable {
     public var fullPanel: Bool
     /// A Mac folder the guest sees as ~/Mac (virtio-9p, mount tag "pingouin").
     public var sharedFolder: String?
+    /// The Linux user who owns the shared folder's files in the guest (the
+    /// first user is 1000 on nearly every distro; install.sh says if not).
+    public var guestUID: Int
     /// Vulkan in the guest (Venus on MoltenVK); OpenGL works either way.
     public var vulkan: Bool
     /// The Mac draws the guest's pointer (its image, as the Mac's cursor):
@@ -21,7 +24,8 @@ public struct VMConfig: Codable, Equatable, Sendable {
 
     public init(name: String, cpus: Int = VMConfig.defaultCPUs, memoryMiB: Int = VMConfig.defaultMemoryMiB,
                 diskGiB: Int = 80, isoKeyboard: Bool = false, fullPanel: Bool = true,
-                sharedFolder: String? = nil, vulkan: Bool = true, macCursor: Bool = false) {
+                sharedFolder: String? = nil, guestUID: Int = 1000, vulkan: Bool = true,
+                macCursor: Bool = false) {
         self.name = name
         self.cpus = cpus
         self.memoryMiB = memoryMiB
@@ -29,6 +33,7 @@ public struct VMConfig: Codable, Equatable, Sendable {
         self.isoKeyboard = isoKeyboard
         self.fullPanel = fullPanel
         self.sharedFolder = sharedFolder
+        self.guestUID = guestUID
         self.vulkan = vulkan
         self.macCursor = macCursor
     }
@@ -43,6 +48,7 @@ public struct VMConfig: Codable, Equatable, Sendable {
         isoKeyboard = try c.decodeIfPresent(Bool.self, forKey: .isoKeyboard) ?? false
         fullPanel = try c.decodeIfPresent(Bool.self, forKey: .fullPanel) ?? true
         sharedFolder = try c.decodeIfPresent(String.self, forKey: .sharedFolder)
+        guestUID = try c.decodeIfPresent(Int.self, forKey: .guestUID) ?? 1000
         vulkan = try c.decodeIfPresent(Bool.self, forKey: .vulkan) ?? true
         macCursor = try c.decodeIfPresent(Bool.self, forKey: .macCursor) ?? false
     }

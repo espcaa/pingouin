@@ -188,6 +188,14 @@ struct VMDetail: View {
                     }
                 }
                 .disabled(isRunning)
+                if vm.config.sharedFolder != nil {
+                    // the guest sees the folder's files as this user's (the installer says if not 1000)
+                    NumberRow(
+                        title: "Linux user ID", value: $vm.config.guestUID, range: 0...65535,
+                        slider: false
+                    )
+                    .disabled(isRunning)
+                }
             } footer: {
                 Text("Shows up as ~/Mac inside Linux.")
                     .font(.footnote).foregroundStyle(.secondary)
