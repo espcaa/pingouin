@@ -1,0 +1,8 @@
+#!/sbin/openrc-run
+# pingouind for OpenRC (Alpine, Gentoo, Artix): see pingouind.service.
+description="pingouind: Mac trackpad gestures on a virtual touchpad"
+command=/usr/local/bin/pingouind
+supervisor=supervise-daemon
+respawn_delay=2
+output_log=/var/log/pingouind.log
+error_log=/var/log/pingouind.log

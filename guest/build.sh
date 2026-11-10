@@ -8,6 +8,7 @@ cd "$root/guest/pingouind"
 go test ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
   -ldflags "-s -w -X main.version=${VERSION:-dev}" -o "$out/pingouind/pingouind" .
-cp pingouind.service pingouin-displays.service "$out/pingouind/"
+cp pingouind.service pingouin-displays.service pingouin-displays.desktop pingouind.openrc pingouind.runit "$out/pingouind/"
 cp "$root/guest/install.sh" "$out/"
+rm -rf "$out/nixos" && cp -R "$root/guest/nixos" "$out/nixos"
 echo "$out"

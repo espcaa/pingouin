@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Pingouin displays
+Comment=Tells the Mac where this desktop's screens are (extra displays)
+Exec=/usr/local/bin/pingouind displays
+NoDisplay=true
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-phase=1

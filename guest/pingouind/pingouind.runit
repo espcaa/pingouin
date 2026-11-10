@@ -1,0 +1,3 @@
+#!/bin/sh
+# pingouind for runit (Void, Artix): the service's run script.
+exec /usr/local/bin/pingouind 2>&1
