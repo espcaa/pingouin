@@ -22,6 +22,7 @@ struct PingouinApp: App {
         }
         .windowResizability(.contentMinSize)
         .commands {
+            UpdateCommands()
             CommandGroup(replacing: .newItem) {
                 Button("New VM…") { model.creatingVM = true }.keyboardShortcut("n")
             }

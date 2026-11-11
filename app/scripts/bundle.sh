@@ -18,8 +18,14 @@ else
   sign_id=-
   echo "bundle: signing ad-hoc; run scripts/make-dev-cert.sh once to keep permissions across rebuilds" >&2
 fi
-bundle_id=${BUNDLE_ID:-app.pingouin.Pingouin}
-version=${VERSION:-0.1.0}
+bundle_id=${BUNDLE_ID:-io.github.espcaa.pingouin}
+version=${VERSION:-$(cat "$root/VERSION")}
+# RELEASE=1 (scripts/release.sh): the update feed goes in, so the app checks
+# GitHub for new versions. Dev builds have none: they never "update" over dist/.
+release=${RELEASE:-0}
+feed_url=${FEED_URL:-https://github.com/espcaa/pingouin/releases/latest/download/appcast.xml}
+# Sparkle's public key (its private half: the login keychain, scripts/release.sh, CI secrets)
+sparkle_public_key=jIppggsGP5QV4Af83Mj2ILCPclS8nSi1qXzhDjEgWuw=
 
 cd "$app_dir"
 swift build -c release --product Pingouin
@@ -29,6 +35,15 @@ rm -rf "$out"
 mkdir -p "$out/Contents/MacOS" "$out/Contents/Resources"
 cp "$bin" "$out/Contents/MacOS/Pingouin"
 sed -e "s/@BUNDLE_ID@/$bundle_id/" -e "s/@VERSION@/$version/" Resources/Info.plist > "$out/Contents/Info.plist"
+if [[ $release == 1 ]]; then
+  pb=/usr/libexec/PlistBuddy
+  $pb -c "Add :SUFeedURL string $feed_url" "$out/Contents/Info.plist"
+  $pb -c "Add :SUPublicEDKey string $sparkle_public_key" "$out/Contents/Info.plist"
+  $pb -c "Add :SUEnableAutomaticChecks bool true" "$out/Contents/Info.plist"
+fi
+# Sparkle (updates)
+mkdir -p "$out/Contents/Frameworks"
+ditto "$(swift build -c release --show-bin-path)/Sparkle.framework" "$out/Contents/Frameworks/Sparkle.framework"
 [[ -f Resources/Pingouin.icns ]] && cp Resources/Pingouin.icns "$out/Contents/Resources/"
 # the VM windows' Dock icon (QEMU sets it while running: flat only)
 [[ -f Resources/VM.icns ]] && cp Resources/VM.icns "$out/Contents/Resources/"
@@ -77,6 +92,8 @@ find "$res/lib" -name '*.dylib' -type f -print0 |
 codesign --force ${hardened[@]+"${hardened[@]}"} --sign "$sign_id" \
   --entitlements "$root/runtime/qemu-hvf.entitlements" "$res/bin/qemu-system-aarch64"
 
+# Sparkle's helpers (Autoupdate, Updater.app, its XPC services) and the framework
+codesign --force --deep ${hardened[@]+"${hardened[@]}"} --sign "$sign_id" "$out/Contents/Frameworks/Sparkle.framework"
 codesign --force ${hardened[@]+"${hardened[@]}"} --sign "$sign_id" "$out/Contents/MacOS/Pingouin"
 codesign --force ${hardened[@]+"${hardened[@]}"} --sign "$sign_id" "$out"
 codesign --verify --strict "$out" && echo "$out"

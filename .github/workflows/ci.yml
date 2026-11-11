@@ -1,0 +1,31 @@
+# Every push and pull request: the app compiles, pingouind's tests pass.
+# (The QEMU runtime takes ~10 min to build: only release.yml builds it.)
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: guest/pingouind/go.mod
+          cache-dependency-path: guest/pingouind/go.sum
+
+      - name: pingouind (Linux side)
+        working-directory: guest/pingouind
+        run: |
+          go vet ./...
+          GOOS=linux GOARCH=arm64 go vet ./...
+          go test ./...
+
+      - name: Pingouin.app and pingouinctl
+        working-directory: app
+        run: swift build -c release

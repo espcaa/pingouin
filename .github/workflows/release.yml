@@ -1,0 +1,84 @@
+# A tag v1.2.3: builds everything, signs it as Alice, and publishes the GitHub
+# release with Pingouin-1.2.3.dmg and appcast.xml (installed copies update from it).
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# Repository secrets (Settings > Secrets and variables > Actions):
+#   SIGNING_CERT_P12       base64 of the Alice certificate + key, as .p12
+#   SIGNING_CERT_PASSWORD  that .p12's password
+#   SPARKLE_PRIVATE_KEY    Sparkle's private key (generate_keys -x)
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # to create the release
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: guest/pingouind/go.mod
+          cache-dependency-path: guest/pingouind/go.sum
+
+      - name: Build tools
+        run: brew install pkgconf
+
+      # QEMU, virglrenderer, the Homebrew bottles... (pinned and checked by hash)
+      - uses: actions/cache@v4
+        with:
+          path: runtime/.build/cache
+          key: runtime-sources-${{ hashFiles('runtime/build.sh', 'runtime/pinned-runtime-bottles.sh') }}
+
+      - name: Version
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          [ "$v" = "$(cat VERSION)" ] || echo "::warning::tag $GITHUB_REF_NAME but VERSION says $(cat VERSION): building $v"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Signing certificate (Alice)
+        env:
+          CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          kc=$RUNNER_TEMP/signing.keychain-db
+          pw=$(uuidgen)
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          # self-signed: trusted for code signing on this runner only
+          security find-certificate -c "Alice" -p "$kc" > "$RUNNER_TEMP/cert.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$kc"
+
+      - name: Sparkle key
+        env:
+          SPARKLE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: printf '%s' "$SPARKLE_KEY" > "$RUNNER_TEMP/sparkle.key"
+
+      - name: Build the release
+        run: SIGN_ID="Alice" SPARKLE_KEY_FILE="$RUNNER_TEMP/sparkle.key" app/scripts/release.sh
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/release/Pingouin-${{ env.VERSION }}.dmg
+            dist/release/appcast.xml
+          generate_release_notes: true
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/sparkle.key"
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
