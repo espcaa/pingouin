@@ -6,10 +6,10 @@
 
 <p align="center">experimental native-like linux vms on macos</p>
 
-I recently stumbled upon _Try Omarchy_ and thought to myself, woa this is exactly what I wanted, if only it worked on any distro! (Yeah omarchy kinda sucks and I don't want to use it 😭). \
+I recently stumbled upon _Try Omarchy_ and thought to myself, woa this is exactly what I wanted, if only it worked on any distro!\
 So I took the patches and some of the ideas to make a new app :) \
 You want to use linux as your main os but your mac isn't supported by Asahi yet? This is perfect for you!\
-(You should also definitely consider [donating to Asahi](https://asahilinux.org/donate/) if you can)\
+(You should also definitely consider [donating to Asahi](https://opencollective.com/asahilinux) if you can)
 
 ## Features
 
