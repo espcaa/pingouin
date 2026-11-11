@@ -125,7 +125,7 @@ pingouin-displays-now.patch                    # a display used this run only (t
 pingouin-start-display.patch                   # start on a chosen display; tell the app where the VM is
 pingouin-start-display-place.patch             # ...and really move the window there (AppKit's center moved it back)
 
-[virglrenderer]   # 131 patches (OpenGL + Venus/Vulkan on MoltenVK; no video, no KosmicKrisp)
+[virglrenderer]   # 133 patches (OpenGL + Venus/Vulkan on MoltenVK; no video, no KosmicKrisp)
 TAP:virglrenderer-macos-unified.patch                   # tap base: virglrenderer on macOS (CGL)
 TAP:virglrenderer-venus-metal-func-ptrs.patch           # tap: Venus Metal function pointers
 TAP:virglrenderer-gallium-endian.patch                  # tap base: build fix on macOS
@@ -257,8 +257,11 @@ virgl-venus-encoder-cap.patch                           # Venus ends an app's co
 virgl-venus-host-memory.patch                           # Venus charges recordings and objects for the Mac memory they take
 virgl-venus-submit-state.patch                          # Venus submits only primaries the guest ended, whose secondaries are what they executed
 virgl-venus-refusal-text.patch                          # Venus logs a refusal's reason whole
+virgl-venus-spirv-inline-array-calls.patch              # Venus inlines calls of modules whose functions take an array by value (MoltenVK's SPIRV-Cross miscompiles them: Zed)
+virgl-venus-pipeline-driver-failure.patch               # Venus says (at warning level) when the driver made no pipelines
 
-[spirv-tools]   # 3 patches (SPIRV-Tools 2026.3, the validator Venus runs on guest SPIR-V)
+[spirv-tools]   # 4 patches (SPIRV-Tools 2026.3, the validator and inliner Venus runs on guest SPIR-V)
 spirv-tools-val-catch-throws.patch            # validator ends in an error, never the process or the clock
 spirv-tools-val-function-private-layout.patch # layout decorations on Function/Private types at every SPIR-V version (MoltenVK accepts them)
 spirv-tools-val-no-debug-source.patch         # messages leave out the shader's debug source
+spirv-tools-opt-catch-throws.patch            # optimizer passes from flags end in an error, never the process

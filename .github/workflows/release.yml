@@ -1,19 +1,19 @@
-# A tag v1.2.3: builds everything, signs it as Alice, and publishes the GitHub
+# A tag v1.2.3: builds everything, signs it, and publishes the GitHub
 # release with Pingouin-1.2.3.dmg and appcast.xml (installed copies update from it).
 #   git tag v1.0.0 && git push origin v1.0.0
 #
 # Repository secrets (Settings > Secrets and variables > Actions):
-#   SIGNING_CERT_P12       base64 of the Alice certificate + key, as .p12
+#   SIGNING_CERT_P12       base64 of the certificate + key, as .p12
 #   SIGNING_CERT_PASSWORD  that .p12's password
 #   SPARKLE_PRIVATE_KEY    Sparkle's private key (generate_keys -x)
 name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ["v*"]
 
 permissions:
-  contents: write   # to create the release
+  contents: write # to create the release
 
 jobs:
   release:
@@ -42,7 +42,7 @@ jobs:
           [ "$v" = "$(cat VERSION)" ] || echo "::warning::tag $GITHUB_REF_NAME but VERSION says $(cat VERSION): building $v"
           echo "VERSION=$v" >> "$GITHUB_ENV"
 
-      - name: Signing certificate (Alice)
+      - name: Signing certificate
         env:
           CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
           CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}

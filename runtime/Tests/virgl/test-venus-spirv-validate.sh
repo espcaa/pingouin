@@ -12,6 +12,9 @@
 #  - spirv-corpus/refuse: modules that ended KosmicKrisp's or MoltenVK's process or hung
 #    them on an M4, or took spirv-val past 512 MB, 2 s or the process, are refused by the
 #    scan, spirv-val, the element cap or the pipeline checks;
+#  - inline: every pass module whose function takes an array by value (Zed's vs_quad and
+#    fs_path_rasterization) is inlined, scans, has none left and passes spirv-val
+#    (virgl-venus-spirv-inline-array-calls.patch); the rest are not touched;
 #  - units: the targets, the cache (hits, bound, LRU order, no refusals kept, 8 threads),
 #    the size cap, the Function and Private element cases, the Workgroup bytes, the
 #    variables one entry point gets;
@@ -38,12 +41,15 @@ take "$patches/virgl-venus-spirv-scan.patch" vkr_spirv.c
 take "$patches/virgl-venus-spirv-scan.patch" vkr_spirv.h
 take "$patches/virgl-venus-spirv-validate.patch" vkr_spirv_validate.c
 take "$patches/virgl-venus-spirv-validate.patch" vkr_spirv_validate.h
-srcs=("$here/test-venus-spirv-validate.c" "$work/src/vkr_spirv.c" "$work/src/vkr_spirv_validate.c")
+take "$patches/virgl-venus-spirv-inline-array-calls.patch" vkr_spirv_inline.c
+take "$patches/virgl-venus-spirv-inline-array-calls.patch" vkr_spirv_inline.h
+srcs=("$here/test-venus-spirv-validate.c" "$work/src/vkr_spirv.c" "$work/src/vkr_spirv_validate.c"
+      "$work/src/vkr_spirv_inline.c")
 warn=(-std=c11 -Wall -Wextra -Werror -I"$work/src")
-cc -O2 "${warn[@]}" -I"$prefix/include" "${srcs[@]}" "$prefix/lib/libSPIRV-Tools.a" -lc++ \
+cc -O2 "${warn[@]}" -I"$prefix/include" "${srcs[@]}" "$prefix/lib/libSPIRV-Tools-opt.a" "$prefix/lib/libSPIRV-Tools.a" -lc++ \
   -o "$work/validate"
 cc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer "${warn[@]}" \
-  -I"$asan_prefix/include" "${srcs[@]}" "$asan_prefix/lib/libSPIRV-Tools.a" -lc++ -o "$work/validate-asan"
+  -I"$asan_prefix/include" "${srcs[@]}" "$asan_prefix/lib/libSPIRV-Tools-opt.a" "$asan_prefix/lib/libSPIRV-Tools.a" -lc++ -o "$work/validate-asan"
 c++ -std=c++17 -O1 -Wall -Wextra -Werror -I"$prefix/include" "$here/test-venus-spirv-extensions.cpp" \
   "$prefix/lib/libSPIRV-Tools.a" -o "$work/extensions"
 
@@ -59,6 +65,7 @@ for bin in validate validate-asan; do
   for profile in kk mvk mvk11; do
     "$work/$bin" pass "$profile" "${pass[@]}"
     "$work/$bin" refuse "$profile" "${refuse[@]}"
+    "$work/$bin" inline "$profile" "${pass[@]}"
   done
 done
 "$work/extensions" "$here/venus-spirv-extensions.tsv"

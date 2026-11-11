@@ -1,0 +1,93 @@
+SPIRV-Tools: optimizer passes from flags, ending in an error, never the process
+
+What: pingouinOptimizeWithFlags(env, flags, count, max_id_bound, binary, words, &out)
+runs the spirv-opt passes the flags name over a binary, without the validator
+before them (the caller validated it) and with the id bound capped, and returns
+SPV_SUCCESS and the result (spvBinaryDestroy), SPV_ERROR_INVALID_VALUE for an
+unknown flag, or SPV_ERROR_INTERNAL when a pass fails (an id past the bound) or a
+C++ exception is thrown. Every step that allocates (the optimizer, its passes,
+the options, the result) is inside one try/catch; diagnostics are dropped.
+Why: Venus inlines the calls of guest modules whose functions take an array by
+value before MoltenVK reads them (virgl-venus-spirv-inline-array-calls.patch),
+on the thread of the guest's command ring. spvOptimizerRun alone is not enough:
+spvOptimizerCreate and the pass registration allocate outside it, and its own
+`new` checks never see a NULL (new throws). The library is built with
+exceptions and with assert() that throws (spirv-tools-val-catch-throws.patch
+applies to SPIRV-Tools-opt as well), so a failed assert or std::bad_alloc in a
+pass would else end QEMU.
+Upstream: no (a Pingouin entry point).
+Tests: Tests/virgl/test-venus-spirv-validate.sh (the inline unit: every corpus
+module with an array parameter is inlined, valid, with none left; an unknown flag
+is SPV_ERROR_INVALID_VALUE; an id bound below the module's is an error, not the
+end of the process).
+
+diff --git a/include/spirv-tools/libspirv.h b/include/spirv-tools/libspirv.h
+--- a/include/spirv-tools/libspirv.h
++++ b/include/spirv-tools/libspirv.h
+@@ -1089,6 +1089,18 @@ SPIRV_TOOLS_EXPORT spv_result_t spvOptimizerRun(
+     spv_optimizer_t* optimizer, const uint32_t* binary, const size_t word_count,
+     spv_binary* optimized_binary, const spv_optimizer_options options);
+ 
++// Pingouin: the passes named by `flags` (spirv-opt's, e.g. "--merge-return")
++// over `binary`, without the validator before them and with the id bound capped
++// at `max_id_bound`, all inside try/catch: SPV_SUCCESS and the result in
++// *optimized_binary (free it with spvBinaryDestroy), or an error and NULL. An
++// unknown flag is SPV_ERROR_INVALID_VALUE; a pass that fails (an id past the
++// bound) or a C++ exception (a failed assert(), which throws in this build,
++// std::bad_alloc) is SPV_ERROR_INTERNAL instead of the end of the process.
++SPIRV_TOOLS_EXPORT spv_result_t pingouinOptimizeWithFlags(
++    spv_target_env env, const char* const* flags, size_t flag_count,
++    uint32_t max_id_bound, const uint32_t* binary, size_t word_count,
++    spv_binary* optimized_binary);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/source/opt/optimizer.cpp b/source/opt/optimizer.cpp
+--- a/source/opt/optimizer.cpp
++++ b/source/opt/optimizer.cpp
+@@ -1316,4 +1316,44 @@ spv_result_t spvOptimizerRun(spv_optimizer_t* optimizer,
+   return SPV_SUCCESS;
+ }
+ 
++// Pingouin (spirv-tools-opt-catch-throws.patch): Venus runs passes on guest
++// SPIR-V on the thread of a guest's command ring; an exception there must end
++// the call, not QEMU. Every step that allocates is inside the try.
++spv_result_t pingouinOptimizeWithFlags(spv_target_env env,
++                                       const char* const* flags,
++                                       size_t flag_count, uint32_t max_id_bound,
++                                       const uint32_t* binary,
++                                       size_t word_count,
++                                       spv_binary* optimized_binary) {
++  *optimized_binary = nullptr;
++  try {
++    spvtools::Optimizer optimizer(env);
++    // no message consumer: diagnostics are dropped, the result says it all
++    optimizer.SetMessageConsumer(
++        [](spv_message_level_t, const char*, const spv_position_t&,
++           const char*) {});
++    for (size_t i = 0; i < flag_count; i++) {
++      if (!optimizer.RegisterPassFromFlag(flags[i]))
++        return SPV_ERROR_INVALID_VALUE;
++    }
++    std::unique_ptr<spv_optimizer_options_t,
++                    decltype(&spvOptimizerOptionsDestroy)>
++        options(spvOptimizerOptionsCreate(), spvOptimizerOptionsDestroy);
++    spvOptimizerOptionsSetRunValidator(options.get(), false);
++    spvOptimizerOptionsSetMaxIdBound(options.get(), max_id_bound);
++    std::vector<uint32_t> optimized;
++    if (!optimizer.Run(binary, word_count, &optimized, options.get()))
++      return SPV_ERROR_INTERNAL;
++    auto result = std::make_unique<spv_binary_t>();
++    auto code = std::make_unique<uint32_t[]>(optimized.size());
++    memcpy(code.get(), optimized.data(), optimized.size() * sizeof(uint32_t));
++    result->code = code.release();
++    result->wordCount = optimized.size();
++    *optimized_binary = result.release();
++    return SPV_SUCCESS;
++  } catch (...) {
++    return SPV_ERROR_INTERNAL;
++  }
++}
++
+ }  // extern "C"

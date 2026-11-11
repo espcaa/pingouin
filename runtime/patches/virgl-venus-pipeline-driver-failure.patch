@@ -1,0 +1,37 @@
+virglrenderer: Venus says when the driver made no pipelines
+
+What: when the driver's vkCreateGraphicsPipelines or vkCreateComputePipelines returns an
+error (vkr_pipelines_made), one virgl_warn line names the context, the app, the call, the
+pipeline count and the VkResult (the 1st, 2nd, 4th, 8th ... failure in the process).
+Nothing else changes: the handles stay unknown to vkr, as before.
+Why: the guest makes pipelines without waiting and binds the handle; vkr has no object for
+it and the bind ends the context with "failed to look up object N of type 19", at info
+level, which the runtime's log level (warning) drops. Zed's crash on MoltenVK
+(virgl-venus-spirv-inline-array-calls.patch) left only "venus context N (zed-editor) is
+lost" in qemu.log; the reason took VIRGL_LOG_LEVEL=info and MVK_CONFIG_LOG_LEVEL=4.
+Upstream: no.
+Tests: none of its own (a driver failure on demand needs a module the driver refuses
+after spirv-val passed it; Zed's were the case, and the inline patch fixes them).
+
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -1182,6 +1182,18 @@ vkr_pipelines_made(struct vkr_context *ctx,
+ {
+    vkr_unpin(ctx, pins);
+    if (ret < VK_SUCCESS) {
++      /* Pingouin (virgl-venus-pipeline-driver-failure.patch): the guest makes pipelines
++       * without waiting and binds the handles; vkr has no object for them, so the bind ends
++       * the context ("failed to look up object N of type 19") with no reason in the log.
++       * The 1st, 2nd, 4th, 8th ... failure says it here, at the default log level. */
++      static atomic_uint_fast64_t failed;
++      const uint64_t n = atomic_fetch_add(&failed, 1) + 1;
++      if (!(n & (n - 1)))
++         virgl_warn("venus context %u (%s): %s: the driver made none of the %u pipelines "
++                    "(VkResult %d; %" PRIu64 " failed so far); binding one ends the app's "
++                    "Vulkan context\n",
++                    ctx->ctx_id, ctx->debug_name ? ctx->debug_name : "?", call, arr->count,
++                    ret, n);
+       memset(out, 0, arr->count * sizeof(*out));
+       object_array_fini(arr);
+       return false;

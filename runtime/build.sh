@@ -296,7 +296,9 @@ DYLD_LIBRARY_PATH="$slirp_src/build:$libs" python3 "$meson" test -C "$slirp_src/
 python3 "$meson" install -C "$slirp_src/build" --no-rebuild >/dev/null
 
 # ---------------------------------------------------------------------------
-# SPIRV-Tools: Venus validates the guest's SPIR-V with it before MoltenVK compiles it.
+# SPIRV-Tools: Venus validates the guest's SPIR-V with it before MoltenVK compiles it, and
+# inlines the calls of modules whose functions take an array by value (SPIRV-Tools-opt;
+# virgl-venus-spirv-inline-array-calls.patch).
 # A static library with hidden symbols, so libvirglrenderer exports none of them (MoltenVK
 # carries a private copy of its own); once more with AddressSanitizer for the CPU test.
 # ---------------------------------------------------------------------------
@@ -309,10 +311,10 @@ build_spirv_tools() { # PREFIX CFLAGS
     -DSPIRV-Headers_SOURCE_DIR="$spirv_headers_src" \
     -DSPIRV_SKIP_TESTS=ON -DSPIRV_SKIP_EXECUTABLES=ON -DSPIRV_WERROR=OFF -DBUILD_SHARED_LIBS=OFF \
     >"$build.cmake.log" 2>&1 || { tail -20 "$build.cmake.log" >&2; die "SPIRV-Tools: cmake failed"; }
-  "$ninja" ${jobs[@]+"${jobs[@]}"} -C "$build" SPIRV-Tools-static >"$build.log" ||
+  "$ninja" ${jobs[@]+"${jobs[@]}"} -C "$build" SPIRV-Tools-static SPIRV-Tools-opt >"$build.log" ||
     { tail -20 "$build.log" >&2; die "SPIRV-Tools: build failed"; }
   mkdir -p "$1/lib/pkgconfig" "$1/include"
-  install -m 0644 "$build/source/libSPIRV-Tools.a" "$1/lib/"
+  install -m 0644 "$build/source/libSPIRV-Tools.a" "$build/source/opt/libSPIRV-Tools-opt.a" "$1/lib/"
   cp -R "$spirv_tools_src/include/spirv-tools" "$1/include/"
 }
 log "Building SPIRV-Tools $spirv_tools_version (static, hidden symbols)"
@@ -323,7 +325,7 @@ cat > "$spirv/lib/pkgconfig/pingouin-spirv-tools.pc" <<EOF
 Name: pingouin-spirv-tools
 Description: SPIRV-Tools $spirv_tools_version, static with hidden symbols (Pingouin's runtime build)
 Version: $spirv_tools_version
-Libs: $spirv/lib/libSPIRV-Tools.a -lc++
+Libs: $spirv/lib/libSPIRV-Tools-opt.a $spirv/lib/libSPIRV-Tools.a -lc++
 Cflags: -I$spirv/include
 EOF
 export PKG_CONFIG_LIBDIR=$PKG_CONFIG_LIBDIR:$spirv/lib/pkgconfig
@@ -351,7 +353,7 @@ DYLD_LIBRARY_PATH="$libs" \
 # (Tests/virgl/run-regressions.py: upstream's list minus video).
 link=("-L$epoxy/lib" -lepoxy -framework Metal -framework CoreFoundation -lobjc
       -framework CoreVideo -framework OpenGL -framework IOSurface
-      "$spirv/lib/libSPIRV-Tools.a" -lc++
+      "$spirv/lib/libSPIRV-Tools-opt.a" "$spirv/lib/libSPIRV-Tools.a" -lc++
       "-Wl,-rpath,$epoxy/lib" "-Wl,-rpath,$angle/lib")
 DYLD_LIBRARY_PATH="$libs" python3 "$tap/tests/run-driver-regressions.py" \
   "$virgl_src/build" "$tests/virgl" -- "${link[@]}"

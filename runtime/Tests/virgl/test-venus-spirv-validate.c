@@ -23,6 +23,9 @@
  *   run PROFILE FILE...      every module through all of them, no expectation (under
  *                            AddressSanitizer: the validator on hostile input)
  *   time PROFILE REPS FILE...  microseconds per spirv-val run (cache off), median of REPS
+ *   inline PROFILE FILE...   every module with a function that takes an array by value is
+ *                            inlined, scans, has none left and passes spirv-val; the
+ *                            rest are not touched (virgl-venus-spirv-inline-array-calls.patch)
  *   units FILE               targets (their interface limits from the drivers' own), the
  *                            cache (hits, LRU order, eviction, threads) on a module that
  *                            passes, the Function and Private element cases, the Workgroup
@@ -45,6 +48,7 @@
 #include <spirv-tools/libspirv.h>
 
 #include "vkr_spirv.h"
+#include "vkr_spirv_inline.h"
 #include "vkr_spirv_validate.h"
 
 /* maxComputeSharedMemorySize of both Mac drivers on an M4 (out2/limits-*.txt) */
@@ -1402,9 +1406,202 @@ cost_units(void)
    vkr_spirv_free(info);
 }
 
+/* a compute module whose functions call the next one twice, `depth` levels below main: inlined,
+ * 2^depth copies of the last one (for vkr_spirv_inline_size_ok); malloc'd words */
+static uint32_t *
+call_chain_module(spv_context ctx, int depth, size_t *bytes)
+{
+   const size_t cap = 4096 + (size_t)depth * 256;
+   char *text = malloc(cap);
+   if (!text)
+      return NULL;
+   int n = snprintf(text, cap, "OpCapability Shader\nOpMemoryModel Logical GLSL450\n"
+                         "OpEntryPoint GLCompute %%main \"main\"\nOpExecutionMode %%main LocalSize 1 1 1\n"
+                         "%%void = OpTypeVoid\n%%fn = OpTypeFunction %%void\n"
+                         "%%main = OpFunction %%void None %%fn\n%%lm = OpLabel\n"
+                         "%%cm = OpFunctionCall %%void %%f0\nOpReturn\nOpFunctionEnd\n");
+   for (int i = 0; i < depth; i++)
+      n += snprintf(text + n, cap - (size_t)n,
+                   "%%f%d = OpFunction %%void None %%fn\n%%l%d = OpLabel\n"
+                   "%%a%d = OpFunctionCall %%void %%f%d\n%%b%d = OpFunctionCall %%void %%f%d\n"
+                   "OpReturn\nOpFunctionEnd\n",
+                   i, i, i, i + 1, i, i + 1);
+   n += snprintf(text + n, cap - (size_t)n, "%%f%d = OpFunction %%void None %%fn\n%%l%d = OpLabel\nOpReturn\nOpFunctionEnd\n",
+                depth, depth);
+   spv_binary bin = NULL;
+   spv_diagnostic diag = NULL;
+   uint32_t *words = NULL;
+   if (spvTextToBinary(ctx, text, (size_t)n, &bin, &diag) == SPV_SUCCESS) {
+      words = malloc(bin->wordCount * 4);
+      if (words) {
+         memcpy(words, bin->code, bin->wordCount * 4);
+         *bytes = bin->wordCount * 4;
+      }
+   } else {
+      printf("FAIL: call chain %d: %s\n", depth, diag && diag->error ? diag->error : "not assembled");
+      failures++;
+   }
+   spvBinaryDestroy(bin);
+   spvDiagnosticDestroy(diag);
+   free(text);
+   return words;
+}
+
+/* vkr_spirv_inline_size_ok before the optimizer: a short chain is under the cap, a chain
+ * whose copies double 24 levels deep is refused in well under a second, with no optimizer */
+static void
+inline_size_units(void)
+{
+   spv_context ctx = spvContextCreate(SPV_ENV_VULKAN_1_3);
+   static const struct { int depth; bool ok; } cases[] = { { 3, true }, { 24, false }, { 200, false } };
+   for (size_t c = 0; ctx && c < sizeof(cases) / sizeof(cases[0]); c++) {
+      size_t bytes = 0;
+      uint32_t *code = call_chain_module(ctx, cases[c].depth, &bytes);
+      if (!code)
+         continue;
+      char why[512];
+      struct vkr_spirv_info *info = vkr_spirv_scan(code, bytes, why, sizeof(why));
+      CHECK(info, "inline size: chain %d scans (%s)", cases[c].depth, why);
+      if (info) {
+         uint64_t estimate = 0;
+         const double t0 = now_us();
+         const bool ok =
+            vkr_spirv_inline_size_ok(info, code, bytes, VKR_SPIRV_INLINE_MAX_BYTES, &estimate);
+         const double us = now_us() - t0;
+         CHECK(ok == cases[c].ok && us < 100000,
+               "inline size: chain %d: %s (estimate %llu bytes, %.0f us)", cases[c].depth,
+               ok ? "under the cap" : "refused", (unsigned long long)estimate, us);
+         printf("inline size: chain %d: %s, estimate %llu bytes, %.0f us\n", cases[c].depth,
+                ok ? "under the cap" : "refused", (unsigned long long)estimate, us);
+         vkr_spirv_free(info);
+      }
+      free(code);
+   }
+   if (ctx)
+      spvContextDestroy(ctx);
+}
+
+/* the modules that must be inlined: Zed's (naga) whose helper takes an array by value */
+static bool
+inline_expected(const char *name)
+{
+   const size_t n = strlen(name);
+   return !strncmp(name, "naga-zed-", 9) &&
+          ((n > 12 && !strcmp(name + n - 12, "-vs_quad.spv")) ||
+           (n > 26 && !strcmp(name + n - 26, "-fs_path_rasterization.spv")));
+}
+
+/* inline PROFILE FILE... (virgl-venus-spirv-inline-array-calls.patch,
+ * spirv-tools-opt-catch-throws.patch): each module the target takes goes as vkr_pipeline.c
+ * takes it: scan, then, when a function takes an array by value, the size estimate, the
+ * inliner, the scan again, no array parameter left and spirv-val. Exactly the expected modules
+ * (inline_expected: Zed's vs_quad and fs_path_rasterization) are inlined, and come out that
+ * way; no other is touched. Then the entry point's error paths (an unknown flag, an id bound
+ * below the module's and at it) and the size estimate (inline_size_units). */
+static int
+inline_corpus(const char *prof, int count, char **files)
+{
+   struct vkr_spirv_target t;
+   if (!profile(prof, &t)) {
+      printf("FAIL: profile %s\n", prof);
+      return 1;
+   }
+   int inlined = 0, untouched = 0;
+   uint32_t *affected = NULL; /* one affected module's code, for the error paths */
+   size_t affected_bytes = 0;
+   for (int i = 0; i < count; i++) {
+      size_t bytes;
+      uint32_t *code = load(files[i], &bytes);
+      if (!code) {
+         printf("FAIL: %s unreadable\n", files[i]);
+         failures++;
+         continue;
+      }
+      const char *name = strrchr(files[i], '/') ? strrchr(files[i], '/') + 1 : files[i];
+      if (bytes < 20 || code[1] > target_spirv(&t)) {
+         free(code);
+         continue;
+      }
+      const bool expected = inline_expected(name);
+      char why[512];
+      struct vkr_spirv_info *info = vkr_spirv_scan(code, bytes, why, sizeof(why));
+      if (!info) {
+         printf("FAIL: inline %s %s: the scan refuses it (%s)\n", prof, name, why);
+         failures++;
+         free(code);
+         continue;
+      }
+      if (!vkr_spirv_has_array_params(info, code, bytes)) {
+         CHECK(!expected, "inline %s %s: expected to be inlined, but no array parameter found", prof,
+               name);
+         untouched++;
+         vkr_spirv_free(info);
+         free(code);
+         continue;
+      }
+      CHECK(expected, "inline %s %s: not a module expected to be inlined (inline_expected)", prof,
+            name);
+      uint64_t estimate = 0;
+      const bool sized =
+         vkr_spirv_inline_size_ok(info, code, bytes, VKR_SPIRV_INLINE_MAX_BYTES, &estimate);
+      CHECK(sized, "inline %s %s: the size estimate refuses it (%llu bytes)", prof, name,
+            (unsigned long long)estimate);
+      size_t out_bytes = 0;
+      uint32_t *out = vkr_spirv_inline_calls(t.env, code, bytes, &out_bytes, why, sizeof(why));
+      struct vkr_spirv_info *again = out ? vkr_spirv_scan(out, out_bytes, why, sizeof(why)) : NULL;
+      const bool clean = again && !vkr_spirv_has_array_params(again, out, out_bytes);
+      const bool valid =
+         clean && vkr_spirv_validate(&t, again, out, out_bytes, why, sizeof(why), NULL);
+      CHECK(valid, "inline %s %s: %s", prof, name,
+            !out ? why : !again ? why : !clean ? "a function still takes an array" : why);
+      if (sized && valid) {
+         inlined++;
+         printf("inline %s %s: %zu -> %zu bytes (estimated %llu)\n", prof, name, bytes, out_bytes,
+                (unsigned long long)estimate);
+      }
+      if (again)
+         vkr_spirv_free(again);
+      free(out);
+      vkr_spirv_free(info);
+      if (!affected) {
+         affected = code;
+         affected_bytes = bytes;
+      } else {
+         free(code);
+      }
+   }
+   if (affected) {
+      spv_binary out = NULL;
+      static const char *const unknown[] = { "--no-such-pass-pingouin" };
+      CHECK(pingouinOptimizeWithFlags(t.env, unknown, 1, VKR_SPIRV_MAX_BOUND, affected,
+                                      affected_bytes / 4, &out) == SPV_ERROR_INVALID_VALUE &&
+               !out,
+            "inline %s: an unknown flag is SPV_ERROR_INVALID_VALUE", prof);
+      static const char *const passes[] = { "--merge-return", "--inline-entry-points-exhaustive" };
+      /* below the module's own bound (ids it has are past it), and at it (every new id is) */
+      const uint32_t bounds[2] = { affected[3] / 2, affected[3] };
+      for (int b = 0; b < 2; b++) {
+         CHECK(pingouinOptimizeWithFlags(t.env, passes, 2, bounds[b], affected, affected_bytes / 4,
+                                         &out) != SPV_SUCCESS &&
+                  !out,
+               "inline %s: an id bound of %u (the module's: %u) is an error", prof, bounds[b],
+               affected[3]);
+         spvBinaryDestroy(out);
+         out = NULL;
+      }
+      free(affected);
+   }
+   inline_size_units();
+   printf("inline %s: %d inlined, %d untouched%s\n", prof, inlined, untouched,
+          failures ? " (FAIL)" : "");
+   return failures != 0;
+}
+
 int
 main(int argc, char **argv)
 {
+   if (argc >= 3 && !strcmp(argv[1], "inline"))
+      return inline_corpus(argv[2], argc - 3, argv + 3);
    if (argc >= 3 && (!strcmp(argv[1], "pass") || !strcmp(argv[1], "refuse") || !strcmp(argv[1], "run")))
       return corpus(!strcmp(argv[1], "pass") ? 1 : !strcmp(argv[1], "refuse") ? 0 : 2, argv[2],
                     argc - 3, argv + 3);
@@ -1429,7 +1626,7 @@ main(int argc, char **argv)
       printf("units: %s\n", failures ? "FAIL" : "all ok");
       return failures != 0;
    }
-   fprintf(stderr, "usage: %s pass|refuse|run PROFILE FILE... | time PROFILE REPS FILE... | units FILE\n",
+   fprintf(stderr, "usage: %s pass|refuse|run|inline PROFILE FILE... | time PROFILE REPS FILE... | units FILE\n",
            argv[0]);
    return 2;
 }

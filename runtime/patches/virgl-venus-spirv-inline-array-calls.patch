@@ -1,0 +1,547 @@
+virglrenderer: Venus inlines the calls of modules whose functions take an array by value
+
+What: vkCreateShaderModule on MoltenVK (KosmicKrisp compiles such modules), after the scan
+and spirv-val passed the guest's code: when a function of the module takes an array by value
+(an OpFunctionParameter of an OpTypeArray type, and the module calls something), its calls
+are inlined into its entry points
+(spirv-opt --merge-return --inline-entry-points-exhaustive --eliminate-dead-functions, for
+the device's SPIR-V target, ids capped at VKR_SPIRV_MAX_BOUND; new src/venus/
+vkr_spirv_inline.c). The result is scanned and validated as strictly as guest code (always
+enforced, also in a log-only build) and must have no array parameter left; then the driver
+gets it, the module keeps its scan (the pipeline checks see what the driver compiles) and
+the module is charged for the code the drivers copy. Before the optimizer runs: the guest's
+code must pass spirv-val strictly (a log-only build lets invalid code on, and the optimizer
+reads what spirv-val took only; the validator's cache answers), and the inlined size,
+estimated from the call graph in one linear pass (each function's words plus its callees'
+inlined size once per call), must be under VKR_SPIRV_INLINE_MAX_BYTES (1 MB): a module whose
+functions call each other twice, 20 levels deep, would else have the inliner make 2^20
+copies on the ring thread. After it: an entry point the guest's code kept inside the
+Function and Private element cap (default sizes) must stay inside it (inlined, a callee's
+variables are one copy per call), or the pipeline check would refuse a module that worked
+before. If any of that fails, the guest's code goes to the driver as it is and the app's
+context goes on; the 1st, 2nd, 4th, 8th ... such module says why (virgl_warn). A successful inline is one vkr_log line (info). Modules without an array
+parameter are not touched (4 of the corpus' 180-odd: Zed's vs_quad and
+fs_path_rasterization, SPIR-V 1.4 and 1.6). Shader code chained into a pipeline stage
+(VK_KHR_maintenance5) is not inlined.
+Why: Zed 1.27.0 (gpui's wgpu renderer) ended at its first frame on MoltenVK. MoltenVK
+1.4.2's SPIRV-Cross declares a by-value array parameter as spvUnsafeArray<T, 2> but passes
+a buffer struct's member as the plain T[2] it declares there, and Metal refuses the call:
+  program_source:374:16: error: no matching function for call to '_350'
+  note: candidate function not viable: no known conversion from '_13[2]' to
+  'spvUnsafeArray<_13, 2>' for 4th argument
+so vkCreateGraphicsPipelines failed (VK_ERROR_INITIALIZATION_FAILED, "Vertex shader
+function could not be compiled into pipeline"), the guest, which makes pipelines without
+waiting, bound the handle, vkr had no object for it ("failed to look up object 134 of type
+19", "vkCmdBindPipeline resulted in CS error") and the context was lost; the guest's Venus
+driver aborted in vn_EndCommandBuffer. naga writes helper functions as functions and passes
+arrays by value; inlined, there is no call for SPIRV-Cross to get wrong.
+Upstream: no; the SPIRV-Cross bug is not reported yet (Zed's modules are in
+Tests/virgl/spirv-corpus/pass/naga-zed-*).
+Tests: Tests/virgl/test-venus-spirv-validate.sh (inline unit on the CPU: exactly Zed's
+vs_quad and fs_path_rasterization modules are inlined, pass the scan and spirv-val for both
+drivers' targets and have no array parameter, and no other corpus module is touched; a module
+whose calls double 24 levels deep is refused by the size estimate, quickly, without the
+optimizer); test-venus-commands.c
+p-gfx-naga-array-call-ok on the staged MoltenVK (Zed's quad and path rasterization
+pipelines are made; before this patch both failed with -3).
+
+diff --git a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -86,6 +86,7 @@ venus_sources = [
+    'venus/vkr_queue.c',
+    'venus/vkr_render_pass.c',
+    'venus/vkr_spirv.c',
++   'venus/vkr_spirv_inline.c',
+    'venus/vkr_spirv_validate.c',
+    'venus/vkr_renderer.c',
+    'venus/vkr_ring.c',
+diff --git a/src/venus/vkr_pipeline.c b/src/venus/vkr_pipeline.c
+--- a/src/venus/vkr_pipeline.c
++++ b/src/venus/vkr_pipeline.c
+@@ -10,6 +10,7 @@
+ #include "vkr_physical_device.h"
+ #include "vkr_render_pass.h"
+ #include "vkr_spirv.h"
++#include "vkr_spirv_inline.h"
+ #include "vkr_spirv_validate.h"
+ 
+ /* Pingouin (virgl-venus-spirv-validate.patch): SPIR-V the scan passed, through spirv-val for
+@@ -43,6 +44,114 @@ vkr_spirv_valid(const struct vkr_physical_device *physical_dev,
+    return true;
+ }
+ 
++static bool
++vkr_spec_lookup(const void *data, uint32_t spec_id, uint32_t *value);
++
++/* Pingouin (virgl-venus-spirv-inline-array-calls.patch): a module that could not be inlined
++ * goes to the driver as the guest gave it; the 1st, 2nd, 4th, 8th ... such module in the
++ * process says why */
++static void
++vkr_shader_module_not_inlined(const struct vkr_context *ctx, const char *why)
++{
++   static atomic_uint_fast64_t failed;
++   const uint64_t n = atomic_fetch_add(&failed, 1) + 1;
++   if (!(n & (n - 1)))
++      virgl_warn("venus context %u (%s): vkCreateShaderModule: a function takes an array by "
++                 "value and its calls were not inlined (%s; %" PRIu64 " so far): the driver "
++                 "gets the code as it is, and MoltenVK may fail its pipelines\n",
++                 ctx->ctx_id, ctx->debug_name ? ctx->debug_name : "?", why, n);
++}
++
++/* Pingouin (virgl-venus-spirv-inline-array-calls.patch): on MoltenVK, for a module the scan
++ * passed (*spirv, the guest's `info`), the code the driver gets instead when a function takes
++ * an array by value: calls inlined (vkr_spirv_inline.h), scanned and validated as strictly as
++ * the guest's code, with no array parameter left and no entry point past the Function and
++ * Private element cap that the guest's code was inside. Then *spirv is the new code's scan,
++ * *out the guest's create info with the new code, and the code is returned (free() it after
++ * the driver's call). NULL otherwise, and the guest's code goes on as it is (the app's
++ * context goes on): not MoltenVK (KosmicKrisp compiles such modules), no such function, the
++ * guest's code not valid (a log-only build lets it through: the optimizer runs only on code
++ * spirv-val took), an inlined size past VKR_SPIRV_INLINE_MAX_BYTES (estimated before the
++ * optimizer runs: a guest cannot make it grow without bound) or a failed step (a warning). */
++static uint32_t *
++vkr_shader_module_inlined(struct vkr_context *ctx,
++                          const struct vkr_device *dev,
++                          struct vkr_spirv_info **spirv,
++                          const VkShaderModuleCreateInfo *info,
++                          VkShaderModuleCreateInfo *out)
++{
++   const struct vkr_physical_device *physical_dev = dev->physical_device;
++   const struct vkr_spirv_target *target = &physical_dev->spirv_target;
++   if (!physical_dev->spirv_target_ok || !physical_dev->limits.moltenvk ||
++       !vkr_spirv_has_array_params(*spirv, info->pCode, info->codeSize))
++      return NULL;
++   char why[512];
++   /* strict, whatever VKR_SPIRV_VALIDATE_ENFORCE says (the cache answers: vkr_spirv_valid
++    * just validated the same code for the same target) */
++   if (!vkr_spirv_validate(target, *spirv, info->pCode, info->codeSize, why, sizeof(why), NULL))
++      return NULL;
++   uint64_t estimate;
++   if (!vkr_spirv_inline_size_ok(*spirv, info->pCode, info->codeSize, VKR_SPIRV_INLINE_MAX_BYTES,
++                                 &estimate)) {
++      if (estimate == UINT64_MAX)
++         snprintf(why, sizeof(why), "its call graph could not be sized");
++      else
++         snprintf(why, sizeof(why), "inlined it would take at least %" PRIu64 " bytes (at most %u)",
++                  estimate, VKR_SPIRV_INLINE_MAX_BYTES);
++      vkr_shader_module_not_inlined(ctx, why);
++      return NULL;
++   }
++   size_t bytes = 0;
++   uint32_t *code =
++      vkr_spirv_inline_calls(target->env, info->pCode, info->codeSize, &bytes, why, sizeof(why));
++   struct vkr_spirv_info *scan = code ? vkr_spirv_scan(code, bytes, why, sizeof(why)) : NULL;
++   bool ok = scan != NULL;
++   if (ok && vkr_spirv_has_array_params(scan, code, bytes)) {
++      snprintf(why, sizeof(why), "a function still takes an array after the inliner");
++      ok = false;
++   }
++   if (ok)
++      ok = vkr_spirv_validate(target, scan, code, bytes, why, sizeof(why), NULL);
++   /* a callee's Function variables are one copy per call once inlined: an entry point the
++    * guest's code kept inside the cap (default sizes, as at vkCreateShaderModule) must stay
++    * inside it, or the pipeline check would refuse what worked before */
++   const bool by_interface = target->options & VKR_SPIRV_INTERFACE_GLOBALS;
++   for (uint32_t e = 0; ok && e < scan->entry_count; e++) {
++      uint64_t before = 0, after = 0;
++      const struct vkr_spirv_entry *was =
++         vkr_spirv_entry(*spirv, scan->names + scan->entries[e].name, scan->entries[e].model);
++      const bool counted_before =
++         was && vkr_spirv_function_elements(*spirv, was, by_interface, vkr_spec_lookup, NULL,
++                                            &before);
++      const bool counted_after = vkr_spirv_function_elements(scan, &scan->entries[e], by_interface,
++                                                             vkr_spec_lookup, NULL, &after);
++      if (counted_before && before <= VKR_SPIRV_MAX_FUNCTION_ELEMENTS &&
++          (!counted_after || after > VKR_SPIRV_MAX_FUNCTION_ELEMENTS)) {
++         snprintf(why, sizeof(why),
++                  "inlined, entry point %u's Function and Private variables would pass the cap "
++                  "(%" PRIu64 " elements, at most %u)",
++                  e, after, VKR_SPIRV_MAX_FUNCTION_ELEMENTS);
++         ok = false;
++      }
++   }
++   if (!ok) {
++      if (scan)
++         vkr_spirv_free(scan);
++      free(code);
++      vkr_shader_module_not_inlined(ctx, why);
++      return NULL;
++   }
++   vkr_log("%s: vkCreateShaderModule: calls inlined (a function takes an array by value): %zu "
++           "bytes of SPIR-V, %zu as the app gave it",
++           ctx->debug_name ? ctx->debug_name : "?", bytes, (size_t)info->codeSize);
++   vkr_spirv_free(*spirv);
++   *spirv = scan;
++   *out = *info;
++   out->codeSize = bytes;
++   out->pCode = code;
++   return code;
++}
++
+ static void
+ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
+                                   struct vn_command_vkCreateShaderModule *args)
+@@ -97,7 +206,19 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
+       vkr_context_refuse(ctx, true, "vkCreateShaderModule", "%s", why);
+       return;
+    }
++   /* Pingouin (virgl-venus-spirv-inline-array-calls.patch): a function that takes an array
++    * by value has its calls inlined first (MoltenVK's SPIRV-Cross writes Metal that does not
++    * compile for it); the driver gets the inlined code and the module keeps its scan */
++   const VkShaderModuleCreateInfo *guest_info = args->pCreateInfo;
++   VkShaderModuleCreateInfo inlined_info;
++   uint32_t *inlined = vkr_shader_module_inlined(ctx, dev, &spirv, guest_info, &inlined_info);
++   if (inlined)
++      args->pCreateInfo = &inlined_info;
++   /* the code the drivers keep a copy of (virgl-venus-host-memory.patch's charge below) */
++   const size_t driver_bytes = args->pCreateInfo->codeSize;
+    struct vkr_shader_module *module = vkr_shader_module_create_and_add(dispatch->data, args);
++   args->pCreateInfo = guest_info;
++   free(inlined);
+    if (!module) {
+       vkr_spirv_free(spirv);
+       return;
+@@ -106,8 +227,7 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
+    /* Pingouin (virgl-venus-host-memory.patch): both drivers keep a copy of the code, vkr its
+     * scan; real modules took 107-122 KB each at 68 KB of code, 6.2-6.4 KB at 2.6 KB (M4):
+     * 2 bytes per code byte on top of the 4 KB every module has */
+-   vkr_object_charge_more(ctx, &module->base, 2 * (uint64_t)args->pCreateInfo->codeSize,
+-                          "vkCreateShaderModule");
++   vkr_object_charge_more(ctx, &module->base, 2 * (uint64_t)driver_bytes, "vkCreateShaderModule");
+ }
+ 
+ void
+diff --git a/src/venus/vkr_spirv_inline.c b/src/venus/vkr_spirv_inline.c
+new file mode 100644
+--- /dev/null
++++ b/src/venus/vkr_spirv_inline.c
+@@ -0,0 +1,260 @@
++/*
++ * Copyright 2026 Pingouin contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Pingouin (virgl-venus-spirv-inline-array-calls.patch): see vkr_spirv_inline.h */
++
++#include "vkr_spirv_inline.h"
++
++#include <spirv-tools/libspirv.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum {
++   OP_FUNCTION = 54,
++   OP_FUNCTION_PARAMETER = 55,
++   OP_FUNCTION_END = 56,
++   OP_FUNCTION_CALL = 57,
++};
++
++static bool
++is_array_type(const struct vkr_spirv_info *info, uint32_t id)
++{
++   /* info->types is sorted by id (vkr_spirv_scan) */
++   uint32_t lo = 0, hi = info->type_count;
++   while (lo < hi) {
++      const uint32_t mid = lo + (hi - lo) / 2;
++      const struct vkr_spirv_type *t = &info->types[mid];
++      if (t->id == id)
++         return t->kind == VKR_SPIRV_TYPE_ARRAY;
++      if (t->id < id)
++         lo = mid + 1;
++      else
++         hi = mid;
++   }
++   return false;
++}
++
++bool
++vkr_spirv_has_array_params(const struct vkr_spirv_info *info, const uint32_t *code, size_t bytes)
++{
++   /* no call, no parameter that matters (an entry point takes none) */
++   if (!info->call_count || !info->type_count)
++      return false;
++   const size_t n = bytes / 4;
++   /* the scan walked the same code: the words are whole instructions; checked anyway */
++   for (size_t i = 5; i < n;) {
++      const uint32_t op = code[i] & 0xffff, len = code[i] >> 16;
++      if (!len || len > n - i)
++         return false;
++      if (op == OP_FUNCTION_PARAMETER && len >= 3 && is_array_type(info, code[i + 1]))
++         return true;
++      i += len;
++   }
++   return false;
++}
++
++static inline uint64_t
++min_u64(uint64_t a, uint64_t b)
++{
++   return a < b ? a : b;
++}
++
++struct fn_id {
++   uint32_t id, index;
++};
++
++static int
++cmp_fn_id(const void *a, const void *b)
++{
++   const uint32_t x = ((const struct fn_id *)a)->id, y = ((const struct fn_id *)b)->id;
++   return x < y ? -1 : x > y;
++}
++
++/* the index of function `id`, or UINT32_MAX */
++static uint32_t
++fn_index(const struct fn_id *ids, uint32_t n, uint32_t id)
++{
++   uint32_t lo = 0, hi = n;
++   while (lo < hi) {
++      const uint32_t mid = lo + (hi - lo) / 2;
++      if (ids[mid].id == id)
++         return ids[mid].index;
++      if (ids[mid].id < id)
++         lo = mid + 1;
++      else
++         hi = mid;
++   }
++   return UINT32_MAX;
++}
++
++bool
++vkr_spirv_inline_size_ok(const struct vkr_spirv_info *info,
++                         const uint32_t *code,
++                         size_t bytes,
++                         uint64_t max_bytes,
++                         uint64_t *estimate_bytes)
++{
++   *estimate_bytes = UINT64_MAX;
++   const size_t n = bytes / 4;
++   if (n < 5)
++      return false;
++   /* past the cap every size is cap: no overflow, and the answer is the same */
++   const uint64_t cap = max_bytes / 4 + 1;
++   /* first walk: functions and calls (each a word index bound, so the arrays fit) */
++   uint32_t nf = 0, nc = 0;
++   for (size_t i = 5; i < n;) {
++      const uint32_t op = code[i] & 0xffff, len = code[i] >> 16;
++      if (!len || len > n - i)
++         return false;
++      nf += op == OP_FUNCTION;
++      nc += op == OP_FUNCTION_CALL;
++      i += len;
++   }
++   if (!nf)
++      return false;
++   uint64_t *own = calloc(nf, sizeof(*own));
++   uint64_t *size = calloc(nf, sizeof(*size));
++   struct fn_id *ids = calloc(nf, sizeof(*ids));
++   uint32_t *call_from = calloc(nc + 1, sizeof(*call_from));
++   uint32_t *call_to = calloc(nc + 1, sizeof(*call_to));
++   uint32_t *start = calloc(nf + 1, sizeof(*start)); /* calls of function f: [start[f], start[f+1]) */
++   uint32_t *callee = calloc(nc + 1, sizeof(*callee));
++   uint32_t *stack = calloc(nf, sizeof(*stack));
++   uint32_t *pos = calloc(nf, sizeof(*pos));
++   uint8_t *state = calloc(nf, 1); /* 0 not seen, 1 open, 2 done */
++   bool ok = own && size && ids && call_from && call_to && start && callee && stack && pos && state;
++   uint64_t outside = 0;
++   /* second walk: each function's own words, each call's caller and callee id */
++   uint32_t f = UINT32_MAX, fi = 0, ci = 0;
++   for (size_t i = 5; ok && i < n;) {
++      const uint32_t op = code[i] & 0xffff, len = code[i] >> 16;
++      if (op == OP_FUNCTION) {
++         if (len < 5 || f != UINT32_MAX) {
++            ok = false;
++            break;
++         }
++         f = fi++;
++         ids[f] = (struct fn_id){ code[i + 2], f };
++      }
++      if (f == UINT32_MAX) {
++         outside += len;
++      } else {
++         own[f] += len;
++         if (op == OP_FUNCTION_CALL) {
++            if (len < 4) {
++               ok = false;
++               break;
++            }
++            call_from[ci] = f;
++            call_to[ci++] = code[i + 3];
++         }
++      }
++      if (op == OP_FUNCTION_END)
++         f = UINT32_MAX;
++      i += len;
++   }
++   if (ok) {
++      qsort(ids, nf, sizeof(*ids), cmp_fn_id);
++      /* calls by caller (counting sort), their callees by index */
++      for (uint32_t c = 0; c < nc; c++)
++         start[call_from[c] + 1]++;
++      for (uint32_t g = 0; g < nf; g++)
++         start[g + 1] += start[g];
++      memcpy(pos, start, nf * sizeof(*pos));
++      for (uint32_t c = 0; ok && c < nc; c++) {
++         const uint32_t to = fn_index(ids, nf, call_to[c]);
++         ok = to != UINT32_MAX;
++         callee[pos[call_from[c]]++] = to;
++      }
++   }
++   /* each function's inlined size, callees first (an explicit stack: no recursion) */
++   for (uint32_t root = 0; ok && root < nf; root++) {
++      if (state[root])
++         continue;
++      uint32_t sp = 0;
++      stack[sp++] = root;
++      while (ok && sp) {
++         const uint32_t g = stack[sp - 1];
++         if (!state[g]) {
++            state[g] = 1;
++            pos[g] = start[g];
++            size[g] = min_u64(own[g], cap);
++         }
++         if (pos[g] < start[g + 1]) {
++            const uint32_t h = callee[pos[g]];
++            if (state[h] == 1) {
++               ok = false; /* a cycle: recursion, which SPIR-V for Vulkan has none of */
++            } else if (!state[h]) {
++               stack[sp++] = h; /* each function is pushed once: sp <= nf */
++            } else {
++               size[g] = min_u64(size[g] + size[h], cap);
++               pos[g]++;
++            }
++         } else {
++            state[g] = 2;
++            sp--;
++         }
++      }
++   }
++   /* the entry points' functions with their callees inside, and the rest of the module */
++   uint64_t total = min_u64(outside, cap);
++   for (uint32_t e = 0; ok && e < info->entry_count; e++) {
++      const uint32_t g = fn_index(ids, nf, info->entries[e].function);
++      ok = g != UINT32_MAX;
++      if (ok)
++         total = min_u64(total + size[g], cap);
++   }
++   free(own);
++   free(size);
++   free(ids);
++   free(call_from);
++   free(call_to);
++   free(start);
++   free(callee);
++   free(stack);
++   free(pos);
++   free(state);
++   if (!ok)
++      return false;
++   *estimate_bytes = total * 4;
++   return total < cap;
++}
++
++uint32_t *
++vkr_spirv_inline_calls(uint32_t env,
++                       const uint32_t *code,
++                       size_t bytes,
++                       size_t *out_bytes,
++                       char *why,
++                       size_t why_size)
++{
++   /* merge-return first: the inliner leaves a function with an early return where it is */
++   static const char *const flags[] = {
++      "--merge-return",
++      "--inline-entry-points-exhaustive",
++      "--eliminate-dead-functions",
++   };
++   spv_binary out = NULL;
++   const spv_result_t r =
++      pingouinOptimizeWithFlags((spv_target_env)env, flags, sizeof(flags) / sizeof(flags[0]),
++                                VKR_SPIRV_MAX_BOUND, code, bytes / 4, &out);
++   if (r != SPV_SUCCESS || !out) {
++      snprintf(why, why_size, "spirv-opt's inliner failed (%d%s)", r,
++               r == SPV_ERROR_INTERNAL ? ": a pass failed, ids past the bound or an exception" : "");
++      return NULL;
++   }
++   const size_t size = out->wordCount * sizeof(uint32_t);
++   uint32_t *copy = malloc(size ? size : 4);
++   if (!copy) {
++      spvBinaryDestroy(out);
++      snprintf(why, why_size, "out of host memory");
++      return NULL;
++   }
++   memcpy(copy, out->code, size);
++   spvBinaryDestroy(out);
++   *out_bytes = size;
++   return copy;
++}
+diff --git a/src/venus/vkr_spirv_inline.h b/src/venus/vkr_spirv_inline.h
+new file mode 100644
+--- /dev/null
++++ b/src/venus/vkr_spirv_inline.h
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2026 Pingouin contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Pingouin (virgl-venus-spirv-inline-array-calls.patch): guest SPIR-V whose functions take
++ * an array by value has its calls inlined into its entry points before the Mac's driver
++ * reads it. MoltenVK's SPIRV-Cross (MoltenVK 1.4.2) declares such a parameter as
++ * spvUnsafeArray<T, N> but passes a plain T[N] when the argument comes straight out of a
++ * buffer's struct, and Metal's compiler refuses the call ("no matching function"): the
++ * pipeline fails (VK_ERROR_INITIALIZATION_FAILED) and the guest, which made it without
++ * waiting, binds a pipeline vkr never had. naga (wgpu) writes such functions (Zed 1.27.0's
++ * vs_quad and fs_path_rasterization). Inlined, no function takes an array and SPIRV-Cross
++ * writes no such call. Only modules with an array parameter are touched. Self-contained but
++ * for SPIRV-Tools' C API (pingouinOptimizeWithFlags, spirv-tools-opt-catch-throws.patch), so
++ * it is tested on the CPU alone (Tests/virgl/test-venus-spirv-validate.sh). */
++
++#ifndef VKR_SPIRV_INLINE_H
++#define VKR_SPIRV_INLINE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "vkr_spirv.h"
++
++/* true when a function of the module (its `bytes` bytes of code, scanned as `info`) takes
++ * an array by value (an OpFunctionParameter of an OpTypeArray type) */
++bool
++vkr_spirv_has_array_params(const struct vkr_spirv_info *info, const uint32_t *code, size_t bytes);
++
++/* the most bytes an inlined module may take: 16 times the largest real module seen (67 KB);
++ * Zed's inline to 21-22 KB */
++#define VKR_SPIRV_INLINE_MAX_BYTES (1u << 20)
++
++/* before the optimizer runs: an estimate of the module's size once every call is inlined
++ * into its entry points (each function's own words, plus its callees' inlined size once per
++ * call, plus the words outside functions; merge-return adds a little: Zed's came out within
++ * 1%) in *estimate_bytes; false when it is past
++ * max_bytes (the inliner would grow without bound: a function calling another twice, 20
++ * levels deep, is 2^20 copies), when the call graph is not acyclic or out of host memory.
++ * Linear in the module's size, no recursion (the ring thread's stack). */
++bool
++vkr_spirv_inline_size_ok(const struct vkr_spirv_info *info,
++                         const uint32_t *code,
++                         size_t bytes,
++                         uint64_t max_bytes,
++                         uint64_t *estimate_bytes);
++
++/* the module with its function calls inlined into its entry points (spirv-opt's
++ * --merge-return --inline-entry-points-exhaustive --eliminate-dead-functions for target env
++ * `env`, a spv_target_env, ids capped at VKR_SPIRV_MAX_BOUND): malloc'd code (free() it) and
++ * its size in *out_bytes, or NULL with the reason in why. The result is not validated: the
++ * caller scans and validates it as it does the guest's code. */
++uint32_t *
++vkr_spirv_inline_calls(uint32_t env,
++                       const uint32_t *code,
++                       size_t bytes,
++                       size_t *out_bytes,
++                       char *why,
++                       size_t why_size);
++
++#endif /* VKR_SPIRV_INLINE_H */

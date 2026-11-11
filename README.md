@@ -6,6 +6,10 @@
 
 <p align="center">experimental native-like linux vms on macos</p>
 
+<p align="center">
+    <img src="assets/laptop.jpg" alt='pingouin running fedora on a 14" mbp' style='max-width: 100%;' width="800">
+</p>
+
 I recently stumbled upon _Try Omarchy_ and thought to myself, woa this is exactly what I wanted, if only it worked on any distro!\
 So I took the patches and some of the ideas to make a new app :) \
 You want to use linux as your main os but your mac isn't supported by Asahi yet? This is perfect for you!\

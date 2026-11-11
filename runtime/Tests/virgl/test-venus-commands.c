@@ -931,6 +931,7 @@ struct gfx {
    VkFormat color_format, depth_format; /* dynamic rendering's (0: FMT, none) */
    bool blend_null; /* the color blend state without its attachment array */
    bool discard;    /* rasterizerDiscardEnable VK_TRUE */
+   const char *vert_name, *frag_name; /* the stages' entry points (NULL: "main") */
 };
 
 static void *graphics_pipeline(void *layout, const struct gfx *g)
@@ -938,9 +939,9 @@ static void *graphics_pipeline(void *layout, const struct gfx *g)
    VkPipelineShaderStageCreateInfo st[2] = {
       { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .stage = g->vert_stage ? g->vert_stage : VK_SHADER_STAGE_VERTEX_BIT, .module = (VkShaderModule)g->vert,
-        .pName = "main", .pSpecializationInfo = g->spec },
+        .pName = g->vert_name ? g->vert_name : "main", .pSpecializationInfo = g->spec },
       { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .module = (VkShaderModule)g->frag, .pName = "main" } };
+        .module = (VkShaderModule)g->frag, .pName = g->frag_name ? g->frag_name : "main" } };
    VkVertexInputBindingDescription vb = { g->vbinding, g->vstride ? g->vstride : 16, VK_VERTEX_INPUT_RATE_VERTEX };
    VkVertexInputAttributeDescription va = { g->vlocation, g->vbinding, VK_FORMAT_R32G32B32A32_SFLOAT, 0 };
    VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -1452,6 +1453,47 @@ static int spirv_case(const char *c, struct world *w)
    return BROKEN;
 }
 
+/* Zed 1.27.0's quad and path rasterization pipelines, from the modules naga writes for it
+ * (spirv-corpus/pass/naga-zed-1.6-storage-*: set 0 a uniform buffer, set 1 a storage
+ * buffer). vs_quad and fs_path_rasterization pass an array by value; MoltenVK 1.4.2's
+ * SPIRV-Cross wrote Metal that does not compile for that and both pipelines failed (-3,
+ * VK_ERROR_INITIALIZATION_FAILED) until virgl-venus-spirv-inline-array-calls.patch inlined
+ * the calls. p-gfx-naga-array-call-ok: both are made, no refusal. */
+static size_t corpus_module(const char *name, uint32_t *out, size_t max);
+static uint32_t naga_code[4][8192];
+static int naga_array_call(void)
+{
+   if (VK_API_VERSION_MINOR(props.apiVersion) < 3) {
+      printf("skip: Vulkan 1.%u (SPIR-V 1.6 needs 1.3)\n", VK_API_VERSION_MINOR(props.apiVersion));
+      return SKIP;
+   }
+   static const char *const files[4] = {
+      "naga-zed-1.6-storage-vs_quad.spv", "naga-zed-1.6-storage-fs_quad.spv",
+      "naga-zed-1.6-storage-vs_path_rasterization.spv", "naga-zed-1.6-storage-fs_path_rasterization.spv" };
+   void *mods[4];
+   for (int i = 0; i < 4; i++) {
+      const size_t bytes = corpus_module(files[i], naga_code[i], sizeof(naga_code[i]));
+      step("vkCreateShaderModule %s (%zu bytes)", files[i], bytes);
+      mods[i] = shader(naga_code[i], bytes);
+      if (!mods[i])
+         return created(NULL);
+   }
+   void *dsl[2] = { one_binding_layout(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL),
+                    one_binding_layout(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL) };
+   if (!dsl[0] || !dsl[1])
+      broken("set layouts");
+   void *layout = pipeline_layout_of(dsl, 2, NULL, 0);
+   if (!layout)
+      broken("pipeline layout");
+   const struct gfx quad = { .colors = 1, .vert = mods[0], .frag = mods[1], .vert_name = "vs_quad",
+                             .frag_name = "fs_quad" };
+   if (!graphics_pipeline(layout, &quad))
+      return created(NULL);
+   const struct gfx path = { .colors = 1, .vert = mods[2], .frag = mods[3],
+                             .vert_name = "vs_path_rasterization", .frag_name = "fs_path_rasterization" };
+   return created(graphics_pipeline(layout, &path));
+}
+
 static int case_pipeline(const char *c)
 {
    unsigned needs = 0;
@@ -1469,6 +1511,8 @@ static int case_pipeline(const char *c)
       return cache_case(IS("p-cache-header"));
    if (!strncmp(c, "p-layout-", 9))
       return case_pipeline_layout(c);
+   if (IS("p-gfx-naga-array-call-ok"))
+      return naga_array_call();
    struct world w = { 0 };
    make_world(&w, IS("p-ok") || IS("p-gfx-ok"));
    if (IS("p-ok") || IS("p-gfx-ok"))
@@ -7909,7 +7953,7 @@ struct test_case {
 
 static const struct test_case cases[] = {
    /* pipelines, layouts, stages */
-   { "p-ok", E_WORKS }, { "p-gfx-ok", E_WORKS }, { "p-cache-garbage", E_KEEP }, { "p-cache-header", E_KEEP },
+   { "p-ok", E_WORKS }, { "p-gfx-ok", E_WORKS }, { "p-gfx-naga-array-call-ok", E_WORKS }, { "p-cache-garbage", E_KEEP }, { "p-cache-header", E_KEEP },
    { "p-spec-oob", E_REFUSE }, { "p-spec-wrap", E_REFUSE },
    { "p-stage-null-module", E_REFUSE }, { "p-inline-spirv-odd", E_REFUSE }, { "p-inline-spirv-ok", E_WORKS },
    { "p-compute-stage-wrong", E_REFUSE }, { "p-stage-bits-bad", E_REFUSE }, { "p-robustness-bad", E_REFUSE },
