@@ -355,8 +355,15 @@ link=("-L$epoxy/lib" -lepoxy -framework Metal -framework CoreFoundation -lobjc
       "-Wl,-rpath,$epoxy/lib" "-Wl,-rpath,$angle/lib")
 DYLD_LIBRARY_PATH="$libs" python3 "$tap/tests/run-driver-regressions.py" \
   "$virgl_src/build" "$tests/virgl" -- "${link[@]}"
-DYLD_LIBRARY_PATH="$libs" python3 "$T/virgl/run-regressions.py" \
-  "$virgl_src/build" "$tests/virgl" -- "${link[@]}"
+# PINGOUIN_SKIP_GPU_TESTS=1 (GitHub Actions): these draw on the Mac's GPU and check its
+# timing; a CI runner is itself a VM with Apple's paravirtual GPU, which orders contexts
+# differently (test-vulkan-window-handover). Release builds are tested on real Macs.
+if [[ ${PINGOUIN_SKIP_GPU_TESTS:-0} == 1 ]]; then
+  log "GPU regression tests skipped (PINGOUIN_SKIP_GPU_TESTS=1)"
+else
+  DYLD_LIBRARY_PATH="$libs" python3 "$T/virgl/run-regressions.py" \
+    "$virgl_src/build" "$tests/virgl" -- "${link[@]}"
+fi
 python3 "$meson" install -C "$virgl_src/build" --no-rebuild >/dev/null
 # SPIRV-Tools stays private to the renderer: no spv symbol exported, so neither its copy nor
 # MoltenVK's can bind to the other's.
@@ -450,11 +457,15 @@ grep -qaF 'highmem-mmio-size cannot be smaller than 1 GiB' "$q" ||
 # A guest's Vulkan calls never reach MoltenVK with what Metal ends QEMU on, and what ended
 # QEMU's process in vkr now ends only the app's context: each case through vkr's own dispatch
 # on the staged runtime's MoltenVK, one process per case; objects and binds only.
-log "Venus tests on the staged runtime's MoltenVK"
-python3 "$T/virgl/run-venus-limits.py" \
-  "$virgl_src/build" "$tests/venus-limits" "$stage" -- "${link[@]}" >"$tests/venus-limits.log" 2>&1 ||
-  { tail -40 "$tests/venus-limits.log" >&2; die "the Venus limits tests failed"; }
-grep '^venus limits' "$tests/venus-limits.log" | tail -5
+if [[ ${PINGOUIN_SKIP_GPU_TESTS:-0} == 1 ]]; then
+  log "Venus tests on MoltenVK skipped (PINGOUIN_SKIP_GPU_TESTS=1)"
+else
+  log "Venus tests on the staged runtime's MoltenVK"
+  python3 "$T/virgl/run-venus-limits.py" \
+    "$virgl_src/build" "$tests/venus-limits" "$stage" -- "${link[@]}" >"$tests/venus-limits.log" 2>&1 ||
+    { tail -40 "$tests/venus-limits.log" >&2; die "the Venus limits tests failed"; }
+  grep '^venus limits' "$tests/venus-limits.log" | tail -5
+fi
 
 rm -rf "$out.old"
 [[ ! -e $out ]] || mv "$out" "$out.old"

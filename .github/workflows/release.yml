@@ -67,7 +67,11 @@ jobs:
           SPARKLE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: printf '%s' "$SPARKLE_KEY" > "$RUNNER_TEMP/sparkle.key"
 
+      # The GPU tests need a real Mac's GPU (the runner's is paravirtual): run
+      # app/scripts/release.sh locally before tagging, which runs them.
       - name: Build the release
+        env:
+          PINGOUIN_SKIP_GPU_TESTS: "1"
         run: SIGN_ID="Alice" SPARKLE_KEY_FILE="$RUNNER_TEMP/sparkle.key" app/scripts/release.sh
 
       - uses: softprops/action-gh-release@v2
